@@ -1,5 +1,7 @@
 # CDP Transport, Chromium Process Management, Targets and Sessions
 
+> **Verification pass 2, 2026-08-04 — three further corrections, all architectural.** (1) **The `tab`-target plan is dead**: `Target.setAutoAttach` refuses a filter admitting both `tab` and `page`, a `tab` session answers nothing but `Target.*`, and attaching via a tab session **flushes the bfcache** (§3.2). (2) **Only one page per browser *window* is `visible`** — every other tab runs `requestAnimationFrame` at 0 fps, which makes "one BrowserContext per job" a correctness requirement rather than an isolation nicety (§4.2). (3) **`--remote-debugging-port=0` also sets `navigator.webdriver === true`** (primary source: `content/child/runtime_features.cc`), so the §8.6 debug escape hatch buys no fingerprint relief (§6.4).
+
 > **Verification pass 2026-08-04 — three corrections that change decisions, detailed inline and summarised at the end of this document.** (1) The `setsid()` supervisor **is confirmed to survive `launchctl bootout` on macOS**, but `setsid()` does **not** escape a systemd cgroup — Linux needs `systemd-run --user --scope` (§8.2). (2) The 100 MB pipe cap is **client→Chrome only**; a 125.8 MB screenshot response transits fine (§1.1). (3) **`--remote-debugging-pipe` sets `navigator.webdriver === true` unconditionally** — websocket mode does not — so every page `brow` touches is identifiable as automation (§6.4). Also: `Schema.getDomains` is *not* removed, the Windows `--remote-debugging-io-pipes` reading is *confirmed* against the consuming code, and the "copied profile can't be decrypted" claim is *unsupported on macOS*.
 
 > **Bottom line.** Use `--remote-debugging-pipe` (fd 3 read / fd 4 write, NUL-delimited UTF-8 JSON — confirmed in Chromium source and verified against local Chrome 151.0.7922.72). It gives you an unforgeable, unlistenable, single-client channel that no other local process can hijack, and it kills the browser automatically when the holder of the fds goes away — which is simultaneously the best orphan-prevention primitive available and **the single biggest architectural constraint in this whole document**: a persistent background Chromium *cannot* survive a `browserd` restart if `browserd` itself holds the pipe. The fix is a per-browser `setsid()`-detached supervisor process that owns fds 3/4 and re-exports the protocol over a `0600` unix socket. Use the flat protocol (`sessionId` on every envelope) with `Target.setAutoAttach{autoAttach, waitForDebuggerOnStart, flatten:true, filter}` applied **recursively on every new page/iframe session** — without that, cross-origin iframes are simply invisible (verified: parent session's `iframe.contentDocument === null`). Use `Target.createBrowserContext` for per-job isolation (verified full cookie/localStorage isolation; marginal cost ≈150 MB per extra live page, ≈0 for an empty context) rather than separate `--user-data-dir` processes (≈500 MB + 6 processes each). Pin `browser_protocol.json` + `js_protocol.json` from the `ChromeDevTools/devtools-protocol` repo (rolled ~daily; head at `r1672245`, 2026-08-01) and generate Rust types at build time — because over a pipe there is **no** way to ask Chrome for its own protocol descriptor (`Schema.getDomains` is deprecated, renderer-only, and returns nothing but domain names at version "1.2"; `/json/protocol` needs an HTTP port you do not want).
@@ -301,7 +303,45 @@ Entries are matched **sequentially, first match wins**. Recommended explicit fil
  {"type":"background_page"},{"type":"other"},{"exclude":true}]
 ```
 
-Whether to include `tab` targets: a `tab` target is the container above `page`, and it is the only place where **prerender / bfcache page swaps** are observable as one continuous entity. For a state-aware site mapper that matters. Recommendation: attach to `tab` targets *in addition to* `page` targets, and treat `tab` as the stable identity for "this browser tab" while `page` targets come and go under it. Mark as **UNVERIFIED** — I did not empirically exercise a prerender swap.
+~~Whether to include `tab` targets: a `tab` target is the container above `page`, and it is the only place where **prerender / bfcache page swaps** are observable as one continuous entity. For a state-aware site mapper that matters. Recommendation: attach to `tab` targets *in addition to* `page` targets, and treat `tab` as the stable identity for "this browser tab" while `page` targets come and go under it. Mark as **UNVERIFIED** — I did not empirically exercise a prerender swap.~~
+
+> **REFUTED 2026-08-04 — three separate reasons, any one of which kills the recommendation. This was the load-bearing unverified item for the site-graph design.**
+>
+> **1. You cannot attach to `tab` *and* `page`. The protocol rejects it.**
+> ```
+> Target.setAutoAttach{filter:[{}]}   (or any filter admitting both types)
+>   -> {"code":-32602,"message":"Filter should not simultaneously allow \"tab\" and \"page\",
+>                                page targets are attached via tab targets"}
+> ```
+> It is `tab` **XOR** `page`. If you auto-attach `tab` at the browser session, `page` targets no longer arrive there at all — you must re-issue `Target.setAutoAttach` **on each tab session**, and the `Target.attachedToTarget` for the page then carries the *tab* session in its envelope. That restructures the entire session tree (the built-in component extension's `background_page` also arrives under a `tab`).
+>
+> **2. A `tab` session is not queryable. It supports only `Target.*`.** Probed on Chrome 151:
+> ```
+> OK    Target.getTargetInfo, Target.getTargets, Target.setAutoAttach
+> -32601  Page.enable, Page.getFrameTree, Page.getNavigationHistory, Page.navigate,
+>         Page.captureScreenshot, Runtime.enable, Runtime.evaluate, Network.enable,
+>         Fetch.enable, Log.enable, Preload.enable, Input.dispatchMouseEvent,
+>         Emulation.setDeviceMetricsOverride, Target.enable
+> ```
+> So a tab session gives you exactly one thing: `attachedToTarget` / `detachedFromTarget` for the page targets underneath it. It is a *routing node*, not an observation point. There is no continuous URL, no navigation history, no lifecycle stream at the tab level.
+>
+> **3. Attaching via `tab` targets DISABLES bfcache — it destroys the thing it was meant to observe.** Same fixture, same back-navigation, only the attach topology varied:
+> ```
+> page auto-attached directly at the browser session:
+>     back nav -> console "PAGESHOW persisted=true"        <- bfcache restore
+>     no Page.backForwardCacheNotUsed
+> page auto-attached VIA a tab session:
+>     back nav -> console "PAGESHOW persisted=false"       <- full reload
+>     Page.backForwardCacheNotUsed{notRestoredExplanations:[{"type":"Circumstantial",
+>                                                            "reason":"CacheFlushed"}]}
+> ```
+>
+> **What to do instead.** Auto-attach `page` targets directly (the default filter already excludes `tab`), and detect the transitions from the page session:
+> * **bfcache restore** — verified signature on the page session: `Page.frameStartedNavigating`, `Page.frameNavigated`, `Page.frameStartedLoading`, `Page.frameStoppedLoading`, `Runtime.executionContextsCleared`/`executionContextCreated`, **and no `Page.loadEventFired`, no `Page.domContentEventFired`**. A normal (non-bfcache) navigation fires both. The session and the target survive; the sessionId does not change.
+> * **bfcache *miss*** — `Page.backForwardCacheNotUsed{loaderId, frameId, notRestoredExplanations[], notRestoredExplanationsTree}` fires with a machine-readable reason. This is a first-class site-graph edge annotation and neither this document nor `90-crawler-*` mentions it.
+> * **prerender** — use the `Preload` domain, which **does** work on a page session (`Preload.enable` → `{}` verified), plus `TargetInfo.subtype == "prerender"` from `Target.setDiscoverTargets`. Not the tab session.
+>
+> Open question 3 below is therefore **answered: no, we do not attach to `tab` targets.**
 
 ### 3.3 OOPIF: what breaks if you skip it
 
@@ -374,6 +414,16 @@ So: cookies, localStorage, permissions and all `Storage.*` state are per-context
 | 5 more pages, each in its **own** context | +661 MB | +5 procs |
 
 **Conclusion: an empty BrowserContext costs essentially nothing; the cost is per live renderer, and it is the same whether or not the pages share a context.** Whereas a second `--user-data-dir` Chrome costs a whole browser: ~500 MB and 6 processes before you open anything, plus 0.2–0.3 s startup.
+
+> **Verified 2026-08-04 — a second, much stronger reason to use one BrowserContext per job, which this document did not have.** **Only one page per browser *window* is `document.visibilityState === "visible"`; every other tab in that window runs `requestAnimationFrame` at 0 fps.** Measured on headless Chrome 151 (rAF counter over 1 s):
+> ```
+> two pages, same (default) BrowserContext:   A = hidden/0fps    B = visible/60fps
+> Target.activateTarget(A):                   A = visible/60fps  B = hidden/0fps    (swaps, does not add)
+> pages in SEPARATE BrowserContexts:          A = visible/60fps  C = visible/61fps  D = visible/60fps
+> ```
+> `--disable-backgrounding-occluded-windows`, `--disable-renderer-backgrounding`, `--disable-background-timer-throttling` do **not** help; nor do `Page.bringToFront`, `Emulation.setFocusEmulationEnabled` or `Page.setWebLifecycleState{state:"active"}`. `Emulation.setPageVisibilityOverride` does not exist (`-32601`).
+>
+> `Target.createBrowserContext` gives each page its own window and therefore its own `visible` state; `Target.createTarget{newWindow:true}` does too. **So "BrowserContext per job" is a correctness requirement, not just isolation hygiene.** Anyone who "optimises" by putting several job pages in one context will silently freeze all but one of them: no rAF, no CSS animations, no screencast frames (see `50-capture-*` §4.1), and the actionability stability probe in `40-input-*` §12 hangs forever.
 
 Startup latency to first successful `Browser.getVersion` over the pipe (measured): **headless 0.19 s, headful 0.27 s** on this machine, warm disk cache.
 
@@ -549,6 +599,30 @@ I probed `navigator.webdriver` in Chrome 151 headless via the pipe:
 > | headless `--remote-debugging-pipe --disable-blink-features=AutomationControlled` | pipe | `false` |
 >
 > So: headless alone does **not** set it; websocket CDP does **not** set it; `--enable-automation` **does** set it (contradicting this section's original claim); and **`--remote-debugging-pipe` sets it unconditionally** (contradicting `40-input-synthesis.md` §11).
+
+> **Verified 2026-08-04 (second pass) — observations reproduced, mechanism found in primary source, and ONE ROW OF THE MATRIX IS WRONG.**
+>
+> Reproduced independently over a hand-built pipe client: `pipe headless → true`, `pipe headful → true`, `pipe + --enable-automation → true`, `pipe + --disable-blink-features=AutomationControlled → false`, `--remote-debugging-port=39471/39472 headless → false` (with and without `--no-startup-window`, ruling that flag out as a confound).
+>
+> **The mechanism is [`content/child/runtime_features.cc`](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/content/child/runtime_features.cc), lines 387–389 and 430–445:**
+> ```cpp
+> {wrf::EnableAutomationControlled, switches::kEnableAutomation,   true},
+> {wrf::EnableAutomationControlled, switches::kHeadless,           true},
+> {wrf::EnableAutomationControlled, switches::kRemoteDebuggingPipe, true},
+> ...
+> // Set EnableAutomationControlled if the caller passes --remote-debugging-port=0
+> // ... If the caller provides a specific port number, this is more likely for
+> // attaching a debugger, so we should leave EnableAutomationControlled unset ...
+> if (command_line.HasSwitch(switches::kRemoteDebuggingPort)) {
+>   int port;
+>   if (base::StringToInt(port_str, &port) && port == 0) {
+>     WebRuntimeFeatures::EnableAutomationControlled(true);
+>   }
+> }
+> ```
+> Two things follow that were not in the matrix:
+> 1. **`--remote-debugging-port=0` also sets `navigator.webdriver === true`.** Measured: `--headless=new --remote-debugging-port=0` → `DevToolsActivePort` = 52935, `navigator.webdriver` = **`true`**. Only an *explicit non-zero* port leaves it unset. This matters directly: §8.6's "also launch with `--remote-debugging-port=0`, reconnect via `DevToolsActivePort`" escape hatch **does not escape the fingerprint** — it has the same webdriver signal as the pipe, plus the local-process exposure. If a job genuinely needs `webdriver === false`, it must use a **fixed** port.
+> 2. `switches::kHeadless` is in the table, yet `--headless=new` + a fixed port measured `false`. The most likely reading is that new headless does not propagate `--headless` onto the *renderer* command line that `runtime_features.cc` reads. Do not rely on either direction; the empirical matrix is what counts.
 >
 > **Consequence for `brow`, and it is not small.** Our chosen transport is the pipe, so **every page `brow` ever touches sees `navigator.webdriver === true`**, in headful, with no way to turn it off short of `--disable-blink-features=AutomationControlled` (an evasion flag we have decided not to ship). The recommendation below — "don't pass `--enable-automation`" — is still right but is now *cosmetic*: it changes the infobar and the password-save UI, not the fingerprint. Any doc text implying `brow` is indistinguishable on this axis must be removed, and `SKILL.md` should state plainly: *sites that gate on `navigator.webdriver` will treat every `brow` session as automation.* If a job genuinely needs `webdriver === false` (testing a code path that is disabled under automation), the only honest options are (a) run that job over `--remote-debugging-port` on loopback behind an explicit opt-in, accepting the local-process exposure, or (b) accept the flag.
 
@@ -668,7 +742,7 @@ Even though the pipe makes orphans structurally rare, be defensive:
 |---|---|
 | Supervisor holds the pipe, `browserd` reconnects to the supervisor's unix socket | **Recommended.** Real reconnect, no listening TCP port |
 | Pass the fds to a new `browserd` over the socket via `SCM_RIGHTS` | Works on Unix, elegant, but leaves a window where nobody holds them and requires a live handoff (not a crash-recovery path). **UNVERIFIED** |
-| Also launch with `--remote-debugging-port=0`, reconnect via `DevToolsActivePort` | Verified that pipe+port coexist and both work. But it opens the browser to every local process for the entire session. Debug-only |
+| Also launch with `--remote-debugging-port=0`, reconnect via `DevToolsActivePort` | Verified that pipe+port coexist and both work. But it opens the browser to every local process for the entire session. Debug-only. **Corrected 2026-08-04: port `0` specifically *also* sets `navigator.webdriver === true`** (`runtime_features.cc`, verified — see §6.4), so this buys nothing on the fingerprint axis; only a fixed non-zero port leaves `webdriver` unset |
 | Accept the restart | Simple, honest, loses page state |
 
 ---
@@ -790,6 +864,9 @@ All against **Google Chrome 151.0.7922.72** (`V8 15.1.206.10`, revision `@2903d8
 10. **`--disable-hang-monitor` shifts hang responsibility to us.** There is no CDP event for "this renderer is wedged". Detection is timeout-based only; a renderer that is slow-but-alive is indistinguishable from one that is wedged, which means the harness will occasionally kill a page that would have recovered.
 11. **`Target.exposeDevToolsProtocol`** exists and injects a `window.cdp` binding into a page. It is an outright violation of the "raw CDP is never exposed" invariant. It must be hard-blocked in the policy crate with a test that asserts the method string never appears in any allowed capability path.
 12. Everything about the **supervisor process, `SCM_RIGHTS` fd handoff, Windows named-pipe transport, and Linux/systemd behaviour is UNVERIFIED** — I had only macOS + Chrome 151 to test against.
+13. **You cannot attach to `tab` and `page` targets at the same time**, a `tab` session exposes only `Target.*`, and attaching via tab targets **turns bfcache off** (`CacheFlushed`). "Observe prerender/bfcache swaps on the tab target" is not available. Verified 2026-08-04 (§3.2).
+14. **Only one page per browser window is `visible`.** All other tabs in that window get `rAF` at 0 fps: no screencast frames, no CSS animation progress, and any in-page `await requestAnimationFrame` probe blocks forever. No flag or CDP command un-hides a background tab; the only fix is one window (i.e. one `BrowserContext`, or `newWindow:true`) per concurrently-active page. Verified 2026-08-04 (§4.2).
+15. **`--remote-debugging-port=0` sets `navigator.webdriver === true`** just like the pipe does (`content/child/runtime_features.cc`). Only an explicit non-zero port avoids the signal. The "reconnect via `DevToolsActivePort`" fallback therefore trades security for nothing on the detection axis (§6.4, §8.6).
 
 ---
 
@@ -797,7 +874,7 @@ All against **Google Chrome 151.0.7922.72** (`V8 15.1.206.10`, revision `@2903d8
 
 1. **Supervisor process: yes or no?** It is the only way to get "persistent Chromium" + "restartable daemon" + "no TCP port". It adds one tiny binary and one IPC hop. If no, which of the three do we give up?
 2. **Headful by default?** I recommend yes (fidelity of gestures, paint, screenshots), with headless reserved for detached background jobs. That means a visible window on the user's desktop — acceptable? Off-screen positioning (`--window-position=-32000,-32000`) is a hack that breaks screenshots on macOS.
-3. **Do we attach to `tab` targets in addition to `page` targets?** Needed for prerender/bfcache transitions in the site graph; adds a second identity layer to the model.
+3. ~~**Do we attach to `tab` targets in addition to `page` targets?**~~ **ANSWERED 2026-08-04: no, and we could not even if we wanted to.** `Target.setAutoAttach` rejects a filter admitting both types (`-32602 "page targets are attached via tab targets"`); a `tab` session answers only `Target.*` (everything else `-32601`); and routing the page attach through a tab session **flushes the bfcache** (`Page.backForwardCacheNotUsed{reason:"CacheFlushed"}`), destroying the transition it was supposed to observe. See §3.2 for the replacement detection recipe.
 4. **bfcache on or off?** Playwright disables it for deterministic navigation interception. For a *site mapper*, bfcache restores are real transitions worth recording. Which wins?
 5. **Minimum supported Chrome milestone?** I'd propose 136 (the user-data-dir rule is then unconditional) or 128 (broader compatibility, more feature-gating).
 6. **Edge/Brave/Chromium support tier?** Discovery is easy; Brave injects Shields (breaks network expectations) and Edge injects `msForceBrowserSignIn`/updater behaviour. Tier-1 Chrome + Chromium, tier-2 Edge, tier-3 Brave?
@@ -860,3 +937,19 @@ Re-tested against **Google Chrome 151.0.7922.72** on macOS 26.5.1 (Darwin 25.5.0
 | CBOR mode has the same 100 MB inbound cap | **REFUTED** | `PipeReaderCBOR` never calls `set_max_buffer_size`; it resizes to the envelope length. Unbounded (§1.1) |
 
 **Not re-tested** (still carrying the original document's confidence): BrowserContext memory figures, target-filter behaviour, hung-renderer timings, crash signalling, id-collision safety, Snap/Flatpak, `SCM_RIGHTS` handoff, `tab`-target prerender/bfcache semantics.
+
+---
+
+## Verification pass 2 — 2026-08-04 (second adversarial review)
+
+Chrome **151.0.7922.72**, macOS Darwin 25.5.0. Pipe transport driven by a hand-written client using `os.posix_spawn` with `POSIX_SPAWN_DUP2` file actions onto fds 3/4 — **note for the implementer: you must also clear `FD_CLOEXEC` on both pipe ends** (`os.set_inheritable(fd, True)`), otherwise Chrome exits immediately with `chrome_main_delegate.cc:1101 Remote debugging pipe file descriptors are not open.` even though the `dup2` file actions look correct. Websocket transport used as the control. All processes killed.
+
+| Claim under test | Outcome | Evidence |
+|---|---|---|
+| Attach to `tab` targets *in addition to* `page` targets (§3.2, Open Q3) | **REFUTED, three ways** | (a) `Target.setAutoAttach{filter:[{}]}` → `-32602 "Filter should not simultaneously allow \"tab\" and \"page\""`; (b) tab session answers only `Target.getTargetInfo/getTargets/setAutoAttach`, everything else `-32601`; (c) tab-routed attach ⇒ `Page.backForwardCacheNotUsed{reason:"CacheFlushed"}` and `pageshow persisted=false`, vs `persisted=true` with direct page attach (§3.2) |
+| bfcache restores are observable | **CONFIRMED, from the page session** | Direct page attach: back nav → `pageshow persisted=true`, `Page.frameNavigated`+`frameStartedNavigating`+`frameStarted/StoppedLoading`, **no `loadEventFired`/`domContentEventFired`**; session and target survive (§3.2) |
+| `--remote-debugging-pipe` sets `navigator.webdriver` unconditionally | **CONFIRMED + mechanism found** | Reproduced pipe headless/headful → `true`, fixed port → `false`. Primary source: `content/child/runtime_features.cc:387-389` maps `kEnableAutomation`, `kHeadless`, `kRemoteDebuggingPipe` → `EnableAutomationControlled` (§6.4) |
+| "Websocket/port mode → `false`" | **PARTIAL — true only for a fixed port** | `runtime_features.cc:438-445` also enables it for `--remote-debugging-port=0`. Measured: port 0 → **`true`**; ports 39471/39472 → `false` (§6.4, §8.6) |
+| `Schema.getDomains` is present-but-deprecated, not removed | **CONFIRMED** | Local `/json/protocol`: 57 domains, protocol `1.3`; `Schema` present with `deprecated:true`; `Console` likewise; no `Canvas` domain |
+| BrowserContext-per-job is "isolation only" | **REFUTED — it is a correctness requirement** | Two pages in one context ⇒ one is `hidden` at 0 rAF/s; separate contexts ⇒ all `visible` at 60 fps. `activateTarget` swaps rather than adds; `bringToFront`/`setFocusEmulationEnabled`/`setWebLifecycleState` and the three backgrounding flags are all ineffective (§4.2) |
+| `Target.setAutoAttach.flatten` and `.filter` are stable API | **PARTIAL** | Both are marked `experimental: true` in Chrome 151's `/json/protocol`, and the whole design depends on them |

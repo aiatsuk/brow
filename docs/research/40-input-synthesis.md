@@ -29,7 +29,7 @@
 
 ## 1. The coordinate model — get this right first, everything else follows
 
-`Input.dispatchMouseEvent.x/y` and `Input.dispatchTouchEvent.touchPoints[].x/y` are **CSS pixels in the main frame's visual viewport**, independent of `deviceScaleFactor`. Verified: with `Emulation.setDeviceMetricsOverride{deviceScaleFactor:3}`, a click dispatched at `(196,400)` arrived in the page as `clientX/clientY = 196,400`.
+`Input.dispatchMouseEvent.x/y` and `Input.dispatchTouchEvent.touchPoints[].x/y` are ~~**CSS pixels in the main frame's visual viewport**~~ **CSS pixels in the main frame's LAYOUT viewport** *(corrected 2026-08-04: under `Emulation.setPageScaleFactor{2.0}` the visual viewport became 400×300 while the layout viewport stayed 800×600; a click at `(250,425)` still arrived as `clientX/clientY = 250,425`, and `getContentQuads` was unchanged by the page scale — so the two spaces are distinguishable and CDP uses layout)*, independent of `deviceScaleFactor`. Verified: with `Emulation.setDeviceMetricsOverride{deviceScaleFactor:3}`, a click dispatched at `(196,400)` arrived in the page as `clientX/clientY = 196,400`.
 
 `DOM.getContentQuads` (EXPERIMENTAL, but load-bearing) returns an array of 4-corner quads `[x1,y1,x2,y2,x3,y3,x4,y4]` in the **same** space. Observed properties:
 
@@ -572,6 +572,12 @@ This is the core value proposition versus `element.dispatchEvent`, which produce
 > | pipe `+ --enable-automation` | pipe | `true` (unchanged) |
 > | pipe `+ --disable-blink-features=AutomationControlled` | pipe | `false` |
 >
+> **Corrected again 2026-08-04 (second pass): the `--remote-debugging-port` row is only true for a *fixed, non-zero* port.** Primary source [`content/child/runtime_features.cc`](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/content/child/runtime_features.cc): lines 387–389 map `switches::kEnableAutomation`, `switches::kHeadless` and `switches::kRemoteDebuggingPipe` to `wrf::EnableAutomationControlled`, and lines 438–445 additionally enable it when `--remote-debugging-port` parses to **`0`** ("*the caller has requested an ephemeral port which is how ChromeDriver launches the browser by default*"). Measured on Chrome 151: `--headless=new --remote-debugging-port=0` → `navigator.webdriver` **`true`**; fixed ports 39471/39472 → `false` (with and without `--no-startup-window`). Add this row to the matrix:
+>
+> | headless `--remote-debugging-port=0` | websocket | **`true`** |
+>
+> Note also that `switches::kHeadless` is in the source table yet `--headless=new` + a fixed port measured `false` — most likely because new headless does not put `--headless` on the *renderer's* command line, which is what `runtime_features.cc` reads. Trust the measurements, not the table.
+>
 > **`--remote-debugging-pipe` sets `navigator.webdriver` unconditionally.** Since the transport decision (`10-…` §1) is pipe-only, **every page `brow` touches will see `navigator.webdriver === true`**, headful included. Correction #1 below ("CDP attachment does not set `navigator.webdriver`") is therefore false for this project, and the "don't pass `--enable-automation`" decision becomes cosmetic — it still suppresses the infobar and the password-save UI, but it does not change the fingerprint. Say so plainly in `SKILL.md`: *sites that gate behaviour on `navigator.webdriver` will treat every `brow` session as automation, and the harness will not lie about it.*
 
 | Probe | Chrome 151 headless, plain `--remote-debugging-port` | headful, plain | headful `--enable-automation` |
@@ -667,6 +673,7 @@ async fn resolve_action_point(r: &Ref, need: Checks) -> Result<ActionPoint, NotA
           return a.x===b.x && a.y===b.y && a.width===b.width && a.height===b.height;
         })"#, r).await?;
     if need.stable && !stable { return Err(Unstable) }
+    // ⚠ 2026-08-04: this await BLOCKS FOREVER on a backgrounded tab. See the note below.
 
     // 5. ACTION POINT — centre of the largest quad, CLIPPED to the viewport and to
     //    every scroll-clipping ancestor, so sticky/overflow:hidden cases pick a visible pixel.
@@ -687,6 +694,17 @@ async fn resolve_action_point(r: &Ref, need: Checks) -> Result<ActionPoint, NotA
     Ok(ActionPoint { x: p.x, y: p.y, frame_session: r.frame_session })
 }
 ```
+
+> **⚠ Defect found 2026-08-04 in step 4 as written — the stability probe hangs forever on any page that is not the active tab of its window.** `requestAnimationFrame` does not fire on a `document.visibilityState === "hidden"` page, so `await raf(); await raf();` never resolves and the `Runtime.evaluate{awaitPromise:true}` never returns. Measured on Chrome 151:
+> ```
+> single page (visible):                       probe returned true in 0.02 s
+> after creating a 2nd page in the same
+>   BrowserContext (1st becomes "hidden"):     probe TIMED OUT at 12 s, no reply
+> ```
+> Only one page per browser **window** is `visible` (see `10-…` §4.2 for the full matrix — `Target.activateTarget` swaps which one, `Page.bringToFront` / `Emulation.setFocusEmulationEnabled` / `Page.setWebLifecycleState{active}` and the `--disable-*-backgrounding` flags all fail to help). Three required changes:
+> 1. **One `BrowserContext` (or `Target.createTarget{newWindow:true}`) per concurrently-driven page.** Verified: pages in separate contexts are all `visible` at 60 fps.
+> 2. **Never issue a bare `awaitPromise` rAF probe.** Race it against a timer inside the page — `Promise.race([twoRafs, new Promise(r => setTimeout(() => r("hidden-no-raf"), 250))])` — so the command always returns, and surface `hidden-no-raf` as a distinct actionability outcome rather than an `Unstable` or a timeout.
+> 3. The daemon's per-command deadline must exist regardless (it is already required for the `setEmitTouchEventsForMouse` latch in §11), but a 5 s actionability budget made of 30 s hangs is not a budget.
 
 Retry loop: re-run every attempt (do **not** cache), backoff ~50 ms, default budget 5 s, and on failure return a **structured** reason (`StaleRef | Disabled | ReadOnly | NotVisible | OffScreen | Unstable | Occluded{by}`) plus a screenshot with the action point annotated. That error object is what makes the agent able to self-correct instead of retrying blindly.
 
@@ -795,7 +813,8 @@ Chrome **151.0.7922.72** (V8 15.1.206.10), macOS Darwin 25.5.0, launched by me w
 10. **You cannot make synthesised input statistically indistinguishable from human input**, and this project explicitly does not try. Say so.
 11. **Headless UA leaks `HeadlessChrome`.** Overriding it with `setUserAgentOverride` is legitimate device emulation, but be aware you are then lying about one thing while `--headless=new` still differs in others (no GPU compositing by default, different `screen` metrics, no window chrome).
 12. **`data:` URLs are not secure contexts**, so `navigator.userAgentData`, clipboard, and geolocation behave differently there. Fixtures must be served over `http://localhost`.
-13. **`clickCount` is honoured mechanically, not temporally.** That is convenient, but it means the harness never exercises the *real* double-click timing path — a page with its own `dblclick` polyfill keyed on timestamps will behave differently under `brow` than under a human. Offer `Tap{count:2}`/`Click{count:2}` with an optional real inter-click delay.
+13. **Anything time-based is dead on a backgrounded tab.** Only one page per browser window has `document.visibilityState === "visible"`; every other tab in that window gets `requestAnimationFrame` at **0 fps**. That silently breaks the actionability stability probe (§12 — verified to hang past 12 s), CSS-transition settling, `synthesize*` gesture pacing assumptions, and screencast. No flag or CDP command un-hides a background tab. The only fix is one browser window — i.e. one `BrowserContext`, or `newWindow:true` — per concurrently-driven page. Verified 2026-08-04; see `10-…` §4.2.
+14. **`clickCount` is honoured mechanically, not temporally.** That is convenient, but it means the harness never exercises the *real* double-click timing path — a page with its own `dblclick` polyfill keyed on timestamps will behave differently under `brow` than under a human. Offer `Tap{count:2}`/`Click{count:2}` with an optional real inter-click delay.
 
 ---
 
@@ -852,3 +871,17 @@ Re-run against **Google Chrome 151.0.7922.72** on macOS 26.5.1, primarily over `
 | `Input` domain experimental/stable split | **CONFIRMED** | Chrome 151 `/json/protocol`: experimental = `dispatchDragEvent, insertText, imeSetComposition, emulateTouchFromMouseEvent, setInterceptDrags, synthesizePinchGesture, synthesizeScrollGesture, synthesizeTapGesture`; stable = `dispatchKeyEvent, dispatchMouseEvent, dispatchTouchEvent, cancelDragging, setIgnoreInputEvents`. `DOM.getContentQuads` experimental: `true` |
 
 **Not re-tested:** modifier bitmask probe, right/middle/pen variants, multi-touch splitting, `synthesizeTapGesture`/`synthesizePinchGesture` timings, drag recipes, file upload paths, dialogs, the full device-emulation profile, `setIgnoreInputEvents`, the actionability algorithm, keymap codegen feasibility.
+
+---
+
+## Verification pass 2 — 2026-08-04 (second adversarial review)
+
+Chrome **151.0.7922.72**, macOS Darwin 25.5.0, over `--remote-debugging-pipe` with `--remote-debugging-port` as a control, fixtures served from `http://127.0.0.1:8899`. All processes killed.
+
+| Claim under test | Outcome | Evidence |
+|---|---|---|
+| The §12 actionability algorithm as written is sound | **REFUTED at step 4** | The in-page double-`rAF` stability probe returned `true` in 0.02 s on a visible page and **never returned** (12 s timeout) once a second page in the same BrowserContext made the first `hidden`. `rAF` does not fire on hidden pages. Fix: race the probe against an in-page timer, and give every concurrently-driven page its own window/BrowserContext (§12) |
+| `navigator.webdriver` matrix: "port mode → `false`" | **PARTIAL — only for a fixed non-zero port** | `content/child/runtime_features.cc:438-445` also enables `AutomationControlled` for `--remote-debugging-port=0`. Measured: port 0 → `true`, ports 39471/39472 → `false`. Pipe headless/headful → `true` (reproduced) (§11) |
+| Mechanism behind the pipe/webdriver coupling was only observational | **now CONFIRMED from primary source** | `runtime_features.cc:387-389`: `{EnableAutomationControlled, kEnableAutomation}`, `{…, kHeadless}`, `{…, kRemoteDebuggingPipe}` (§11) |
+| `Input` domain experimental/stable split, `DOM.getContentQuads` experimental | **CONFIRMED** | Re-read from this Chrome's `/json/protocol`: `DOM.getContentQuads` `experimental:true`; `Input.synthesizeScrollGesture` `experimental:true` with params `x, y, xDistance, yDistance, xOverscroll, yOverscroll, preventFling, speed, gestureSourceType, repeatCount, repeatDelayMs, interactionMarkerName` |
+| `Input.dispatchMouseEvent` coordinates are "visual viewport CSS px" (§1) | **PARTIAL — they are LAYOUT viewport CSS px** | Under `Emulation.setPageScaleFactor{2.0}` the visual viewport shrank to 400×300 (`scale:2`) while the layout viewport stayed 800×600. A click dispatched at the element's `getContentQuads` centre `(250,425)` arrived as `clientX/clientY = 250,425` — unchanged by page scale. Quads and `getBoxModel` likewise tracked `getBoundingClientRect()` exactly. Reword §1 to say **layout** viewport |

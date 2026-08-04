@@ -429,6 +429,15 @@ This is the correct tool for "what does this variable actually evaluate to here"
 
 Resolve the **document node** once (`DOM.resolveNode{nodeId: root}`) and call it with `depth:-1, pierce:true` → **the whole-page listener map in one call**, each entry carrying `backendNodeId`. Verified: it returned listeners on `document` (delegated capture handler), on individual elements, **inside a closed shadow root** (`CLOSED_SHADOW_LISTENER`), and **inside a same-origin iframe** (`IFRAME_LISTENER`). [CONFIRMED]
 
+> **Verified 2026-08-04 at real-site scale — the "untested at scale, may OOM or truncate" risk does not materialise.** Chrome 151, 1280×900, live network:
+> ```
+> github.com/rust-lang/rust    2,394 elements -> 1,007 listeners, 158,205 B, 0.01 s
+>                              top types: click 220, keydown 70, mouseover 36, mouseleave 34, keyup 33
+> en.wikipedia.org/wiki/Rust…  9,534 elements -> 1,161 listeners, 181,868 B, 0.01 s
+>                              top types: mouseover 380, mouseout 380, click 335, keydown 16
+> ```
+> One call, ~10 ms, ~180 KB on the two heaviest pages in this document's corpus. **No truncation, no OOM, latency negligible.** The residual concern is the one the original text raised and it is real: the result holds ~2× that many `RemoteObject` handles (`handler` + `originalHandler`) in the default object group, so `Runtime.releaseObjectGroup` after every batch is mandatory, not optional. Also note Wikipedia's profile — 760 of 1,161 listeners are `mouseover`/`mouseout` pairs from the page-preview feature — so "listener count" is a poor interactivity proxy on its own, which reinforces the delegation-map presentation below.
+
 Each `EventListener` = `{type, useCapture, passive, once, scriptId, lineNumber, columnNumber, handler?: RemoteObject, originalHandler?: RemoteObject, backendNodeId?}`. `originalHandler` is the un-bound function when the site wrapped it — prefer it for source attribution.
 
 Two gaps:
@@ -543,6 +552,15 @@ Honest statement to ship in `SKILL.md`: *"Canvas-rendered UI (including Flutter 
 | github.com/rust-lang/rust | 3,670 | 0.91 MB / ~246K tok | 0.62 MB / ~168K tok (57 ms) | 0.89 MB / ~240K tok (27 ms) |
 
 (Token figures are estimates at 3.7 bytes/token for dense JSON — the byte counts are exact.)
+
+> **Verified 2026-08-04 — the byte counts replicate almost exactly on an independent run**, which is the strongest evidence in this document that the token-economics argument is sound even if the bytes→tokens constant is not. Chrome 151, 1280×900, live network:
+> ```
+> Wikipedia  Accessibility.getFullAXTree     9,288,017 B / 23,573 nodes   (orig: 9,282,016 / 23,573)
+> Wikipedia  DOMSnapshot.captureSnapshot     3,939,916 B                  (orig: 4,006,833)
+> github     Accessibility.getFullAXTree       888,159 B /  2,010 nodes   (orig:   888,206 /  2,010)
+> github     DOMSnapshot.captureSnapshot       608,799 B                  (orig:   620,000-ish)
+> ```
+> Node counts are identical to the unit. **Still UNVERIFIED: the 3.7 bytes/token conversion itself** — no tokenizer was run in either pass. Treat every "≈N tokens" figure in this document as ±40 %, and gate the output-size policy on *bytes*, which are measurable, not on tokens.
 
 Single fat node, `<a>` on github.com: `describe` 465 B, `box` 171 B, `ax` 3,086 B, **`computed` 154,022 B**, **`matched` 985,478 B** (of which `inherited` = 1,062,842 B across only 11 entries — the universal `*` rules and `:root` custom-property blocks are repeated per inherited ancestor). Total **~309K tokens for one node.**
 
@@ -669,7 +687,18 @@ pub struct FrameInfo {
 }
 ```
 
-Keep the snapshot's `strings` table as-is and intern into it — it was only 2,400 entries for github.com and 14,457 for Wikipedia, so string data is a tiny fraction of the payload and re-allocating it is pure waste. Parse the snapshot with `simd-json` (the payload is 4 MB of numeric arrays; `serde_json` is the bottleneck at that size). [performance claim UNVERIFIED — benchmark before committing]
+Keep the snapshot's `strings` table as-is and intern into it — it was only 2,400 entries for github.com and 14,457 for Wikipedia, so string data is a tiny fraction of the payload and re-allocating it is pure waste. ~~Parse the snapshot with `simd-json` (the payload is 4 MB of numeric arrays; `serde_json` is the bottleneck at that size). [performance claim UNVERIFIED — benchmark before committing]~~
+
+> **REFUTED 2026-08-04 — benchmarked, and `simd-json` is not worth it for the snapshot.** `cargo build --release` (rustc 1.97.1, `serde_json 1.0`, `simd-json 0.17.3`), Apple M4, parsing the *actual* payloads captured live from Chrome 151 into a generic `Value` / `OwnedValue`, 3 runs each:
+>
+> | payload | `serde_json` | `simd-json` | verdict |
+> |---|---|---|---|
+> | `DOMSnapshot.captureSnapshot`, Wikipedia, **4,362,821 B** | 12.08 / 10.22 / **9.42 ms** | 11.78 / 10.14 / **9.80 ms** | **a wash — no win** |
+> | `Accessibility.getFullAXTree`, Wikipedia, **9,288,017 B** | 31.72 / 29.74 / **30.42 ms** | 22.28 / 21.87 / **17.98 ms** | ~35 % faster |
+>
+> The premise was wrong twice over: (a) `serde_json` parses the 4 MB snapshot in **~10 ms**, which is 5 % of the 211 ms Chrome spends *producing* it — it was never the bottleneck; (b) the win only appears on the AX tree, which is the payload the design already says to strip and never store raw (§3). And this benchmark uses the *slow* path (generic `Value`); deserialising straight into `#[derive(Deserialize)]` structs, which is what the codegen in `10-…` §9.3 produces, is faster still.
+>
+> **Decision: use `serde_json`. Do not take the `simd-json` dependency** — it needs mutable input buffers, has a divergent API, and buys ~0 ms where it matters. Revisit only if profiling shows AX-tree parsing on the hot path, and even then prefer "don't fetch the AX tree raw".
 
 ---
 
@@ -783,3 +812,18 @@ Re-run against **Google Chrome 151.0.7922.72** on macOS 26.5.1, over `--remote-d
 | `DOMSnapshot.captureSnapshot` works in an OOPIF's own session | **CONFIRMED** | Returned OK on the OOPIF session; `Page.getLayoutMetrics` there gave that frame's own `cssContentSize` |
 
 **Not re-tested:** token/byte measurements on Wikipedia and github.com, `CSS.*` surface details (`resolveValues`, `getLayersForNode`, `Specificity.components`), `DOM.getNodeStackTraces`, `Runtime.getProperties` closure walking, `simd-json` vs `serde_json` performance, snapshot timing figures.
+
+---
+
+## Verification pass 2 — 2026-08-04 (second adversarial review)
+
+Chrome **151.0.7922.72**, macOS Darwin 25.5.0, over `--remote-debugging-pipe`, 1280×900 at `deviceScaleFactor:1`, against the **live** github.com and en.wikipedia.org (not fixtures). Rust benchmark built with `cargo build --release`, rustc 1.97.1. All processes killed.
+
+| Claim under test | Outcome | Evidence |
+|---|---|---|
+| `simd-json` is worth taking over `serde_json` for the 4 MB snapshot | **REFUTED** | 4,362,821 B snapshot: `serde_json` 9.42–12.08 ms vs `simd-json` 9.80–11.78 ms — a wash. `serde_json` was never the bottleneck (Chrome takes 211 ms to *produce* it). Only the 9.29 MB AX tree shows a win (30 ms → 18–22 ms), and that payload is one the design says never to keep raw (§12) |
+| `DOMDebugger.getEventListeners{depth:-1,pierce:true}` at framework scale — may OOM/truncate/be slow | **CONFIRMED SAFE** | github 1,007 listeners / 158,205 B / 0.01 s; Wikipedia 1,161 / 181,868 B / 0.01 s. One call, no truncation. Object-group retention remains the real cost (§7) |
+| Payload byte counts / node counts on real sites | **CONFIRMED (independent replication)** | AX: 9,288,017 B / 23,573 nodes (Wikipedia), 888,159 B / 2,010 nodes (github) — node counts identical to the original run, bytes within 0.1 % (§11) |
+| The 3.7 bytes/token conversion | **STILL UNVERIFIED** | No tokenizer run in either pass. Bytes are exact; token figures are a heuristic (§11) |
+| `Schema.getDomains` "removed in Chrome 151" (Limits #13, already corrected once) | **REFUTED again, from `/json/protocol`** | Local dump: **57 domains**, `version {major:"1", minor:"3"}`, `Schema` present with `"deprecated": true`. Also confirms **no `Canvas` domain** exists, so Limits #9 stands |
+| `DOM.getDocument` really has only `depth`/`pierce` (no UA-shadow suppression) | **CONFIRMED** | `/json/protocol` parameter list for `DOM.getDocument` is exactly `[depth, pierce]`; `Accessibility.getFullAXTree` is `[depth, frameId]` and `experimental:true`; `DOM.getContentQuads` `experimental:true` |

@@ -452,3 +452,50 @@ async fn accessibility_names_cross_same_origin_iframes() {
 
     shutdown(launched);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_captures_are_cut_rather_than_silently_duplicated() {
+    if !common::chrome_available() {
+        return common::skip("oversized_captures_are_cut_rather_than_silently_duplicated");
+    }
+    let fixture = common::serve();
+    let (launched, mut page, _scratch) = open_fixture("huge", &fixture.url("/")).await;
+
+    // Past 16384 output pixels Chromium returns an image of exactly the requested
+    // size in which the rows beyond the limit are verbatim copies of rows from the
+    // top. Measured: row 16390 was byte-identical to row 6. Nothing downstream can
+    // detect that, so the only defence is never to ask.
+    let shot = page
+        .screenshot(
+            ScreenshotTarget::Rect(Clip { x: 0.0, y: 0.0, width: 800.0, height: 20_000.0 }),
+            ImageFormat::Png,
+            None,
+        )
+        .await
+        .expect("oversized rect capture");
+
+    let (w, h) = common::png_size(&shot.bytes).expect("valid PNG");
+    assert_eq!(w, 800);
+    assert!(
+        h <= 16_384,
+        "capture came back {h}px tall; everything past 16384 is duplicated content"
+    );
+    let note = shot
+        .truncated
+        .expect("an oversized capture must say it was cut");
+    assert!(note.contains("16384"), "{note}");
+    assert!(note.contains("20000"), "the note must state what was asked for: {note}");
+
+    // A capture inside the limit must not be flagged.
+    let ok = page
+        .screenshot(
+            ScreenshotTarget::Rect(Clip { x: 0.0, y: 0.0, width: 400.0, height: 400.0 }),
+            ImageFormat::Png,
+            None,
+        )
+        .await
+        .expect("normal capture");
+    assert!(ok.truncated.is_none());
+
+    shutdown(launched);
+}

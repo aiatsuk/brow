@@ -269,3 +269,46 @@ fn a_dead_daemon_takes_its_browsers_with_it_and_recovers_cleanly() {
 
     h.ok(&["daemon", "stop"]);
 }
+
+/// Two daemons racing to start must not leave a socket nobody is listening on.
+///
+/// The stale-socket recovery path is inherently racy — connect, fail, unlink,
+/// bind — and without a lock the second process's unlink can delete the first
+/// one's freshly bound socket.
+#[test]
+fn concurrent_daemon_starts_leave_exactly_one_listener() {
+    let h = Harness::new("race");
+    // Eight at once, spawned before any of them can finish binding.
+    let children: Vec<_> = (0..8)
+        .map(|_| {
+            Command::new(BIN)
+                .args(["daemon", "start"])
+                .env("BROW_HOME", &h.home)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn brow daemon start")
+        })
+        .collect();
+    for mut c in children {
+        let _ = c.wait();
+    }
+
+    // Whoever won, the socket must exist and answer.
+    let status = h.json(&["daemon", "status"]);
+    assert!(
+        status["pid"].as_u64().unwrap_or(0) > 0,
+        "no daemon is reachable after a concurrent start: {status}"
+    );
+
+    // And there must be exactly one of them.
+    let listeners = Command::new("pgrep")
+        .arg("-f")
+        .arg(h.home.display().to_string())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+        .unwrap_or(0);
+    assert!(listeners <= 1, "{listeners} browd processes survived the race");
+
+    h.ok(&["daemon", "stop"]);
+}

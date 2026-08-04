@@ -1,6 +1,6 @@
 # Capture: screenshots, node/frame/region shots, screencast video, diffing
 
-> **Bottom line.** Everything the spec asks for is achievable with plain CDP, and I verified most of it against the local Chrome 151.0.7922.72 rather than trusting folklore. Three results overturn common belief: (1) `position:fixed` elements are **not** duplicated in a `captureBeyondViewport` full-page shot — they render exactly once at `y == scrollY`, so the only fix needed is "scroll to 0 first"; (2) there is **no 16384 px texture ceiling** on `Page.captureScreenshot` in 2026 — I captured a 756×100000 CSS-px page headless and a 1600×200000 device-px PNG headful; the real limit is `W*H*4` bytes of RAM; (3) `Page.screencastFrame.metadata.timestamp` is **wall-clock epoch seconds**, measured 1.5 ms from the host's own clock, which makes action↔video sync a solved problem instead of the usual mess. The two genuine landmines are coordinate spaces — `DOM.getContentQuads` is **viewport-relative** while `captureScreenshot.clip` is **page-absolute**, so every node shot must add the scroll offset or it silently breaks the moment the page scrolls — and OOPIFs, where `pierce:true` does not cross the boundary and `Page.captureScreenshot` is flatly rejected on non-top-level targets, forcing a manual offset chain through `DOM.getBoxModel(iframe).content`. Lazy-loaded images below the fold are **not** loaded by `captureBeyondViewport` and come out blank; that is unfixable without scroll-priming. Recommend: own-drawn annotations (never `Overlay`), ffmpeg-via-sidecar as rung 1 of a 3-rung video ladder, and a JSON action log as the timing source of truth (video PTS quantizes to ~20 ms).
+> **Bottom line.** Everything the spec asks for is achievable with plain CDP, and I verified most of it against the local Chrome 151.0.7922.72 rather than trusting folklore. Three results overturn common belief: (1) `position:fixed` elements are **not** duplicated in a `captureBeyondViewport` full-page shot — they render exactly once at `y == scrollY`, so the only fix needed is "scroll to 0 first"; ~~(2) there is **no 16384 px texture ceiling** on `Page.captureScreenshot` in 2026 — I captured a 756×100000 CSS-px page headless and a 1600×200000 device-px PNG headful; the real limit is `W*H*4` bytes of RAM;~~ **(2) REFUTED 2026-08-04 — the 16384 px ceiling is alive and it fails silently.** Above 16384 **output (device) pixels** in either axis, `Page.captureScreenshot` returns an image of the *requested* dimensions whose content is the first 16384 rows/columns **tiled and repeated**; everything past 16384 is fabricated. No error, no truncation, so a dimension check passes. Verified in both headless and headful on Apple Silicon M4 (§1.4); (3) `Page.screencastFrame.metadata.timestamp` is **wall-clock epoch seconds**, measured 1.5 ms from the host's own clock, which makes action↔video sync a solved problem instead of the usual mess. The two genuine landmines are coordinate spaces — `DOM.getContentQuads` is **viewport-relative** while `captureScreenshot.clip` is **page-absolute**, so every node shot must add the scroll offset or it silently breaks the moment the page scrolls — and OOPIFs, where `pierce:true` does not cross the boundary and `Page.captureScreenshot` is flatly rejected on non-top-level targets, forcing a manual offset chain through `DOM.getBoxModel(iframe).content`. Lazy-loaded images below the fold are **not** loaded by `captureBeyondViewport` and come out blank; that is unfixable without scroll-priming. Recommend: own-drawn annotations (never `Overlay`), ffmpeg-via-sidecar as rung 1 of a 3-rung video ladder, and a JSON action log as the timing source of truth (video PTS quantizes to ~20 ms).
 
 ## Decisions
 
@@ -117,7 +117,39 @@ Consequences:
 
 `position:sticky` behaved identically (its quad `y0` stayed pinned at 50 across all scroll positions, i.e. viewport-relative, and the page-absolute conversion lands it correctly).
 
-### 1.4 Maximum size — the 16384 limit does not apply
+### 1.4 Maximum size — ~~the 16384 limit does not apply~~ **the 16384 limit DOES apply, and it corrupts silently**
+
+> **REFUTED 2026-08-04. This is the most consequential error in this document.** The original test only checked PNG *dimensions*, which are always correct. The *pixels* are not. Fixture: a page of `#111` filler with 200 px colour bands at known y positions (red@0, green@0.25H, blue@0.5H, yellow@0.75H, magenta@H−200); full-page `captureBeyondViewport` capture; the PNG's column x=400 decoded to raw RGB with `ffmpeg -vf crop=1:H:400:0 -f rawvideo -pix_fmt rgb24` and run-length scanned.
+>
+> ```
+> H=16384  dsf=1 scale=1  -> 800x16384  bands at 0,4096,8192,12288,16184   ALL 5 CORRECT
+> H=16600  dsf=1 scale=1  -> 800x16600  bands at 0,4150,8300,12450, then RED AGAIN at 16384; magenta MISSING
+> H=20000  dsf=1 scale=1  -> 800x20000  bands at 0,5000,10000,15000, RED at 16384; magenta MISSING
+> H=200000 dsf=1 scale=1  -> 800x200000 red band repeats at 0,16384,32768,49152,…,196608; green/blue/yellow/magenta ALL MISSING
+> ```
+> **Rows ≥ 16384 are a verbatim repeat of rows 0..16383.** The image is not blank — it is *plausible wrong content*, which is worse.
+>
+> **The threshold is in OUTPUT device pixels, i.e. `clip.height × clip.scale × deviceScaleFactor`** — not CSS pixels:
+>
+> | capture | output px | result |
+> |---|---|---|
+> | CSS 16384, dsf 1, scale 1 | 16384 | ✅ all bands correct |
+> | CSS 16600, dsf 1, scale 1 | 16600 | ✗ wraps at 16384 |
+> | CSS 10000, **dsf 2**, scale 1 | 20000 | ✗ wraps at 16384 |
+> | CSS 9000, dsf 1, **scale 2** | 18000 | ✗ wraps at 16384 |
+> | CSS 20000, dsf 1, **scale 0.5** | 10000 | ✅ **all bands correct, incl. magenta at 9900** |
+>
+> **It is symmetric and it applies on both axes.** A 20000 CSS-px-wide page captured at dsf 1 wrapped at **x = 16384** with the magenta band at x=19800 missing (same run-length method on row y=200).
+>
+> **It is not a headless/software-raster artifact.** Identical wrap points (`16384`, `23884`) for a 30000 px page in headless *and* in headful GPU mode on this Apple Silicon M4. The original document's headful "1600×200000 ✅" row is a dimension check that the corruption passes.
+>
+> **What must change in the implementation:**
+> 1. The mitigation is **not** `max_capture_megapixels`. A 800×20000 capture is 16 MP — far under any sane megapixel cap — and it is already corrupt. **Cap `height × scale × dsf` and `width × scale × dsf` at 16384 each.**
+> 2. When a full-page capture would exceed it, either (a) auto-reduce `clip.scale` to `16384 / (dim × dsf)` — verified to produce correct content, at the cost of resolution — or (b) tile: N sequential `clip`s each ≤ 16384 output px, stitched by us. Tiling is the only option that preserves resolution.
+> 3. Add a **self-check** in `brow doctor`: capture a fixture taller than 16384 output px with a known marker near the bottom and assert it is present. The threshold is a Chromium/GPU implementation detail and could move.
+> 4. Every stored full-page artifact should record `capture_tiled: true|false` and the output dimensions, so a corrupt legacy artifact is identifiable after the fact.
+>
+> The tables and prose below are left as originally written **only** as a record of what a dimension-only check reports. Read them as "no error was returned", never as "the image is correct".
 
 I pushed content height in headless (`--disable-gpu`, software raster) and headful (GPU, dsf=2):
 
@@ -130,11 +162,15 @@ I pushed content height in headless (`--disable-gpu`, software raster) and headf
 | 65 536 | 756×65536 ✅ | 1600×131072 ✅ |
 | 100 000 | 756×100000 ✅ | **1600×200000** ✅ |
 
-No truncation, no error, at any size, in either mode. The classic 16384 px GPU texture limit clearly does not gate this path any more — Chromium rasters full-page captures in tiles. **The real limit is memory**: the 1600×200000 case implies a ~1.28 GB RGBA buffer. Headless Chrome did in fact die on me twice during this session while doing very large captures plus many targets (§"What we verified"), so the harness must impose its own ceiling.
+No truncation, no error, at any size, in either mode. ~~The classic 16384 px GPU texture limit clearly does not gate this path any more — Chromium rasters full-page captures in tiles.~~ **Corrected 2026-08-04: every row of this table above 16384 output px contains silently fabricated content (blockquote at the top of §1.4). "No error" is not "correct image".** **The secondary limit is memory**: the 1600×200000 case implies a ~1.28 GB RGBA buffer. Headless Chrome did in fact die on me twice during this session while doing very large captures plus many targets (§"What we verified"), so the harness must impose its own ceiling.
 
-**Recommendation:** cap at a configurable `max_capture_megapixels` (default ~120 MP ≈ 480 MB RGBA). Above that, refuse with a structured error offering `--tiles` (capture N vertical strips with separate clips and stitch) rather than risking a browser crash that kills every other session in the daemon.
+**Recommendation (revised 2026-08-04) — two independent caps, both mandatory:**
+* **Correctness cap (hard, new):** `clip.width × scale × dsf ≤ 16384` **and** `clip.height × scale × dsf ≤ 16384`. Beyond either bound the image is fabricated (§1.4 blockquote). Auto-**tile** (N clips, stitched by us — preserves resolution) or auto-reduce `clip.scale` to `16384 / (dim × dsf)` (verified to produce correct content, loses resolution). Never emit a single oversized capture.
+* **Stability cap (soft, as before):** configurable `max_capture_megapixels` for memory. With the 16384 bound in force the largest single capture is 16384² ≈ 268 MP ≈ 1.07 GB RGBA, so the megapixel cap is still required — it is simply no longer the first thing that bites.
 
 > **Verified 2026-08-04 — the "silently blank at huge sizes" worry, partly addressed, plus a transport fact that removes one imagined constraint.** I captured a **5600×5600 canvas filled with `crypto.getRandomValues` noise** (deliberately incompressible, so content emptiness would be obvious in the byte count): the PNG came back at **94,376,178 bytes** — i.e. ~3.0 bytes per pixel, exactly what real noise costs. A blank or half-blank raster would have compressed to a few KB. So at ~31 MP the pixels are genuinely there, not fabricated. (This does **not** clear the 200,000 px case; the original's spot-check gap stands for extreme aspect ratios.)
+>
+> **Superseded 2026-08-04:** the 5600×5600 result is real but is *below* the 16384 bound in both axes, which is exactly why it looked fine. It says nothing about the 20000/200000 px cases, which are now known to be corrupt. See the blockquote at the top of §1.4.
 >
 > The same test settles a cross-document worry from `10-cdp-transport-and-process.md`: that capture's **base64 payload was 125,834,904 bytes** and it crossed the `--remote-debugging-pipe` **intact**, with the browser and the page session both healthy afterwards. Chrome's 100 MB `kReceiveBufferSizeForDevTools` applies only to the fd-3 **reader** (client → Chrome); responses are uncapped. **So there is no transport-level ceiling on screenshot size — only memory.** That makes `max_capture_megapixels` the *sole* defence, which raises its importance rather than lowering it. Encode time was 28.5 s for that single capture, which is its own argument for the cap.
 
@@ -374,7 +410,20 @@ All EXPERIMENTAL. Params: `format` (`jpeg`|`png` — **no webp**), `quality`, `m
 - **`sessionId` is NOT a frame number.** The protocol documents it as "Frame number"; across all 343 frames the value was **constant `1`**. It is a screencast-session id. You must still echo it back, and you **cannot** use it to detect drops. Budget a `frame_index` of your own.
 
 > **Verified 2026-08-04 — reproduced.** 4 s screencast of a `requestAnimationFrame` fixture, jpeg q60, 800×600, headless `--disable-gpu`: **240 frames, `sessionId` distinct values = `[1]`**, 240/240 carrying `metadata.timestamp`, span 3.982 s → **60.0 fps**, median inter-frame **16.7 ms**, max **20.0 ms**. Chrome 151's `/json/protocol` still describes the field as `"Frame number."` — the description is wrong, the observation is right, in two independent runs. Note this run measured a clean 60 fps rather than the original's 68.3 fps headless; effective rate is machine/compositor dependent, so **do not hard-code a frame budget** — report observed fps per recording as the doc already recommends. `Page.screencastFrameAck` was required on every frame (240 acked) for the stream to keep flowing.
-- `Page.screencastFrameAck{sessionId}` is mandatory — without it the stream stalls after a few frames.
+> **Verified 2026-08-04 — a hard architectural limit on concurrent recording that this document missed entirely.** **Only one page per browser *window* is `document.visibilityState === "visible"`. Every other tab in that window gets `requestAnimationFrame` at 0 fps and screencast emits nothing.** Measured on headless Chrome 151, a `rAF` counter sampled over 1 s:
+> ```
+> two pages, same BrowserContext (same window):   A = hidden/0fps    B = visible/60fps
+> Target.activateTarget(A):                       A = visible/60fps  B = hidden/0fps   (it swaps, it does not add)
+> third page with newWindow:true:                 A = visible/60fps  B = hidden/0fps  C = visible/61fps
+> pages in SEPARATE Target.createBrowserContext:  A = visible/60fps  C = visible/61fps  D = visible/60fps  (all visible)
+> ```
+> `--disable-backgrounding-occluded-windows`, `--disable-renderer-backgrounding` and `--disable-background-timer-throttling` do **not** help. `Emulation.setFocusEmulationEnabled`, `Page.setWebLifecycleState{state:"active"}` and `Page.bringToFront` do **not** un-hide a same-window background tab. `Emulation.setPageVisibilityOverride` does not exist (`-32601`).
+>
+> **Consequences for `brow`:**
+> * **Every concurrently recording job needs its own browser window** — i.e. its own `Target.createBrowserContext` (verified to give a new window) or `Target.createTarget{newWindow:true}`. Two jobs sharing a context = one of them records a frozen page. This turns the "BrowserContext per job" decision in `10-…` §4.3 from an isolation nicety into a **correctness requirement**.
+> * A recording of a hidden tab is not merely low-fps, it is **empty** — screencast is damage-driven and a hidden tab produces no damage.
+> * `Page.captureScreenshot` **does** still work on a hidden tab, and each capture appears to pump exactly one frame (two shots 0.6 s apart of an rAF animation produced different md5s even at 0 fps). So still-screenshot jobs are unaffected; only video and anything time-based is.
+- `Page.screencastFrameAck{sessionId}` is mandatory — without it the stream stalls after a few frames (re-observed: 3 frames then stall).
 - Average JPEG at q70/800×600 was ~7.7 KB → **~530 KB/s at 68 fps**. A 10-minute recording is ~320 MB of JPEG before muxing. Use `everyNthFrame` or cap fps for long jobs.
 - `format:"png"` screencast is a bad idea: much larger, and during one PNG-screencast test the browser connection dropped (see §"What we verified"). Use jpeg.
 
@@ -704,10 +753,11 @@ Blunt list. Several of these contradict the spec as written.
 5. **`sessionId` cannot detect dropped frames.** It is constant. Under heavy load screencast *will* drop frames (damage-driven, no delivery guarantee) and we can only infer gaps from timestamp deltas — never prove them. Any "video is complete" claim would be a lie; report observed fps and largest gap instead.
 6. **Screencast is damage-driven.** A completely static page emits zero frames. Duration must come from explicit start/stop timestamps, never from frame count ÷ fps.
 7. **No pure-Rust rung produces a universally-playable video.** Rung 2 (MJPEG-in-MP4) does not play in Chrome or Firefox. A genuinely portable pure-Rust encoder does not exist at usable speed in 2026 (`rav1e` is AV1 and slow; `vpx-encode` is unmaintained since 2022). Without ffmpeg the honest deliverable is frames + manifest. Do not pretend otherwise in the SKILL.md.
-8. **Huge captures are a browser-stability risk.** No protocol-level texture limit means nothing stops a 200 000 px capture from allocating >1 GB. Since `browserd` is a *persistent shared* daemon, one bad capture can take down every session. The megapixel cap is a correctness requirement, not a nicety.
+8. **Captures above 16384 output pixels in either axis are silently corrupt.** ~~No protocol-level texture limit means nothing stops a 200 000 px capture from allocating >1 GB.~~ **REFUTED/REPLACED 2026-08-04.** The classic 16384 texture bound still applies; it just does not error. `Page.captureScreenshot` returns the requested dimensions and repeats rows/columns 0..16383 for everything beyond. Verified headless *and* headful, on both axes, with the threshold in **output device px** (`dim × clip.scale × deviceScaleFactor`) — `CSS 20000 @ scale 0.5` is correct, `CSS 9000 @ scale 2` is not. This is the single most dangerous fact in this document because the failure is invisible to every check the original text proposed. Cap output dimensions at 16384 and tile. The memory/megapixel cap remains, as a *second* limit: 16384² RGBA is still ~1.07 GB, and `browserd` is a shared daemon where one bad capture can take down every session.
+8b. **Concurrent video recording requires one browser window per job.** Only one page per window is `visible`; all other tabs in that window run `requestAnimationFrame` at 0 fps and emit **zero** screencast frames. Not fixable with flags or with `activateTarget`/`bringToFront`/`setFocusEmulationEnabled` (all verified ineffective). Use one `BrowserContext` (or `newWindow:true`) per recording job. Still screenshots are unaffected.
 9. ~~**`webp` quality is not controllable** — `quality` is documented jpeg-only.~~ **REFUTED 2026-08-04:** webp quality *is* honoured (1,674 B at q=1 vs 51,944 B at q=100 for the same clip). The protocol description is stale, not the implementation. Probe at startup rather than trusting either (§1.6).
 10. **Occluded node shots cannot be "fixed."** We composite the real page. Anything else is fabrication. Report occluders; never hide them.
-11. **Pinch-zoom (`pageScaleFactor != 1`) is untested** by me. `cssLayoutViewport` vs `cssVisualViewport` diverge there and my formula picks layout on spec-reasoning alone.
+11. ~~**Pinch-zoom (`pageScaleFactor != 1`) is untested** by me. `cssLayoutViewport` vs `cssVisualViewport` diverge there and my formula picks layout on spec-reasoning alone.~~ **Tested 2026-08-04 — the layout-viewport choice is correct, and page scale turns out not to move any of the numbers §2.1 uses.** With `Emulation.setPageScaleFactor{2.0}` on an 800×600 metrics override, scrolled to y=600: `cssLayoutViewport {pageX:0, pageY:600, clientWidth:800, clientHeight:600}` and `cssVisualViewport {pageX:0, pageY:600, clientWidth:400, clientHeight:300, scale:2, offsetX:0, offsetY:0}` — **`pageX`/`pageY` were identical**; only `clientWidth/Height` and `scale` changed. `DOM.getContentQuads` and `DOM.getBoxModel` were unchanged by the page scale and tracked `getBoundingClientRect()` exactly (both `[200, 400, 300, 400]`, `bcr = [200,400]`), and an `Input.dispatchMouseEvent` at the quad centre arrived as `clientX/clientY = 250,425` — i.e. **all of CDP's geometry and input coordinates are layout-viewport CSS px and are unaffected by `pageScaleFactor`.** A node clip built with `cssLayoutViewport.pageX/pageY` produced the correct pixels (`ee0000` at the target). Residual gap: I could not drive `visualViewport.offsetX/offsetY` away from 0 via `setPageScaleFactor` alone, so the case where the visual viewport is *panned inside* the layout viewport (real two-finger pan on a touch device) is still untested — but since `pageX/pageY` are the only fields §2.1 reads and they agreed, the exposure is small.
 12. **Out of scope by spec, and genuinely uncapturable anyway:** browser chrome, OS dialogs, Keychain/Touch ID. `fromSurface` does not reach them; they are not in the renderer's surface at all.
 
 ---
@@ -761,3 +811,20 @@ Re-run against **Google Chrome 151.0.7922.72** on macOS 26.5.1, over `--remote-d
 | Chrome 151 `captureScreenshot` parameter surface | **CONFIRMED** | `/json/protocol`: `format`, `quality` *("jpeg only")*, `clip`, plus experimental `fromSurface`, `captureBeyondViewport`, `optimizeForSpeed`. No Canvas domain; 57 domains, protocol 1.3 |
 
 **Not re-tested:** the scale equation across DSF 1/2/3, the 200,000 px extreme, `Overlay.highlightNode` tooltip rendering, the five ffmpeg invocations and the 19.8 ms PTS quantisation, the Rust diff pipeline timings, `HeadlessExperimental.beginFrame`, clock-skew drift over long recordings, content-hash dedup ratios.
+
+---
+
+## Verification pass 2 — 2026-08-04 (second adversarial review)
+
+Chrome **151.0.7922.72**, macOS Darwin 25.5.0, driven over `--remote-debugging-pipe` (fds 3/4 via `os.posix_spawn` + `POSIX_SPAWN_DUP2`, `os.set_inheritable` on both pipe ends — without that last call Chrome refuses to start with *"Remote debugging pipe file descriptors are not open."*). Fixtures served from `http://127.0.0.1:8899`. PNG pixels decoded with `ffmpeg -vf crop=… -f rawvideo -pix_fmt rgb24` and run-length scanned in Python. All Chrome instances killed.
+
+| Claim under test | Outcome | Evidence |
+|---|---|---|
+| "No 16384 px texture ceiling; the real limit is RAM" (bottom line #2, §1.4) | **REFUTED — highest-severity finding in this review** | Colour bands at known y: correct to 16383, then rows 0..16383 repeat verbatim. 800×20000 loses the band at 19800; 800×200000 shows the red band 13× at multiples of 16384. Threshold = `dim × clip.scale × dsf`: CSS 20000@scale 0.5 ✅, CSS 9000@scale 2 ✗, CSS 10000@dsf 2 ✗. Symmetric on width (20000 px-wide page wraps at x=16384). Same in headless and headful GPU (§1.4) |
+| The 5600×5600 noise capture proves "pixels are genuinely there" at scale | **PARTIAL — true but not generalisable** | 5600 < 16384 in both axes, so it is inside the safe region by construction (§1.4) |
+| `max_capture_megapixels` is a sufficient guard | **REFUTED** | 800×20000 = 16 MP, far under any sane cap, and already corrupt. Output-dimension cap at 16384 is the necessary guard (§1.4) |
+| webp `quality` is honoured despite the "jpeg only" doc string | **CONFIRMED (independent run)** | Same 800×600 clip: webp q1/q50/q100 = **1,784 / 1,866 / 42,306** B; jpeg = 3,634 / 3,788 / 54,838 B (§1.6) |
+| `cssLayoutViewport` (not `cssVisualViewport`) is the right basis for the node clip | **CONFIRMED** | Under `Emulation.setPageScaleFactor{2.0}`, `pageX/pageY` identical (0/600) in both; quads, box model and `Input` coords all layout-viewport CSS px and unchanged by page scale; clip built from layout pageY captured the correct `ee0000` pixels (Limits #11) |
+| Screencast has near-zero frame loss (untested under load) | **CONFIRMED idle / REFUTED for concurrency, for a reason the doc did not anticipate** | Idle single tab: 240 frames vs 241 rAF, 60.4 fps, max gap 27.9 ms. But adding a second page to the same BrowserContext put the first at `visibilityState:"hidden"`, `rAF = 0 fps`, **0 screencast frames**. Separate BrowserContexts → all pages visible at 60 fps (§4.1) |
+| `Page.screencastFrameAck` is mandatory | **CONFIRMED** | Un-acked stream stalled after 3 frames (§4.1) |
+| `Page.captureScreenshot` works on a backgrounded tab | **CONFIRMED (new)** | Hidden tab, two shots 0.6 s apart of an rAF animation → different md5s; capture appears to pump one frame each time (§4.1) |

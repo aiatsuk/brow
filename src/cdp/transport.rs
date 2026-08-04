@@ -143,6 +143,32 @@ pub fn cloexec_pipe() -> std::io::Result<(RawFd, RawFd)> {
 mod tests {
     use super::*;
 
+    /// This invariant is load-bearing, not hygiene.
+    ///
+    /// The parent keeps one end of each pipe. If those ends were inheritable, the
+    /// *next* browser we launch would inherit them and hold the first browser's
+    /// pipe open — and since closing the pipe is Chromium's only shutdown signal,
+    /// killing the first browser would leave it running forever. One long session
+    /// spawning browsers would accumulate multi-gigabyte orphans.
+    #[test]
+    fn pipe_ends_are_never_inherited_by_a_child() {
+        let (r, w) = cloexec_pipe().unwrap();
+        for fd in [r, w] {
+            // SAFETY: both fds were just created and are still open.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD failed on fd {fd}");
+            assert!(
+                flags & libc::FD_CLOEXEC != 0,
+                "fd {fd} would leak into every child process"
+            );
+        }
+        // SAFETY: we own both fds and have not handed them to a transport.
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+    }
+
     #[tokio::test]
     async fn frames_split_on_nul_across_chunk_boundaries() {
         let (r, w) = cloexec_pipe().unwrap();

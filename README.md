@@ -119,8 +119,16 @@ Measured on Chrome, macOS, 2026-08-04.
   `document.querySelector('#x').textContent` is allowed, while
   `document.getElementById('x').textContent` and `el.getBoundingClientRect()` are
   not. The error message says so and suggests the rewrite.
-- **Full-page screenshots cap at 16384 px** per axis; beyond that the capture is
-  truncated and the result says by how much.
+- **Captures cap at 16384 output pixels** per axis — that is CSS pixels × device
+  pixel ratio, so the ceiling is 8192 CSS px on a 2× display. Past it Chromium
+  does not fail: it returns an image of exactly the requested size whose rows
+  beyond the limit are verbatim copies of rows from the top. `brow` clamps every
+  clipped capture and reports what it cut, because nothing downstream can detect
+  the corruption.
+- **Only one page per browser window is `visible`.** Every other tab in the same
+  window gets `requestAnimationFrame` at zero — frozen animations, no screencast
+  frames, stalled `IntersectionObserver` — and no flag changes it. This is why
+  each `--session` gets its own browser process rather than a tab.
 - **Touch feature detection lags one navigation.** The first touch gesture turns
   on touch emulation, which updates `navigator.maxTouchPoints` immediately but
   leaves `'ontouchstart' in window` false until the page reloads — the property is

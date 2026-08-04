@@ -66,9 +66,18 @@ pub enum Region {
     Rect(Clip),
 }
 
-/// Chromium refuses to allocate a capture surface beyond this; a 100 000 px tall
-/// infinite-scroll page would otherwise fail with an opaque protocol error.
-const MAX_DIMENSION: f64 = 16_384.0;
+/// Chromium's maximum texture dimension, in **output** pixels.
+///
+/// Past this, a capture is not rejected and is not visibly wrong: it comes back
+/// with the requested dimensions, no error, and every row beyond the limit is a
+/// verbatim copy of a row from the top of the image. Measured 2026-08-04 on an
+/// 800×20000 clip — row 16390 was byte-identical to row 6, row 19000 to row 2616.
+///
+/// Nothing downstream can detect this. The dimensions are right, the byte count is
+/// plausible, and the repeated content is real page content. The only defence is
+/// to never ask for more than the limit, so the clamp below is a correctness
+/// requirement rather than a nicety.
+const MAX_OUTPUT_PIXELS: f64 = 16_384.0;
 
 pub struct Capture {
     pub bytes: Vec<u8>,
@@ -88,12 +97,68 @@ impl Capture {
     }
 }
 
+/// A clip clamped to what Chromium can actually render, plus a note when it had
+/// to be cut.
+///
+/// `scale` is the multiplier passed to `Page.captureScreenshot`; `device_ratio`
+/// is `window.devicePixelRatio`. Both multiply into output pixels, which is why
+/// a clamp expressed in CSS pixels silently fails on a HiDPI display: a 10000 px
+/// tall page at `devicePixelRatio` 2 is 20000 output pixels and comes back
+/// corrupted while every CSS-pixel check passes.
+fn clamp_clip(clip: Clip, scale: f64, device_ratio: f64) -> (Clip, Option<String>) {
+    let factor = (scale * device_ratio).max(0.01);
+    let max_css = MAX_OUTPUT_PIXELS / factor;
+
+    if clip.width <= max_css && clip.height <= max_css {
+        return (clip, None);
+    }
+
+    let clamped = Clip {
+        width: clip.width.min(max_css),
+        height: clip.height.min(max_css),
+        ..clip
+    };
+    let note = format!(
+        "requested {:.0}x{:.0} CSS px at {factor:.0}x, which is {:.0}x{:.0} output pixels; \
+         Chromium silently repeats content past {MAX_OUTPUT_PIXELS:.0}, so the capture was \
+         cut to {:.0}x{:.0} CSS px",
+        clip.width,
+        clip.height,
+        clip.width * factor,
+        clip.height * factor,
+        clamped.width,
+        clamped.height,
+    );
+    (clamped, Some(note))
+}
+
 /// Document-space offset of the visual viewport, plus the full content size.
 struct Metrics {
     page_x: f64,
     page_y: f64,
     content_width: f64,
     content_height: f64,
+}
+
+/// `window.devicePixelRatio`, which `Page.getLayoutMetrics` does not report.
+async fn device_pixel_ratio(client: &CdpClient, session_id: &str) -> f64 {
+    let res = client
+        .call_on(
+            session_id,
+            "Runtime.evaluate",
+            json!({
+                "expression": "window.devicePixelRatio",
+                "returnByValue": true,
+                "throwOnSideEffect": true,
+            }),
+        )
+        .await;
+    res.ok()
+        .and_then(|v| v.get("result").and_then(|r| r.get("value")).and_then(Value::as_f64))
+        // Assuming 1 would under-clamp on HiDPI, which is the failure we are
+        // guarding against, so guess high when we cannot tell.
+        .filter(|r| *r > 0.0)
+        .unwrap_or(2.0)
 }
 
 async fn metrics(client: &CdpClient, session_id: &str) -> Result<Metrics, CdpError> {
@@ -123,25 +188,20 @@ pub async fn capture(
     format: ImageFormat,
     quality: Option<i64>,
 ) -> Result<Capture, CdpError> {
-    let mut truncated = None;
+    // `clip.scale` multiplies on top of the device scale factor. Keeping it at 1
+    // means one CSS pixel maps to one device pixel's worth of detail.
+    const CLIP_SCALE: f64 = 1.0;
 
     let clip: Option<Clip> = match region {
         Region::Viewport => None,
         Region::FullPage => {
             let m = metrics(client, session_id).await?;
-            let mut width = m.content_width;
-            let mut height = m.content_height;
-            if width > MAX_DIMENSION || height > MAX_DIMENSION {
-                truncated = Some(format!(
-                    "page is {width:.0}x{height:.0} CSS px; captured the first \
-                     {:.0}x{:.0} because Chromium cannot allocate a larger surface",
-                    width.min(MAX_DIMENSION),
-                    height.min(MAX_DIMENSION)
-                ));
-                width = width.min(MAX_DIMENSION);
-                height = height.min(MAX_DIMENSION);
-            }
-            Some(Clip { x: 0.0, y: 0.0, width, height })
+            Some(Clip {
+                x: 0.0,
+                y: 0.0,
+                width: m.content_width,
+                height: m.content_height,
+            })
         }
         Region::Node { backend_node_id } => {
             // Bring it on screen first: a node parked far outside the viewport can
@@ -179,6 +239,20 @@ pub async fn capture(
         Region::Rect(c) => Some(c),
     };
 
+    // Every clipped path goes through the clamp, not just the full-page one: an
+    // explicit `--rect 0,0,800,20000` is just as capable of producing a silently
+    // duplicated image, and used to.
+    let mut truncated = None;
+    let clip = match clip {
+        Some(c) => {
+            let dpr = device_pixel_ratio(client, session_id).await;
+            let (clamped, note) = clamp_clip(c, CLIP_SCALE, dpr);
+            truncated = note;
+            Some(clamped)
+        }
+        None => None,
+    };
+
     // `captureBeyondViewport` must track whether a clip was given. With a clip it
     // is required, or anything below the fold comes back blank. *Without* a clip
     // it silently expands the capture to the whole document — a plain "viewport"
@@ -197,9 +271,7 @@ pub async fn capture(
         params["clip"] = json!({
             "x": c.x, "y": c.y,
             "width": c.width, "height": c.height,
-            // `scale` multiplies on top of the device scale factor. Keeping it at
-            // 1 means one CSS pixel maps to one device pixel's worth of detail.
-            "scale": 1.0,
+            "scale": CLIP_SCALE,
         });
     }
 
@@ -310,6 +382,52 @@ mod tests {
         assert!(bounding_box(&json!({ "quads": [] })).is_none());
         let flat = json!({ "quads": [[5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]] });
         assert!(bounding_box(&flat).is_none());
+    }
+
+    #[test]
+    fn a_clip_within_the_limit_is_untouched() {
+        let c = Clip { x: 0.0, y: 0.0, width: 1280.0, height: 4000.0 };
+        let (out, note) = clamp_clip(c, 1.0, 1.0);
+        assert_eq!(out, c);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn a_tall_page_is_cut_and_says_so() {
+        let c = Clip { x: 0.0, y: 0.0, width: 800.0, height: 20_000.0 };
+        let (out, note) = clamp_clip(c, 1.0, 1.0);
+        assert_eq!(out.height, MAX_OUTPUT_PIXELS);
+        assert_eq!(out.width, 800.0, "the narrow axis must not be touched");
+        assert!(note.unwrap().contains("16384"));
+    }
+
+    #[test]
+    fn the_limit_is_output_pixels_not_css_pixels() {
+        // The bug this guards: 10000 CSS px passes any CSS-pixel check, but on a
+        // HiDPI display it is 20000 output pixels and Chromium silently repeats
+        // the content past 16384.
+        let c = Clip { x: 0.0, y: 0.0, width: 800.0, height: 10_000.0 };
+
+        let (out, note) = clamp_clip(c, 1.0, 1.0);
+        assert_eq!(out.height, 10_000.0, "fine at 1x");
+        assert!(note.is_none());
+
+        let (out, note) = clamp_clip(c, 1.0, 2.0);
+        assert_eq!(out.height, 8_192.0, "at 2x the same clip must be halved");
+        let note = note.expect("truncation at 2x must be reported");
+        assert!(note.contains("20000 output pixels"), "{note}");
+
+        // clip.scale multiplies on top of the device ratio.
+        let (out, _) = clamp_clip(c, 2.0, 2.0);
+        assert_eq!(out.height, 4_096.0);
+    }
+
+    #[test]
+    fn clamping_preserves_the_origin() {
+        let c = Clip { x: 120.0, y: 640.0, width: 30_000.0, height: 30_000.0 };
+        let (out, _) = clamp_clip(c, 1.0, 1.0);
+        assert_eq!((out.x, out.y), (120.0, 640.0));
+        assert_eq!((out.width, out.height), (MAX_OUTPUT_PIXELS, MAX_OUTPUT_PIXELS));
     }
 
     #[test]

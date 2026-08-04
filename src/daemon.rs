@@ -42,6 +42,8 @@ pub async fn serve() -> anyhow::Result<()> {
     paths::ensure_layout()?;
     let socket_path = paths::socket();
 
+    // Held until this function returns, which is what makes startup single-file.
+    let _lock = acquire_lock()?;
     let listener = bind(&socket_path).await?;
     let _ = std::fs::write(paths::pid_file(), std::process::id().to_string());
 
@@ -107,7 +109,40 @@ pub async fn serve() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An exclusive lock held for the daemon's lifetime.
+///
+/// Dropped — including on a crash, because the kernel releases `flock` when the
+/// file descriptor closes — so there is no stale lock to clean up.
+// The file is never read: holding it open *is* the lock, and dropping it releases.
+struct StartupLock(#[allow(dead_code)] std::fs::File);
+
+/// Takes the single-instance lock, or reports who holds it.
+fn acquire_lock() -> anyhow::Result<StartupLock> {
+    let path = paths::root().join("run").join("browd.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    // SAFETY: `file` is open for the duration of the call and outlives the lock.
+    let rc = unsafe {
+        use std::os::unix::io::AsRawFd;
+        libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+    };
+    if rc != 0 {
+        anyhow::bail!("another browd is already starting or running");
+    }
+    Ok(StartupLock(file))
+}
+
 /// Binds the control socket, clearing a stale one from a crashed daemon.
+///
+/// The stale-socket dance — connect, fail, unlink, bind — races against itself:
+/// two daemons starting together both fail to connect, both unlink, and the
+/// second unlink deletes the first one's freshly bound socket, leaving a daemon
+/// nobody can reach. The lock is taken before any of that so only one process is
+/// ever inside this function.
 async fn bind(path: &std::path::Path) -> anyhow::Result<UnixListener> {
     if path.exists() {
         // A socket file that nobody is listening on is left over from a crash.
