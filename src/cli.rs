@@ -128,6 +128,77 @@ pub enum Command {
         mutate: bool,
     },
 
+    /// Show console output and uncaught exceptions.
+    Console {
+        /// Errors and exceptions only.
+        #[arg(long)]
+        errors: bool,
+        /// How many of the most recent entries to show.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+
+    /// Show network requests.
+    Network {
+        /// Failed and 4xx/5xx requests only.
+        #[arg(long)]
+        failed: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+
+    /// Tap with a finger (enables touch emulation).
+    Tap {
+        /// A ref like @node-42, or a point like 512,340.
+        target: String,
+    },
+
+    /// Press and hold.
+    LongPress {
+        target: String,
+        #[arg(long, default_value_t = 800)]
+        duration_ms: u64,
+    },
+
+    /// Swipe a finger between two points.
+    Swipe {
+        /// Start: a ref or a point.
+        #[arg(long)]
+        from: String,
+        /// End: a ref or a point.
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value_t = 450)]
+        duration_ms: u64,
+        #[arg(long, default_value_t = 24)]
+        steps: u32,
+    },
+
+    /// Pinch to zoom.
+    Pinch {
+        /// Centre of the gesture: a ref or a point.
+        #[arg(long)]
+        center: String,
+        /// Above 1 zooms in, below 1 zooms out.
+        #[arg(long)]
+        scale: f64,
+        /// Gesture speed, in pixels per second.
+        #[arg(long)]
+        speed: Option<i64>,
+    },
+
+    /// Drag with the mouse held down.
+    Drag {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value_t = 450)]
+        duration_ms: u64,
+        #[arg(long, default_value_t = 24)]
+        steps: u32,
+    },
+
     /// Close a session and its browser.
     Close,
 

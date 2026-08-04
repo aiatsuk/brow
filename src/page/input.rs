@@ -328,6 +328,204 @@ pub async fn insert_text(
         .map(|_| ())
 }
 
+/// Turns on touch input for the target.
+///
+/// Without this, `Input.dispatchTouchEvent` is accepted and then ignored: the
+/// renderer has no touch device configured, so nothing is delivered.
+///
+/// **Feature detection lags by one navigation.** Measured 2026-08-04: enabling
+/// touch emulation updates `navigator.maxTouchPoints` on the live document
+/// immediately (0 → 5) but leaves `'ontouchstart' in window` false, because that
+/// property is fixed when the document is created. Touch events are delivered and
+/// handled correctly either way — but a responsive site that branches on
+/// `ontouchstart` keeps rendering its desktop layout until the page is reloaded.
+pub async fn enable_touch(
+    client: &CdpClient,
+    session_id: &str,
+    enabled: bool,
+) -> Result<(), CdpError> {
+    client
+        .call_on(
+            session_id,
+            "Emulation.setTouchEmulationEnabled",
+            json!({ "enabled": enabled, "maxTouchPoints": 5 }),
+        )
+        .await
+        .map(|_| ())
+}
+
+fn touch_point(p: Point) -> Value {
+    json!({
+        "x": p.x,
+        "y": p.y,
+        // A real finger has an area; some hit-testing and gesture libraries use it.
+        "radiusX": 12.0,
+        "radiusY": 12.0,
+        "force": 1.0,
+        "id": 0,
+    })
+}
+
+async fn touch(
+    client: &CdpClient,
+    session_id: &str,
+    kind: &str,
+    points: Vec<Value>,
+) -> Result<(), CdpError> {
+    client
+        .call_on(
+            session_id,
+            "Input.dispatchTouchEvent",
+            json!({ "type": kind, "touchPoints": points }),
+        )
+        .await
+        .map(|_| ())
+}
+
+/// A finger down and up in the same place.
+pub async fn tap(client: &CdpClient, session_id: &str, point: Point) -> Result<(), CdpError> {
+    touch(client, session_id, "touchStart", vec![touch_point(point)]).await?;
+    // `touchEnd` carries the points that are *still* down, so a single-finger tap
+    // ends with an empty list.
+    touch(client, session_id, "touchEnd", vec![]).await
+}
+
+/// Holds a finger down long enough to trigger a long-press handler.
+pub async fn long_press(
+    client: &CdpClient,
+    session_id: &str,
+    point: Point,
+    duration: Duration,
+) -> Result<(), CdpError> {
+    touch(client, session_id, "touchStart", vec![touch_point(point)]).await?;
+    tokio::time::sleep(duration).await;
+    touch(client, session_id, "touchEnd", vec![]).await
+}
+
+/// Drags a finger from one point to another.
+///
+/// The intermediate moves are what make this a swipe rather than a teleport:
+/// Chromium derives fling velocity from the timing of the point stream, so a
+/// two-event "swipe" produces no momentum and many carousels simply ignore it.
+pub async fn swipe(
+    client: &CdpClient,
+    session_id: &str,
+    from: Point,
+    to: Point,
+    duration: Duration,
+    steps: u32,
+) -> Result<(), CdpError> {
+    let steps = steps.max(2);
+    let per_step = duration / steps;
+
+    touch(client, session_id, "touchStart", vec![touch_point(from)]).await?;
+    for i in 1..=steps {
+        let t = f64::from(i) / f64::from(steps);
+        // Ease-out, because a real finger decelerates and constant-velocity input
+        // reads as synthetic to momentum calculations.
+        let eased = 1.0 - (1.0 - t).powi(2);
+        let point = Point {
+            x: from.x + (to.x - from.x) * eased,
+            y: from.y + (to.y - from.y) * eased,
+        };
+        touch(client, session_id, "touchMove", vec![touch_point(point)]).await?;
+        tokio::time::sleep(per_step).await;
+    }
+    touch(client, session_id, "touchEnd", vec![]).await
+}
+
+/// A two-finger pinch, synthesised by the compositor.
+///
+/// `Input.synthesizePinchGesture` is used rather than hand-rolled multi-touch: it
+/// drives the same gesture pipeline as a real trackpad or touchscreen, so page
+/// zoom and gesture libraries both respond correctly. Verified present on Chrome
+/// 2026-08-04.
+pub async fn pinch(
+    client: &CdpClient,
+    session_id: &str,
+    center: Point,
+    scale_factor: f64,
+    relative_speed: Option<i64>,
+) -> Result<(), CdpError> {
+    let mut params = json!({
+        "x": center.x,
+        "y": center.y,
+        "scaleFactor": scale_factor,
+    });
+    if let Some(speed) = relative_speed {
+        params["relativeSpeed"] = json!(speed);
+    }
+    client
+        .call_on(session_id, "Input.synthesizePinchGesture", params)
+        .await
+        .map(|_| ())
+}
+
+/// Press, move, release with the mouse held down.
+///
+/// This is the pointer-based drag that libraries like dnd-kit listen for. HTML5
+/// native drag-and-drop is a *different* mechanism and is not covered here.
+pub async fn drag(
+    client: &CdpClient,
+    session_id: &str,
+    from: Point,
+    to: Point,
+    duration: Duration,
+    steps: u32,
+) -> Result<(), CdpError> {
+    let steps = steps.max(2);
+    let per_step = duration / steps;
+    let button = MouseButton::Left;
+
+    hover_at(client, session_id, from, 0).await?;
+    client
+        .call_on(
+            session_id,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mousePressed", "x": from.x, "y": from.y,
+                "button": button.cdp(), "buttons": button.mask(), "clickCount": 1,
+                "pointerType": "mouse",
+            }),
+        )
+        .await?;
+
+    for i in 1..=steps {
+        let t = f64::from(i) / f64::from(steps);
+        let point = Point {
+            x: from.x + (to.x - from.x) * t,
+            y: from.y + (to.y - from.y) * t,
+        };
+        client
+            .call_on(
+                session_id,
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseMoved", "x": point.x, "y": point.y,
+                    // The held button must stay in the bitmask for the whole drag,
+                    // or the page sees a hover, not a drag.
+                    "button": button.cdp(), "buttons": button.mask(),
+                    "pointerType": "mouse",
+                }),
+            )
+            .await?;
+        tokio::time::sleep(per_step).await;
+    }
+
+    client
+        .call_on(
+            session_id,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseReleased", "x": to.x, "y": to.y,
+                "button": button.cdp(), "buttons": 0, "clickCount": 1,
+                "pointerType": "mouse",
+            }),
+        )
+        .await
+        .map(|_| ())
+}
+
 /// Selects everything in the focused editable field.
 ///
 /// Sending `Cmd+A`/`Ctrl+A` as a plain key event does **not** work: select-all is

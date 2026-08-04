@@ -64,8 +64,42 @@ error, not a wrong click — that is deliberate, and the error tells you what to
 | Scroll | `brow scroll down 800` |
 | Screenshot | `brow screenshot` · `--full-page` · `--node @node-12` · `-o path.png` |
 | Read page state | `brow eval "document.querySelector('#status').textContent"` |
+| Console + exceptions | `brow console` (`--errors` for problems only) |
+| Network | `brow network` (`--failed` for failures and 4xx/5xx) |
+| Touch | `brow tap @node-12` · `brow long-press @node-12` · `brow swipe --from 320,700 --to 320,160` |
+| Pinch zoom | `brow pinch --center 400,400 --scale 1.8` |
+| Drag | `brow drag --from @node-31 --to @node-40` |
 | Several browsers | `--session qa` on any command |
 | Finish | `brow close` |
+
+## Diagnosing, not guessing
+
+When something on the page did not work, look before theorising:
+
+```bash
+brow console --errors     # did the app throw?
+brow network --failed     # did a request 404 or blow up CORS?
+```
+
+This is usually faster and far more conclusive than screenshotting and
+speculating. Credentials are already stripped from the output, so it is safe to
+quote back to the user.
+
+Two things to know:
+
+- A request shows a status as soon as headers arrive, but only counts as
+  *finished* once its body has fully transferred. A `fetch` whose body the app
+  never reads stays unfinished forever — that is normal, not a hang.
+- Capture keeps the most recent 2000 entries per session and says how many it
+  dropped.
+
+## Touch
+
+Touch gestures turn on touch emulation the first time you use one. That updates
+`navigator.maxTouchPoints` right away, but `'ontouchstart' in window` stays false
+until the page reloads. Gestures work regardless — but if you are testing a
+responsive layout that branches on touch support, tap once and then `brow open`
+the same URL again so the site re-renders in its touch layout.
 
 Add `--json` to any command when you need to parse the result rather than read it.
 

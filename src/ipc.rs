@@ -88,9 +88,70 @@ pub enum Request {
         #[serde(default)]
         mutate: bool,
     },
+    Console {
+        session: String,
+        #[serde(default)]
+        errors: bool,
+        #[serde(default = "fifty")]
+        limit: usize,
+    },
+    Network {
+        session: String,
+        #[serde(default)]
+        failed: bool,
+        #[serde(default = "fifty")]
+        limit: usize,
+    },
+    Tap {
+        session: String,
+        target: Target,
+    },
+    LongPress {
+        session: String,
+        target: Target,
+        #[serde(default = "default_press_ms")]
+        duration_ms: u64,
+    },
+    Swipe {
+        session: String,
+        from: Target,
+        to: Target,
+        #[serde(default = "default_swipe_ms")]
+        duration_ms: u64,
+        #[serde(default = "default_steps")]
+        steps: u32,
+    },
+    Pinch {
+        session: String,
+        center: Target,
+        scale: f64,
+        speed: Option<i64>,
+    },
+    Drag {
+        session: String,
+        from: Target,
+        to: Target,
+        #[serde(default = "default_swipe_ms")]
+        duration_ms: u64,
+        #[serde(default = "default_steps")]
+        steps: u32,
+    },
     Close {
         session: String,
     },
+}
+
+fn fifty() -> usize {
+    50
+}
+fn default_press_ms() -> u64 {
+    800
+}
+fn default_swipe_ms() -> u64 {
+    450
+}
+fn default_steps() -> u32 {
+    24
 }
 
 fn one() -> i64 {

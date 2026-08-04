@@ -53,14 +53,18 @@ fn handle(mut stream: TcpStream) -> std::io::Result<()> {
     }
 
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
-    let body = match path.split('?').next().unwrap_or("/") {
-        "/second" => SECOND_PAGE,
-        "/slow" => SLOW_PAGE,
-        _ => MAIN_PAGE,
+    let (status, content_type, body) = match path.split('?').next().unwrap_or("/") {
+        "/second" => ("200 OK", "text/html; charset=utf-8", SECOND_PAGE),
+        "/slow" => ("200 OK", "text/html; charset=utf-8", SLOW_PAGE),
+        "/events" => ("200 OK", "text/html; charset=utf-8", EVENTS_PAGE),
+        "/gestures" => ("200 OK", "text/html; charset=utf-8", GESTURES_PAGE),
+        "/api/ok" => ("200 OK", "application/json", r#"{"ok":true}"#),
+        "/missing-endpoint" => ("404 Not Found", "application/json", r#"{"error":"nope"}"#),
+        _ => ("200 OK", "text/html; charset=utf-8", MAIN_PAGE),
     };
 
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
          Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
@@ -123,6 +127,68 @@ pub const SECOND_PAGE: &str = r##"<!doctype html>
 <html><head><meta charset="utf-8"><title>second page</title></head>
 <body><h1>Second</h1><button id="only">Only button</button></body></html>"##;
 
+/// Exercises every console level, an uncaught exception, a successful request
+/// carrying a credential in its query string, and a 404.
+pub const EVENTS_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>events</title></head>
+<body><div id="done">no</div>
+<script>
+  console.log('plain message', 42);
+  console.warn('a warning');
+  console.error('an error happened');
+  console.log('retrying with Bearer sk_live_9f8a7b6c5d4e');
+  // Bodies are consumed on purpose: an unread response body leaves the request
+  // without a loadingFinished event, and real application code reads them.
+  Promise.all([
+    fetch('/api/ok?access_token=supersecret12345&page=2').then(function (r) { return r.text(); }).catch(function(){}),
+    fetch('/missing-endpoint').then(function (r) { return r.text(); }).catch(function(){})
+  ]).then(function () { document.getElementById('done').textContent = 'yes'; });
+  setTimeout(function () { window.__nope.boom(); }, 30);
+</script>
+</body></html>"##;
+
+/// Distinguishes tap, long-press and swipe from each other, and tracks a
+/// pointer-based drag.
+pub const GESTURES_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>gestures</title></head>
+<body style="margin:0">
+  <div id="pad" style="position:absolute;left:0;top:0;width:400px;height:400px;background:#eee"></div>
+  <div id="out" style="position:absolute;left:0;top:420px">none</div>
+  <div id="handle" style="position:absolute;left:500px;top:100px;width:80px;height:80px;background:#89f"></div>
+  <div id="dragout" style="position:absolute;left:500px;top:220px">idle</div>
+  <div id="touchcap" style="position:absolute;left:0;top:460px"></div>
+<script>
+  var pad = document.getElementById('pad');
+  var out = document.getElementById('out');
+  var moves = 0, startT = 0;
+  pad.addEventListener('touchstart', function (e) {
+    moves = 0; startT = Date.now();
+    out.textContent = 'start:' + e.touches.length;
+  });
+  pad.addEventListener('touchmove', function () { moves++; });
+  pad.addEventListener('touchend', function () {
+    var dt = Date.now() - startT;
+    if (moves > 3) out.textContent = 'swipe:' + moves;
+    else if (dt > 500) out.textContent = 'longpress:' + dt;
+    else out.textContent = 'tap';
+  });
+
+  var handle = document.getElementById('handle');
+  var dragout = document.getElementById('dragout');
+  var dragging = false, seen = 0;
+  handle.addEventListener('mousedown', function () { dragging = true; seen = 0; dragout.textContent = 'down'; });
+  document.addEventListener('mousemove', function (e) {
+    if (dragging) { seen++; dragout.textContent = 'moving:' + seen + ':' + Math.round(e.clientX); }
+  });
+  document.addEventListener('mouseup', function (e) {
+    if (dragging) { dragging = false; dragout.textContent = 'dropped:' + seen + ':' + Math.round(e.clientX); }
+  });
+
+  document.getElementById('touchcap').textContent =
+    ('ontouchstart' in window) + ':' + navigator.maxTouchPoints;
+</script>
+</body></html>"##;
+
 pub const SLOW_PAGE: &str = r##"<!doctype html>
 <html><head><meta charset="utf-8"><title>slow</title></head>
 <body><div id="late">pending</div>
@@ -156,6 +222,7 @@ impl Drop for Scratch {
 }
 
 /// Reads width and height out of a PNG's IHDR chunk.
+#[allow(dead_code)] // used by the screenshot tests only
 pub fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
         return None;

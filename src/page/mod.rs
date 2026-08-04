@@ -1,6 +1,7 @@
 //! A single attached page: navigation, snapshots, input, capture, evaluation.
 
 pub mod capture;
+pub mod events;
 pub mod input;
 pub mod tree;
 
@@ -13,6 +14,7 @@ use serde_json::{json, Value};
 use crate::cdp::{CdpClient, CdpError, CdpEvent};
 
 pub use capture::{Capture, ImageFormat, Region};
+pub use events::{ConsoleEntry, EventLog, NetworkEntry};
 pub use input::{MouseButton, Point};
 pub use tree::{Node, RefError, Snapshot};
 
@@ -46,6 +48,18 @@ pub struct Page {
     /// Isolated world for our own helper code, recreated per document.
     world: Option<(u64, i64)>,
     snapshotted: bool,
+    /// Console, exception and network capture for this session.
+    pub events: Arc<events::EventLog>,
+    /// Touch emulation is off until a touch gesture is first requested; turning it
+    /// on changes how responsive sites render, so it is not a default.
+    touch_enabled: bool,
+}
+
+/// Something a pointer gesture can aim at.
+#[derive(Debug, Clone)]
+pub enum PointTarget {
+    Ref(String),
+    At(Point),
 }
 
 impl Page {
@@ -86,6 +100,7 @@ impl Page {
 
         let generation = Arc::new(AtomicU64::new(1));
         spawn_generation_watcher(&client, &session_id, &frame_id, Arc::clone(&generation));
+        let events = events::spawn_recorder(&client, &session_id).await;
 
         Ok(Self {
             client,
@@ -96,6 +111,8 @@ impl Page {
             generation,
             world: None,
             snapshotted: false,
+            events,
+            touch_enabled: false,
         })
     }
 
@@ -339,6 +356,86 @@ impl Page {
         )
         .await?;
         Ok(())
+    }
+
+    /// Resolves a gesture target to a viewport point.
+    ///
+    /// A ref goes through the full actionability check; explicit coordinates are
+    /// taken at face value, because the caller asking for a raw point has already
+    /// said they know better than our hit test.
+    pub async fn point_of(&mut self, target: &PointTarget) -> Result<Point, PageError> {
+        match target {
+            PointTarget::At(p) => Ok(*p),
+            PointTarget::Ref(node_ref) => {
+                let backend = self.resolve(node_ref)?;
+                Ok(input::prepare_target(&self.client, &self.session_id, backend).await?)
+            }
+        }
+    }
+
+    async fn ensure_touch(&mut self) -> Result<(), PageError> {
+        if !self.touch_enabled {
+            input::enable_touch(&self.client, &self.session_id, true).await?;
+            self.touch_enabled = true;
+        }
+        Ok(())
+    }
+
+    pub async fn tap(&mut self, target: &PointTarget) -> Result<Point, PageError> {
+        self.ensure_touch().await?;
+        let point = self.point_of(target).await?;
+        input::tap(&self.client, &self.session_id, point).await?;
+        Ok(point)
+    }
+
+    pub async fn long_press(
+        &mut self,
+        target: &PointTarget,
+        duration: Duration,
+    ) -> Result<Point, PageError> {
+        self.ensure_touch().await?;
+        let point = self.point_of(target).await?;
+        input::long_press(&self.client, &self.session_id, point, duration).await?;
+        Ok(point)
+    }
+
+    pub async fn swipe(
+        &mut self,
+        from: &PointTarget,
+        to: &PointTarget,
+        duration: Duration,
+        steps: u32,
+    ) -> Result<(Point, Point), PageError> {
+        self.ensure_touch().await?;
+        let a = self.point_of(from).await?;
+        let b = self.point_of(to).await?;
+        input::swipe(&self.client, &self.session_id, a, b, duration, steps).await?;
+        Ok((a, b))
+    }
+
+    pub async fn pinch(
+        &mut self,
+        center: &PointTarget,
+        scale: f64,
+        speed: Option<i64>,
+    ) -> Result<Point, PageError> {
+        self.ensure_touch().await?;
+        let point = self.point_of(center).await?;
+        input::pinch(&self.client, &self.session_id, point, scale, speed).await?;
+        Ok(point)
+    }
+
+    pub async fn drag(
+        &mut self,
+        from: &PointTarget,
+        to: &PointTarget,
+        duration: Duration,
+        steps: u32,
+    ) -> Result<(Point, Point), PageError> {
+        let a = self.point_of(from).await?;
+        let b = self.point_of(to).await?;
+        input::drag(&self.client, &self.session_id, a, b, duration, steps).await?;
+        Ok((a, b))
     }
 
     pub async fn screenshot(

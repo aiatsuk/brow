@@ -60,10 +60,7 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
             interactive: !all,
         },
         Command::Click { target, button, double, count, force } => {
-            let target = match parse_point(target) {
-                Some((x, y)) => Target::Point { x, y },
-                None => Target::Ref { node_ref: target.clone() },
-            };
+            let target = as_target(target);
             Request::Click {
                 session,
                 target,
@@ -120,11 +117,58 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
             expression: expression.clone(),
             mutate: *mutate,
         },
+        Command::Console { errors, limit } => Request::Console {
+            session,
+            errors: *errors,
+            limit: *limit,
+        },
+        Command::Network { failed, limit } => Request::Network {
+            session,
+            failed: *failed,
+            limit: *limit,
+        },
+        Command::Tap { target } => Request::Tap {
+            session,
+            target: as_target(target),
+        },
+        Command::LongPress { target, duration_ms } => Request::LongPress {
+            session,
+            target: as_target(target),
+            duration_ms: *duration_ms,
+        },
+        Command::Swipe { from, to, duration_ms, steps } => Request::Swipe {
+            session,
+            from: as_target(from),
+            to: as_target(to),
+            duration_ms: *duration_ms,
+            steps: *steps,
+        },
+        Command::Pinch { center, scale, speed } => Request::Pinch {
+            session,
+            center: as_target(center),
+            scale: *scale,
+            speed: *speed,
+        },
+        Command::Drag { from, to, duration_ms, steps } => Request::Drag {
+            session,
+            from: as_target(from),
+            to: as_target(to),
+            duration_ms: *duration_ms,
+            steps: *steps,
+        },
         Command::Close => Request::Close { session },
         Command::Sessions => Request::Sessions,
         Command::Status => Request::Status,
         Command::Daemon { .. } => unreachable!("handled before this point"),
     })
+}
+
+/// A pointer target is a ref unless it parses as `x,y`.
+fn as_target(raw: &str) -> Target {
+    match parse_point(raw) {
+        Some((x, y)) => Target::Point { x, y },
+        None => Target::Ref { node_ref: raw.to_string() },
+    }
 }
 
 /// Accepts `example.com` as well as a full URL, because agents and humans both

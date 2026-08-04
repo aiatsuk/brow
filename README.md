@@ -14,9 +14,9 @@ an agent drives them with.
 
 ## Status
 
-**Iteration 1 — walking skeleton.** Everything below works and is covered by tests
-that run against a real Chromium. Jobs, video, network/console streams, the site
-graph and framework adapters are not built yet.
+**Iteration 2.** Everything below works and is covered by tests that run against
+a real Chromium. Background jobs, video recording, the site graph and framework
+adapters are not built yet.
 
 ## Install
 
@@ -40,7 +40,19 @@ brow fill @node-14 'someone@example.com'
 brow press Enter
 brow screenshot --full-page -o page.png
 brow eval "document.querySelector('#status').textContent"
+brow console --errors               # console output and uncaught exceptions
+brow network --failed               # requests, with credentials already stripped
 brow close
+```
+
+Touch and pointer gestures:
+
+```bash
+brow tap @node-12
+brow long-press @node-12 --duration-ms 800
+brow swipe --from 320,720 --to 320,160 --duration-ms 450
+brow pinch --center 400,400 --scale 1.8
+brow drag --from @node-31 --to @node-40
 ```
 
 Everything takes `--json` for machine-readable output and `--session NAME` to run
@@ -76,6 +88,12 @@ whatever now occupies that position.
 `throwOnSideEffect`, which aborts an expression the moment it tries to mutate
 anything. This is a real guarantee, not a convention — see the caveat below.
 
+**Secrets never reach disk.** Console output and network URLs are redacted at
+capture, not at display: credential headers by name, credential query parameters
+by name, and `Bearer` / JWT token shapes in free text. Redaction is narrow on
+purpose — a request id or a content hash is not a secret, and over-redaction
+destroys the debuggability the capture exists for.
+
 **No listening debug port.** The browser is launched with
 `--remote-debugging-pipe` and speaks only to its parent process over inherited
 file descriptors. Nothing else on the machine can attach to it. The control
@@ -98,6 +116,16 @@ Measured on Chrome, macOS, 2026-08-04.
   not. The error message says so and suggests the rewrite.
 - **Full-page screenshots cap at 16384 px** per axis; beyond that the capture is
   truncated and the result says by how much.
+- **Touch feature detection lags one navigation.** The first touch gesture turns
+  on touch emulation, which updates `navigator.maxTouchPoints` immediately but
+  leaves `'ontouchstart' in window` false until the page reloads — the property is
+  fixed when the document is created. Gestures are delivered correctly either way,
+  but a responsive site keeps its desktop layout until you reload.
+- **Event capture is bounded** at 2000 console entries and 2000 requests per
+  session, oldest dropped first; the count of what was dropped is reported rather
+  than hidden.
+- **Event timestamps are receive time**, not browser event time. CDP mixes several
+  clocks and reconciling them is not done yet.
 - **Out-of-process iframes** are not yet traversed. Same-process iframes appear in
   the tree; a cross-origin one needs its own attached session, which iteration 2
   adds.

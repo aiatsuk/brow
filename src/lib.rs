@@ -23,3 +23,4 @@ pub mod daemon;
 pub mod ipc;
 pub mod page;
 pub mod paths;
+pub mod redact;

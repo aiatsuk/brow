@@ -18,7 +18,9 @@ use tokio::sync::Mutex;
 
 use crate::browser::{self, launch::Headless, LaunchOptions, Launched};
 use crate::ipc::{Hello, Request, Response, ShotTarget, Target, PROTOCOL_VERSION};
-use crate::page::{capture, ImageFormat, MouseButton, Page, PageError, Point, ScreenshotTarget};
+use crate::page::{
+    capture, ImageFormat, MouseButton, Page, PageError, Point, PointTarget, ScreenshotTarget,
+};
 use crate::paths;
 
 struct Session {
@@ -431,6 +433,132 @@ impl Daemon {
                     Err(e) => Response::error(format!("could not write {}: {e}", path.display())),
                 }
             }
+            Request::Console { session, errors, limit } => {
+                let Some(s) = self.sessions.get(&session) else {
+                    return no_session(&session);
+                };
+                let rows = s.page.events.console(errors, limit.clamp(1, 5_000));
+                let (dropped, _) = s.page.events.dropped();
+                let mut text = rows
+                    .iter()
+                    .map(|r| r.render())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.is_empty() {
+                    text = if errors {
+                        "no console errors".into()
+                    } else {
+                        "console is empty".into()
+                    };
+                }
+                if dropped > 0 {
+                    text.push_str(&format!("\n({dropped} older entries dropped)"));
+                }
+                Response::ok_text(json!({ "entries": rows, "dropped": dropped }), text)
+            }
+            Request::Network { session, failed, limit } => {
+                let Some(s) = self.sessions.get(&session) else {
+                    return no_session(&session);
+                };
+                let rows = s.page.events.network(failed, limit.clamp(1, 5_000));
+                let (_, dropped) = s.page.events.dropped();
+                let mut text = rows
+                    .iter()
+                    .map(|r| r.render())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.is_empty() {
+                    text = if failed {
+                        "no failed requests".into()
+                    } else {
+                        "no requests recorded".into()
+                    };
+                }
+                if dropped > 0 {
+                    text.push_str(&format!("\n({dropped} older requests dropped)"));
+                }
+                Response::ok_text(json!({ "requests": rows, "dropped": dropped }), text)
+            }
+            Request::Tap { session, target } => {
+                let Some(s) = self.sessions.get_mut(&session) else {
+                    return no_session(&session);
+                };
+                let target = point_target(target);
+                match s.page.tap(&target).await {
+                    Ok(p) => Response::ok_text(
+                        json!({"x": p.x, "y": p.y}),
+                        format!("tapped {:.0},{:.0}", p.x, p.y),
+                    ),
+                    Err(e) => page_error(e),
+                }
+            }
+            Request::LongPress { session, target, duration_ms } => {
+                let Some(s) = self.sessions.get_mut(&session) else {
+                    return no_session(&session);
+                };
+                let target = point_target(target);
+                match s
+                    .page
+                    .long_press(&target, std::time::Duration::from_millis(duration_ms))
+                    .await
+                {
+                    Ok(p) => Response::ok_text(
+                        json!({"x": p.x, "y": p.y, "duration_ms": duration_ms}),
+                        format!("long-pressed {:.0},{:.0} for {duration_ms}ms", p.x, p.y),
+                    ),
+                    Err(e) => page_error(e),
+                }
+            }
+            Request::Swipe { session, from, to, duration_ms, steps } => {
+                let Some(s) = self.sessions.get_mut(&session) else {
+                    return no_session(&session);
+                };
+                let (a, b) = (point_target(from), point_target(to));
+                match s
+                    .page
+                    .swipe(&a, &b, std::time::Duration::from_millis(duration_ms), steps)
+                    .await
+                {
+                    Ok((a, b)) => Response::ok_text(
+                        json!({"from": {"x": a.x, "y": a.y}, "to": {"x": b.x, "y": b.y}}),
+                        format!(
+                            "swiped {:.0},{:.0} → {:.0},{:.0} over {duration_ms}ms",
+                            a.x, a.y, b.x, b.y
+                        ),
+                    ),
+                    Err(e) => page_error(e),
+                }
+            }
+            Request::Pinch { session, center, scale, speed } => {
+                let Some(s) = self.sessions.get_mut(&session) else {
+                    return no_session(&session);
+                };
+                let center = point_target(center);
+                match s.page.pinch(&center, scale, speed).await {
+                    Ok(p) => Response::ok_text(
+                        json!({"x": p.x, "y": p.y, "scale": scale}),
+                        format!("pinched {scale}× at {:.0},{:.0}", p.x, p.y),
+                    ),
+                    Err(e) => page_error(e),
+                }
+            }
+            Request::Drag { session, from, to, duration_ms, steps } => {
+                let Some(s) = self.sessions.get_mut(&session) else {
+                    return no_session(&session);
+                };
+                let (a, b) = (point_target(from), point_target(to));
+                match s
+                    .page
+                    .drag(&a, &b, std::time::Duration::from_millis(duration_ms), steps)
+                    .await
+                {
+                    Ok((a, b)) => Response::ok_text(
+                        json!({"from": {"x": a.x, "y": a.y}, "to": {"x": b.x, "y": b.y}}),
+                        format!("dragged {:.0},{:.0} → {:.0},{:.0}", a.x, a.y, b.x, b.y),
+                    ),
+                    Err(e) => page_error(e),
+                }
+            }
             Request::Eval { session, expression, mutate } => {
                 let Some(s) = self.sessions.get(&session) else {
                     return no_session(&session);
@@ -523,6 +651,13 @@ fn no_session(session: &str) -> Response {
         format!("no session named {session:?} is open"),
         format!("run `brow open <url>` first (use --session {session} to name it)"),
     )
+}
+
+fn point_target(t: Target) -> PointTarget {
+    match t {
+        Target::Ref { node_ref } => PointTarget::Ref(node_ref),
+        Target::Point { x, y } => PointTarget::At(Point { x, y }),
+    }
 }
 
 fn parse_button(s: &str) -> MouseButton {
