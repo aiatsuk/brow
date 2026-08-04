@@ -163,33 +163,74 @@ pub async fn prepare_target(
     Ok(second)
 }
 
-/// Confirms the node actually receives a pointer at `point`.
+/// What the compositor says is on top at a viewport point.
 ///
-/// Runs in an isolated world so a page cannot lie to us by patching
-/// `Node.prototype.contains` or `document.elementFromPoint`.
-pub async fn hit_test(
+/// This is the authoritative hit test: it runs below the JavaScript boundary, so
+/// a page cannot influence it, and it pierces iframes — the returned `frameId`
+/// tells us which document actually owns the pixel.
+pub async fn node_at_point(
+    client: &CdpClient,
+    session_id: &str,
+    point: Point,
+) -> Result<Option<(i64, String)>, ActionError> {
+    let res = client
+        .call_on(
+            session_id,
+            "DOM.getNodeForLocation",
+            json!({
+                "x": point.x.round() as i64,
+                "y": point.y.round() as i64,
+                "includeUserAgentShadowDOM": false,
+            }),
+        )
+        .await;
+
+    // Nothing rendered at that point is a legitimate answer, not an error.
+    let Ok(res) = res else { return Ok(None) };
+    let Some(backend) = res.get("backendNodeId").and_then(Value::as_i64) else {
+        return Ok(None);
+    };
+    let frame = res
+        .get("frameId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(Some((backend, frame)))
+}
+
+/// Confirms a pointer at the node's centre would reach the node.
+///
+/// Called only when the compositor's answer is not the target node itself, which
+/// happens constantly for legitimate reasons: an `<svg>` icon inside a button, a
+/// `<span>` inside a link, a `<label>` wrapping an input.
+///
+/// The geometry is computed **inside the target's own document**, from the
+/// element's own rect, so this is correct for a node in an iframe without any
+/// coordinate conversion. `world_context_id` must belong to that same frame; pass
+/// an isolated world so a page cannot patch `elementFromPoint` out from under us.
+pub async fn covered_by_foreign_element(
     client: &CdpClient,
     session_id: &str,
     backend_node_id: i64,
     world_context_id: Option<i64>,
-    point: Point,
 ) -> Result<bool, ActionError> {
     let mut params = json!({ "backendNodeId": backend_node_id });
     if let Some(ctx) = world_context_id {
         params["executionContextId"] = json!(ctx);
     }
-    let resolved = client.call_on(session_id, "DOM.resolveNode", params).await?;
+    let Ok(resolved) = client.call_on(session_id, "DOM.resolveNode", params).await else {
+        // The node does not exist in that world, which means the point belongs to
+        // a different document than the target: genuinely covered.
+        return Ok(true);
+    };
     let Some(object_id) = resolved
         .get("object")
         .and_then(|o| o.get("objectId"))
         .and_then(Value::as_str)
     else {
-        return Ok(false);
+        return Ok(true);
     };
 
-    // Accept a hit on the node itself, on a descendant (icon inside a button), or
-    // on an ancestor (the label wrapping an input) — all three mean the click
-    // lands where the caller intends.
     let res = client
         .call_on(
             session_id,
@@ -197,13 +238,17 @@ pub async fn hit_test(
             json!({
                 "objectId": object_id,
                 "returnByValue": true,
-                "functionDeclaration": "function(x, y) {\
-                    const root = this.getRootNode ? this.getRootNode() : document;\
-                    const hit = (root.elementFromPoint ? root : document).elementFromPoint(x, y);\
-                    if (!hit) return false;\
-                    return hit === this || this.contains(hit) || hit.contains(this);\
+                // Accept a hit on the node itself, on a descendant, or on an
+                // ancestor — all three mean the click lands where it should.
+                "functionDeclaration": "function() {\
+                    const r = this.getBoundingClientRect();\
+                    if (!r.width || !r.height) return true;\
+                    const root = this.getRootNode();\
+                    const doc = root.elementFromPoint ? root : this.ownerDocument;\
+                    const hit = doc.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);\
+                    if (!hit) return true;\
+                    return !(hit === this || this.contains(hit) || hit.contains(this));\
                 }",
-                "arguments": [{ "value": point.x }, { "value": point.y }],
             }),
         )
         .await?;
@@ -212,7 +257,7 @@ pub async fn hit_test(
         .get("result")
         .and_then(|r| r.get("value"))
         .and_then(Value::as_bool)
-        .unwrap_or(false))
+        .unwrap_or(true))
 }
 
 /// A full click: move, press, release — the sequence a real mouse produces.

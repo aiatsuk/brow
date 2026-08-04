@@ -57,6 +57,8 @@ fn handle(mut stream: TcpStream) -> std::io::Result<()> {
         "/second" => ("200 OK", "text/html; charset=utf-8", SECOND_PAGE),
         "/slow" => ("200 OK", "text/html; charset=utf-8", SLOW_PAGE),
         "/events" => ("200 OK", "text/html; charset=utf-8", EVENTS_PAGE),
+        "/frames" => ("200 OK", "text/html; charset=utf-8", FRAMES_PAGE),
+        "/frame-inner" => ("200 OK", "text/html; charset=utf-8", FRAME_INNER_PAGE),
         "/gestures" => ("200 OK", "text/html; charset=utf-8", GESTURES_PAGE),
         "/api/ok" => ("200 OK", "application/json", r#"{"ok":true}"#),
         "/missing-endpoint" => ("404 Not Found", "application/json", r#"{"error":"nope"}"#),
@@ -145,6 +147,31 @@ pub const EVENTS_PAGE: &str = r##"<!doctype html>
   ]).then(function () { document.getElementById('done').textContent = 'yes'; });
   setTimeout(function () { window.__nope.boom(); }, 30);
 </script>
+</body></html>"##;
+
+/// A same-origin iframe whose controls are labelled *only* by `aria-label`.
+///
+/// Icon buttons with no text are the case that breaks: if the accessibility tree
+/// is not read per frame, they come back nameless and an agent cannot tell them
+/// apart.
+pub const FRAMES_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>frames</title></head>
+<body style="margin:0">
+  <button id="top" aria-label="Outer close"><svg width="10" height="10"></svg></button>
+  <iframe id="f" src="/frame-inner" style="width:400px;height:200px;border:0"></iframe>
+</body></html>"##;
+
+pub const FRAME_INNER_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0">
+  <button id="deep" aria-label="Inner close"><svg width="10" height="10"></svg></button>
+  <input id="q" aria-label="Inner search">
+  <div id="clicked">no</div>
+  <script>
+    document.getElementById('deep').addEventListener('click', function (e) {
+      document.getElementById('clicked').textContent = 'yes:' + e.isTrusted;
+    });
+  </script>
 </body></html>"##;
 
 /// Distinguishes tap, long-press and swipe from each other, and tracks a

@@ -77,7 +77,12 @@ explanation rather than silently delivered somewhere else.
 **One page tree.** `brow snapshot` merges DOM structure, the accessibility tree,
 layout boxes and computed visibility into a single node model. It pierces shadow
 roots — including **closed** ones, because CDP operates below the JavaScript
-boundary — and folds text into its owning element.
+boundary — folds text into its owning element, and reads same-process iframes
+inline. The accessibility tree is fetched per frame and layout boxes are
+translated into top-level coordinates, because CDP gives neither of those for
+free: `Accessibility.getFullAXTree` does not cross an iframe boundary even
+same-origin, and `DOMSnapshot` reports each document's layout in its own frame's
+coordinate space.
 
 **Refs that expire.** `@node-42` is valid only for the document generation it was
 minted in. Navigating, or an SPA `pushState`, invalidates every outstanding ref,
@@ -126,9 +131,20 @@ Measured on Chrome, macOS, 2026-08-04.
   than hidden.
 - **Event timestamps are receive time**, not browser event time. CDP mixes several
   clocks and reconciling them is not done yet.
-- **Out-of-process iframes** are not yet traversed. Same-process iframes appear in
-  the tree; a cross-origin one needs its own attached session, which iteration 2
-  adds.
+- **Out-of-process iframes** are not yet traversed. Same-process iframes are fully
+  supported — tree, accessible names, coordinates and clicks — but a cross-origin
+  frame runs in its own process and needs its own attached session, which is not
+  wired up yet.
+- **The browser does not survive a daemon restart.** Closing the CDP pipe is
+  Chromium's shutdown signal, so killing `browd` takes its browsers with it —
+  verified, including that it leaves no orphans and that a stale socket is
+  recovered cleanly on the next start. "Persistent" here means across CLI
+  invocations, not across a daemon restart; the latter would need a supervisor
+  process per browser holding the pipe.
+- **`navigator.webdriver` is `true`.** The pipe transport sets it unconditionally.
+  `brow` makes no attempt to hide that it is automation — it is a tool for testing
+  your own applications, and the relevant consequence is that your app may take a
+  bot-detection branch it would not take for a human.
 - **Unix only.** The CDP pipe is wired up with `dup2` in a `pre_exec` hook; the
   Windows handle-inheritance equivalent is not written.
 - **Canvas and WebGL** expose only the `<canvas>` element. Nothing inside it is

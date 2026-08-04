@@ -299,14 +299,24 @@ pub async fn capture(
         )
         .await?;
 
-    let ax = ax_index(client, session_id).await;
+    let frames = frame_ids(client, session_id).await;
+    let ax = ax_index(client, session_id, &frames).await;
     let layout = layout_index(client, session_id).await;
 
     let mut nodes = Vec::new();
     let mut counter: u64 = 0;
     if let Some(root) = doc.get("root") {
         walk(
-            root, 0, false, None, refs, &ax, &layout, &mut counter, &mut nodes,
+            root,
+            0,
+            false,
+            None,
+            (0.0, 0.0),
+            refs,
+            &ax,
+            &layout,
+            &mut counter,
+            &mut nodes,
         );
     }
 
@@ -331,40 +341,97 @@ pub async fn capture(
     })
 }
 
-/// backendDOMNodeId -> (role, accessible name)
-async fn ax_index(client: &CdpClient, session_id: &str) -> HashMap<i64, (String, String)> {
-    let mut out = HashMap::new();
+/// Every frame in this session's tree, main frame first.
+async fn frame_ids(client: &CdpClient, session_id: &str) -> Vec<String> {
     let Ok(tree) = client
-        .call_on(session_id, "Accessibility.getFullAXTree", json!({}))
+        .call_on(session_id, "Page.getFrameTree", json!({}))
         .await
     else {
-        // Accessibility is enrichment, never a hard dependency: a page tree without
-        // roles is degraded, not broken.
-        return out;
+        return Vec::new();
     };
-    let Some(list) = tree.get("nodes").and_then(Value::as_array) else {
-        return out;
+    let mut out = Vec::new();
+    fn walk_frames(node: &Value, out: &mut Vec<String>) {
+        if let Some(id) = node
+            .get("frame")
+            .and_then(|f| f.get("id"))
+            .and_then(Value::as_str)
+        {
+            out.push(id.to_string());
+        }
+        for child in node
+            .get("childFrames")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            walk_frames(child, out);
+        }
+    }
+    if let Some(root) = tree.get("frameTree") {
+        walk_frames(root, &mut out);
+    }
+    out
+}
+
+/// backendDOMNodeId -> (role, accessible name), across every frame.
+///
+/// `Accessibility.getFullAXTree` does **not** cross iframe boundaries — not even
+/// same-origin ones. Measured 2026-08-04: a `<button aria-label="Close dialog">`
+/// with no text content, inside a same-origin iframe, came back from a single
+/// whole-page call with no role and no name at all, so it rendered as a bare
+/// `button` that an agent could not identify. The fix is one call per frame,
+/// merged on `backendDOMNodeId`, which is unique across the whole session.
+///
+/// Out-of-process iframes still need their own attached session and are not
+/// covered here.
+async fn ax_index(
+    client: &CdpClient,
+    session_id: &str,
+    frames: &[String],
+) -> HashMap<i64, (String, String)> {
+    let mut out = HashMap::new();
+
+    // An empty frame list still gets the default whole-session call, so a failure
+    // to read the frame tree degrades rather than blanks the accessibility data.
+    let calls: Vec<Value> = if frames.is_empty() {
+        vec![json!({})]
+    } else {
+        frames.iter().map(|id| json!({ "frameId": id })).collect()
     };
-    for n in list {
-        let Some(backend) = n.get("backendDOMNodeId").and_then(Value::as_i64) else {
+
+    for params in calls {
+        let Ok(tree) = client
+            .call_on(session_id, "Accessibility.getFullAXTree", params)
+            .await
+        else {
+            // Accessibility is enrichment, never a hard dependency: a page tree
+            // without roles is degraded, not broken.
             continue;
         };
-        if n.get("ignored").and_then(Value::as_bool).unwrap_or(false) {
+        let Some(list) = tree.get("nodes").and_then(Value::as_array) else {
             continue;
+        };
+        for n in list {
+            let Some(backend) = n.get("backendDOMNodeId").and_then(Value::as_i64) else {
+                continue;
+            };
+            if n.get("ignored").and_then(Value::as_bool).unwrap_or(false) {
+                continue;
+            }
+            let role = n
+                .get("role")
+                .and_then(|r| r.get("value"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = n
+                .get("name")
+                .and_then(|r| r.get("value"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            out.insert(backend, (role, name));
         }
-        let role = n
-            .get("role")
-            .and_then(|r| r.get("value"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let name = n
-            .get("name")
-            .and_then(|r| r.get("value"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        out.insert(backend, (role, name));
     }
     out
 }
@@ -477,12 +544,22 @@ async fn layout_index(client: &CdpClient, session_id: &str) -> HashMap<i64, Layo
     out
 }
 
+/// Walks the pierced DOM, minting refs and joining in accessibility and layout.
+///
+/// `offset` is the document-space origin of the document being walked. It is
+/// non-zero inside an iframe: `DOMSnapshot.captureSnapshot` returns one record per
+/// document and each one's layout boxes are **frame-local**, so a button at (8,8)
+/// inside an iframe positioned at (30,0) is reported at (8,8) unless we add the
+/// offset back. `DOM.getContentQuads`, which is what input and screenshots use,
+/// is already global — so before this was fixed, `bounds` and the actual click
+/// point disagreed for everything inside a frame.
 #[allow(clippy::too_many_arguments)]
 fn walk(
     node: &Value,
     depth: usize,
     in_shadow: bool,
     inherited_frame: Option<&str>,
+    offset: (f64, f64),
     refs: &mut RefTable,
     ax: &HashMap<i64, (String, String)>,
     layout: &HashMap<i64, LayoutInfo>,
@@ -538,7 +615,11 @@ fn walk(
             name: name.filter(|n| !n.is_empty()),
             text,
             attrs,
-            bounds: li.map(|l| l.bounds),
+            bounds: li.map(|l| Bounds {
+                x: l.bounds.x + offset.0,
+                y: l.bounds.y + offset.1,
+                ..l.bounds
+            }),
             visible: li.map(|l| l.visible).unwrap_or(false),
             disabled,
             depth,
@@ -553,16 +634,25 @@ fn walk(
     let next_depth = if node_type == 1 { depth + 1 } else { depth };
 
     for child in node.get("children").and_then(Value::as_array).into_iter().flatten() {
-        walk(child, next_depth, in_shadow, frame_id.as_deref(), refs, ax, layout, counter, out);
+        walk(child, next_depth, in_shadow, frame_id.as_deref(), offset, refs, ax, layout, counter, out);
     }
     // Shadow roots — open *and* closed, because CDP sees below the JS boundary.
     for root in node.get("shadowRoots").and_then(Value::as_array).into_iter().flatten() {
-        walk(root, next_depth, true, frame_id.as_deref(), refs, ax, layout, counter, out);
+        walk(root, next_depth, true, frame_id.as_deref(), offset, refs, ax, layout, counter, out);
     }
     // Nested documents: same-process iframes arrive inline here. Out-of-process
-    // iframes do not, and need their own attached session (see page::frames).
+    // iframes do not, and need their own attached session.
     if let Some(content) = node.get("contentDocument") {
-        walk(content, next_depth, in_shadow, frame_id.as_deref(), refs, ax, layout, counter, out);
+        // The child document's origin is wherever this iframe element sits, in
+        // coordinates we have already made global. Border and padding are not
+        // accounted for, so a frame with a thick border is off by that much —
+        // small, and only ever affects the informational `bounds` field, never
+        // the click point.
+        let child_offset = layout
+            .get(&backend_node_id)
+            .map(|l| (l.bounds.x + offset.0, l.bounds.y + offset.1))
+            .unwrap_or(offset);
+        walk(content, next_depth, in_shadow, frame_id.as_deref(), child_offset, refs, ax, layout, counter, out);
     }
 }
 
@@ -660,7 +750,7 @@ mod tests {
         let mut refs = RefTable::default();
         let mut nodes = Vec::new();
         let mut counter = 0;
-        walk(&doc, 0, false, None, &mut refs, &HashMap::new(), &HashMap::new(), &mut counter, &mut nodes);
+        walk(&doc, 0, false, None, (0.0, 0.0), &mut refs, &HashMap::new(), &HashMap::new(), &mut counter, &mut nodes);
 
         assert_eq!(nodes.len(), 2, "two elements: button and the shadow span");
         let button = &nodes[0];

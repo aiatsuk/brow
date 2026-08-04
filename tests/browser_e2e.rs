@@ -371,3 +371,84 @@ async fn spa_route_changes_also_invalidate_refs() {
 
     shutdown(launched);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accessibility_names_cross_same_origin_iframes() {
+    if !common::chrome_available() {
+        return common::skip("accessibility_names_cross_same_origin_iframes");
+    }
+    let fixture = common::serve();
+    let (launched, mut page, _scratch) = open_fixture("frames", &fixture.url("/frames")).await;
+    let snap = page.snapshot().await.expect("snapshot");
+
+    // The control in the top-level document is the easy case.
+    assert!(
+        snap.interactive().any(|n| n.name.as_deref() == Some("Outer close")),
+        "the top-level icon button lost its accessible name"
+    );
+
+    // The regression this test exists for: Accessibility.getFullAXTree does not
+    // cross iframe boundaries, not even same-origin ones. Without a per-frame
+    // pass these two come back with no role and no name at all, and an icon-only
+    // button is then indistinguishable from any other <button>.
+    let inner = snap
+        .interactive()
+        .find(|n| n.name.as_deref() == Some("Inner close"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the button inside the iframe has no accessible name; interactive set was {:?}",
+                snap.interactive()
+                    .map(|n| (&n.tag, &n.role, &n.name))
+                    .collect::<Vec<_>>()
+            )
+        })
+        .clone();
+    assert_eq!(inner.role.as_deref(), Some("button"));
+    assert!(
+        snap.interactive()
+            .any(|n| n.name.as_deref() == Some("Inner search")),
+        "the input inside the iframe lost its accessible name"
+    );
+
+    // The second half of the same bug: DOMSnapshot reports layout per document,
+    // so a node inside the iframe came back at its frame-local origin while the
+    // click point (from getContentQuads) was global. Reported geometry and actual
+    // geometry have to agree, or coordinates handed to an agent are a trap.
+    let frame = snap
+        .nodes
+        .iter()
+        .find(|n| n.tag == "iframe")
+        .and_then(|n| n.bounds)
+        .expect("the iframe's own box");
+    let inner_bounds = inner.bounds.expect("the inner button's box");
+    assert!(
+        inner_bounds.x >= frame.x && inner_bounds.y >= frame.y,
+        "inner button reported at {inner_bounds:?}, which is outside its own frame at \
+         {frame:?} — the bounds are still frame-local"
+    );
+    assert!(
+        inner_bounds.x < frame.x + frame.width && inner_bounds.y < frame.y + frame.height,
+        "inner button at {inner_bounds:?} falls outside frame {frame:?}"
+    );
+
+    // ...and a node found through the iframe must actually be clickable, which
+    // means the coordinates were resolved in the top-level viewport's space.
+    page.click(&inner.node_ref, MouseButton::Left, 1, 0, false)
+        .await
+        .expect("click a node inside an iframe");
+    let clicked = page
+        .evaluate(
+            "document.querySelector('#f').contentDocument\
+             .querySelector('#clicked').textContent",
+            true,
+        )
+        .await
+        .expect("read the iframe's state");
+    assert_eq!(
+        clicked.as_str(),
+        Some("yes:true"),
+        "the click did not land inside the iframe as a trusted event"
+    );
+
+    shutdown(launched);
+}

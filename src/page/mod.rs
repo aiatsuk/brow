@@ -45,8 +45,9 @@ pub struct Page {
     /// Bumped by a background watcher whenever the main frame's document is
     /// replaced. Every `@node-N` is scoped to one value of this counter.
     generation: Arc<AtomicU64>,
-    /// Isolated world for our own helper code, recreated per document.
-    world: Option<(u64, i64)>,
+    /// Isolated worlds for our own helper code, one per frame, recreated per
+    /// document generation.
+    worlds: std::collections::HashMap<String, (u64, i64)>,
     snapshotted: bool,
     /// Console, exception and network capture for this session.
     pub events: Arc<events::EventLog>,
@@ -109,7 +110,7 @@ impl Page {
             frame_id,
             refs: tree::RefTable::default(),
             generation,
-            world: None,
+            worlds: std::collections::HashMap::new(),
             snapshotted: false,
             events,
             touch_enabled: false,
@@ -164,7 +165,7 @@ impl Page {
 
         // A navigation invalidates every ref and the isolated world with them.
         self.generation.fetch_add(1, Ordering::SeqCst);
-        self.world = None;
+        self.worlds.clear();
         self.snapshotted = false;
         Ok(())
     }
@@ -193,13 +194,17 @@ impl Page {
         }
     }
 
-    /// An isolated world for our helper code, so a hostile or merely eccentric
-    /// page cannot observe or patch what we run.
-    async fn helper_world(&mut self) -> Result<i64, PageError> {
+    /// An isolated world in `frame_id`, so a hostile or merely eccentric page
+    /// cannot observe or patch what we run.
+    ///
+    /// Keyed by frame as well as generation: a node inside an iframe has to be
+    /// resolved in *that* frame's world, and resolving it in the main frame's
+    /// world simply fails — which is how the iframe click bug got in.
+    async fn helper_world(&mut self, frame_id: &str) -> Result<i64, PageError> {
         let gen = self.generation();
-        if let Some((cached_gen, ctx)) = self.world {
-            if cached_gen == gen {
-                return Ok(ctx);
+        if let Some((cached_gen, ctx)) = self.worlds.get(frame_id) {
+            if *cached_gen == gen {
+                return Ok(*ctx);
             }
         }
         let res = self
@@ -209,7 +214,7 @@ impl Page {
                 "Page.createIsolatedWorld",
                 // `grantUniveralAccess` — the typo is in the protocol itself.
                 json!({
-                    "frameId": self.frame_id,
+                    "frameId": frame_id,
                     "worldName": "__brow",
                     "grantUniveralAccess": true,
                 }),
@@ -219,7 +224,7 @@ impl Page {
             .get("executionContextId")
             .and_then(Value::as_i64)
             .unwrap_or_default();
-        self.world = Some((gen, ctx));
+        self.worlds.insert(frame_id.to_string(), (gen, ctx));
         Ok(ctx)
     }
 
@@ -236,9 +241,26 @@ impl Page {
         let point = input::prepare_target(&self.client, &self.session_id, backend).await?;
 
         if !force {
-            let world = self.helper_world().await.ok();
-            let ok = input::hit_test(&self.client, &self.session_id, backend, world, point).await?;
-            if !ok {
+            // The compositor's answer settles the common case and cannot be
+            // spoofed by the page. Only when it names some *other* node do we pay
+            // for the JavaScript containment check, which distinguishes "an icon
+            // inside the button" from "a modal on top of it".
+            let hit = input::node_at_point(&self.client, &self.session_id, point).await?;
+            let clear = match hit {
+                Some((hit_backend, _)) if hit_backend == backend => true,
+                Some((_, hit_frame)) => {
+                    let world = self.helper_world(&hit_frame).await.ok();
+                    !input::covered_by_foreign_element(
+                        &self.client,
+                        &self.session_id,
+                        backend,
+                        world,
+                    )
+                    .await?
+                }
+                None => false,
+            };
+            if !clear {
                 return Err(PageError::Action(input::ActionError::Occluded {
                     x: point.x,
                     y: point.y,

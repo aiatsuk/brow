@@ -15,10 +15,10 @@ struct Harness {
 }
 
 impl Harness {
-    fn new() -> Self {
+    fn new(tag: &str) -> Self {
         // Short path on purpose: a Unix socket path must fit in 104 bytes on
         // macOS, and the system temp dir is already long.
-        let home = std::path::PathBuf::from(format!("/tmp/brow-it-{}", std::process::id()));
+        let home = std::path::PathBuf::from(format!("/tmp/brow-it-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("create test BROW_HOME");
         Harness { home }
@@ -86,7 +86,7 @@ fn cli_drives_a_browser_through_the_daemon() {
     if !common::chrome_available() {
         return common::skip("cli_drives_a_browser_through_the_daemon");
     }
-    let h = Harness::new();
+    let h = Harness::new("cli");
     let fixture = common::serve();
 
     // Nothing running yet.
@@ -210,4 +210,62 @@ fn cli_drives_a_browser_through_the_daemon() {
 
     // The socket is gone, so the next `brow` will start a clean daemon.
     assert!(!h.home.join("run").join("brow.sock").exists());
+}
+
+/// The CDP pipe is what makes the browser unreachable by any other process. The
+/// price is that the browser's lifetime is tied to whoever holds the pipe, and
+/// that needs to be a measured fact rather than an assumption.
+#[test]
+fn a_dead_daemon_takes_its_browsers_with_it_and_recovers_cleanly() {
+    if !common::chrome_available() {
+        return common::skip("a_dead_daemon_takes_its_browsers_with_it_and_recovers_cleanly");
+    }
+    let h = Harness::new("crash");
+    let fixture = common::serve();
+
+    h.json(&["open", &fixture.url("/")]);
+    let daemon_pid = h.json(&["daemon", "status"])["pid"].as_u64().expect("pid");
+    assert!(
+        !chrome_pids(&h.home).is_empty(),
+        "no browser was started for the test profile"
+    );
+
+    // SIGKILL: no chance to clean up, which is exactly the scenario.
+    let killed = Command::new("kill")
+        .args(["-9", &daemon_pid.to_string()])
+        .status()
+        .expect("kill");
+    assert!(killed.success());
+
+    // Closing the pipe is Chromium's shutdown signal, so the browsers go too.
+    // This is the honest cost of the pipe transport: "persistent" means across
+    // CLI invocations, not across a daemon restart.
+    let mut leftover = chrome_pids(&h.home);
+    for _ in 0..50 {
+        if leftover.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        leftover = chrome_pids(&h.home);
+    }
+    assert!(
+        leftover.is_empty(),
+        "a crashed daemon orphaned Chromium processes: {leftover:?}"
+    );
+
+    // The socket file survives a SIGKILL, so the next start has to recognise it
+    // as stale rather than refuse to bind.
+    assert!(
+        h.home.join("run").join("brow.sock").exists(),
+        "expected a stale socket to be left behind"
+    );
+    let status = h.ok(&["daemon", "status"]);
+    assert!(status.contains("not running"), "got: {status}");
+
+    let reopened = h.json(&["open", &fixture.url("/second")]);
+    assert_eq!(reopened["reused"], false);
+    let snap = h.json(&["snapshot"]);
+    assert_eq!(snap["title"], "second page", "the recovered session is not usable");
+
+    h.ok(&["daemon", "stop"]);
 }
