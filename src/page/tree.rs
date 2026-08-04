@@ -1,0 +1,713 @@
+//! The unified page tree and the `@node-N` reference model.
+//!
+//! One traversal produces a single node model that merges:
+//!   * DOM structure, including **open and closed** shadow roots and nested
+//!     iframes (`DOM.getDocument{pierce:true}` — verified 2026-08-04 to expose
+//!     `mode:"closed"` roots, because CDP operates below the JS boundary),
+//!   * accessibility role and name (`Accessibility.getFullAXTree`),
+//!   * layout box and computed visibility (`DOMSnapshot.captureSnapshot`).
+//!
+//! References are `@node-N`, valid only for the *generation* of the document they
+//! were minted in. Navigating bumps the generation and every prior ref becomes a
+//! loud error rather than a silent mis-click.
+
+use std::collections::{BTreeMap, HashMap};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::cdp::{CdpClient, CdpError};
+
+/// Axis-aligned box in CSS pixels, in document coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Bounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// One node of the unified tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Node {
+    /// Stable within a generation, e.g. `@node-42`.
+    #[serde(rename = "ref")]
+    pub node_ref: String,
+    pub backend_node_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
+    pub tag: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub attrs: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<Bounds>,
+    pub visible: bool,
+    pub disabled: bool,
+    pub interactive: bool,
+    pub depth: usize,
+    /// True when the node lives inside a shadow root (open or closed).
+    pub in_shadow: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_root_type: Option<String>,
+}
+
+/// A whole-page capture plus the ref table it minted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub generation: u64,
+    pub url: String,
+    pub title: String,
+    pub nodes: Vec<Node>,
+}
+
+impl Snapshot {
+    pub fn interactive(&self) -> impl Iterator<Item = &Node> {
+        self.nodes.iter().filter(|n| n.interactive && n.visible)
+    }
+
+    /// Compact text rendering — the default output, tuned for an LLM reader.
+    ///
+    /// One line per node, no closing tags, no punctuation an agent has to parse.
+    /// The full node record is available via `--json` when something specific is
+    /// actually needed; dumping it for every node would cost thousands of tokens
+    /// to say almost nothing.
+    pub fn render_text(&self, interactive_only: bool) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("{}  \"{}\"\n", self.url, self.title));
+        out.push_str(&format!("generation {}\n\n", self.generation));
+
+        let nodes: Vec<&Node> = if interactive_only {
+            self.interactive().collect()
+        } else {
+            self.nodes.iter().filter(|n| n.visible).collect()
+        };
+
+        if nodes.is_empty() {
+            out.push_str("(no matching nodes)\n");
+            return out;
+        }
+
+        for n in nodes {
+            let indent = "  ".repeat(if interactive_only { 0 } else { n.depth.min(12) });
+            out.push_str(&indent);
+            out.push_str(&n.node_ref);
+            out.push(' ');
+            out.push_str(&n.tag);
+            if let Some(role) = &n.role {
+                if role != &n.tag {
+                    out.push_str(&format!(" role={role}"));
+                }
+            }
+            if let Some(name) = n.name.as_deref().filter(|s| !s.is_empty()) {
+                out.push_str(&format!(" \"{}\"", truncate(name, 80)));
+            } else if let Some(text) = n.text.as_deref().filter(|s| !s.is_empty()) {
+                out.push_str(&format!(" \"{}\"", truncate(text, 80)));
+            }
+            for key in ["id", "name", "type", "placeholder", "href", "value"] {
+                if let Some(v) = n.attrs.get(key) {
+                    out.push_str(&format!(" {key}={}", truncate(v, 60)));
+                }
+            }
+            if n.disabled {
+                out.push_str(" disabled");
+            }
+            if n.in_shadow {
+                out.push_str(" shadow");
+            }
+            if let Some(b) = n.bounds {
+                out.push_str(&format!(
+                    " [{:.0},{:.0} {:.0}x{:.0}]",
+                    b.x, b.y, b.width, b.height
+                ));
+            }
+            out.push('\n');
+        }
+        out
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.chars().count() <= max {
+        s
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+}
+
+/// Maps `@node-N` back to the browser-side node it was minted from.
+#[derive(Debug, Default)]
+pub struct RefTable {
+    generation: u64,
+    entries: HashMap<u64, RefEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RefEntry {
+    pub backend_node_id: i64,
+    pub generation: u64,
+    pub tag: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RefError {
+    #[error("{0} is not a node reference (expected something like @node-42)")]
+    Malformed(String),
+    #[error(
+        "{node_ref} is stale: it was minted for generation {had}, the page is now at \
+         generation {now}. Take a fresh `brow snapshot` and use the new refs."
+    )]
+    Stale {
+        node_ref: String,
+        had: u64,
+        now: u64,
+    },
+    #[error("{0} is unknown — no such node in the current snapshot")]
+    Unknown(String),
+}
+
+impl RefTable {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Invalidates every outstanding ref. Called when the document is replaced.
+    ///
+    /// Entries are deliberately *kept*, carrying the generation they were minted
+    /// in. Dropping them would turn a stale ref into "unknown node", and the two
+    /// need different advice: "unknown" means the agent invented a ref, "stale"
+    /// means the page moved and it should re-snapshot. The table stays bounded
+    /// because the next capture re-mints the same small integers and overwrites
+    /// them.
+    pub fn bump(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    /// Adopts the page's current generation.
+    pub fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+
+    fn mint(&mut self, n: u64, backend_node_id: i64, tag: &str) -> String {
+        self.entries.insert(
+            n,
+            RefEntry {
+                backend_node_id,
+                generation: self.generation,
+                tag: tag.to_string(),
+            },
+        );
+        format!("@node-{n}")
+    }
+
+    /// Resolves a ref against the page's *current* generation.
+    ///
+    /// The generation is passed in rather than read from the table because the two
+    /// legitimately differ: the table is stamped when a snapshot is taken, and the
+    /// page moves on afterwards. Comparing against the table's own generation
+    /// would call every stale ref valid.
+    pub fn resolve(&self, node_ref: &str, current: u64) -> Result<RefEntry, RefError> {
+        let n = parse_ref(node_ref).ok_or_else(|| RefError::Malformed(node_ref.to_string()))?;
+        let entry = self
+            .entries
+            .get(&n)
+            .ok_or_else(|| RefError::Unknown(node_ref.to_string()))?;
+        if entry.generation != current {
+            return Err(RefError::Stale {
+                node_ref: node_ref.to_string(),
+                had: entry.generation,
+                now: current,
+            });
+        }
+        Ok(entry.clone())
+    }
+}
+
+/// Accepts `@node-42`, `node-42`, `@42` and `42`.
+pub fn parse_ref(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let s = s.strip_prefix('@').unwrap_or(s);
+    let s = s.strip_prefix("node-").unwrap_or(s);
+    s.parse::<u64>().ok()
+}
+
+/// Tags that are interactive regardless of what the accessibility tree thinks.
+const INTERACTIVE_TAGS: &[&str] = &[
+    "a", "button", "input", "select", "textarea", "summary", "option", "details",
+];
+
+/// Roles that mean "a user can act on this".
+const INTERACTIVE_ROLES: &[&str] = &[
+    "button", "link", "checkbox", "radio", "textbox", "combobox", "listbox", "menuitem",
+    "menuitemcheckbox", "menuitemradio", "option", "searchbox", "slider", "spinbutton",
+    "switch", "tab", "treeitem", "gridcell", "columnheader",
+];
+
+fn is_interactive(tag: &str, role: Option<&str>, attrs: &BTreeMap<String, String>) -> bool {
+    if INTERACTIVE_TAGS.contains(&tag) {
+        return true;
+    }
+    if let Some(role) = role {
+        if INTERACTIVE_ROLES.contains(&role) {
+            return true;
+        }
+    }
+    if attrs.contains_key("onclick") {
+        return true;
+    }
+    if attrs
+        .get("contenteditable")
+        .is_some_and(|v| v != "false")
+    {
+        return true;
+    }
+    // tabindex="-1" is programmatic focus only, not a user affordance.
+    if let Some(ti) = attrs.get("tabindex") {
+        if ti.parse::<i32>().map(|v| v >= 0).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Captures a full unified snapshot of the page attached to `session_id`.
+pub async fn capture(
+    client: &CdpClient,
+    session_id: &str,
+    refs: &mut RefTable,
+) -> Result<Snapshot, CdpError> {
+    // These are idempotent; re-enabling on every snapshot keeps us correct after a
+    // renderer swap without tracking per-target enable state.
+    let _ = client.call_on(session_id, "DOM.enable", json!({})).await;
+    let _ = client
+        .call_on(session_id, "Accessibility.enable", json!({}))
+        .await;
+
+    let doc = client
+        .call_on(
+            session_id,
+            "DOM.getDocument",
+            json!({ "depth": -1, "pierce": true }),
+        )
+        .await?;
+
+    let ax = ax_index(client, session_id).await;
+    let layout = layout_index(client, session_id).await;
+
+    let mut nodes = Vec::new();
+    let mut counter: u64 = 0;
+    if let Some(root) = doc.get("root") {
+        walk(
+            root, 0, false, None, refs, &ax, &layout, &mut counter, &mut nodes,
+        );
+    }
+
+    let url = doc
+        .get("root")
+        .and_then(|r| r.get("documentURL"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let title = nodes
+        .iter()
+        .find(|n| n.tag == "title")
+        .and_then(|n| n.text.clone())
+        .unwrap_or_default();
+
+    Ok(Snapshot {
+        generation: refs.generation(),
+        url,
+        title,
+        nodes,
+    })
+}
+
+/// backendDOMNodeId -> (role, accessible name)
+async fn ax_index(client: &CdpClient, session_id: &str) -> HashMap<i64, (String, String)> {
+    let mut out = HashMap::new();
+    let Ok(tree) = client
+        .call_on(session_id, "Accessibility.getFullAXTree", json!({}))
+        .await
+    else {
+        // Accessibility is enrichment, never a hard dependency: a page tree without
+        // roles is degraded, not broken.
+        return out;
+    };
+    let Some(list) = tree.get("nodes").and_then(Value::as_array) else {
+        return out;
+    };
+    for n in list {
+        let Some(backend) = n.get("backendDOMNodeId").and_then(Value::as_i64) else {
+            continue;
+        };
+        if n.get("ignored").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        let role = n
+            .get("role")
+            .and_then(|r| r.get("value"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let name = n
+            .get("name")
+            .and_then(|r| r.get("value"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        out.insert(backend, (role, name));
+    }
+    out
+}
+
+struct LayoutInfo {
+    bounds: Bounds,
+    visible: bool,
+}
+
+/// backendNodeId -> layout box and computed visibility.
+///
+/// `DOMSnapshot.captureSnapshot` returns one flattened record for the entire page
+/// (all documents) in a single round trip. Nodes with `display:none` have no
+/// layout object at all and are therefore simply absent — which is exactly the
+/// visibility signal we want, for free.
+async fn layout_index(client: &CdpClient, session_id: &str) -> HashMap<i64, LayoutInfo> {
+    const STYLES: [&str; 3] = ["visibility", "opacity", "pointer-events"];
+    let mut out = HashMap::new();
+
+    let Ok(snap) = client
+        .call_on(
+            session_id,
+            "DOMSnapshot.captureSnapshot",
+            json!({
+                "computedStyles": STYLES,
+                "includeDOMRects": false,
+                "includePaintOrder": false,
+            }),
+        )
+        .await
+    else {
+        return out;
+    };
+
+    let strings: Vec<&str> = snap
+        .get("strings")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|v| v.as_str().unwrap_or_default()).collect())
+        .unwrap_or_default();
+    let lookup = |idx: i64| -> &str {
+        usize::try_from(idx)
+            .ok()
+            .and_then(|i| strings.get(i).copied())
+            .unwrap_or_default()
+    };
+
+    let Some(documents) = snap.get("documents").and_then(Value::as_array) else {
+        return out;
+    };
+
+    for doc in documents {
+        let backend_ids: Vec<i64> = doc
+            .get("nodes")
+            .and_then(|n| n.get("backendNodeId"))
+            .and_then(Value::as_array)
+            .map(|a| a.iter().map(|v| v.as_i64().unwrap_or(-1)).collect())
+            .unwrap_or_default();
+
+        let Some(layout) = doc.get("layout") else {
+            continue;
+        };
+        let node_index: Vec<i64> = layout
+            .get("nodeIndex")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().map(|v| v.as_i64().unwrap_or(-1)).collect())
+            .unwrap_or_default();
+        let empty = Vec::new();
+        let boxes = layout.get("bounds").and_then(Value::as_array).unwrap_or(&empty);
+        let styles = layout.get("styles").and_then(Value::as_array);
+
+        for (i, &node_idx) in node_index.iter().enumerate() {
+            let Some(&backend) = usize::try_from(node_idx)
+                .ok()
+                .and_then(|i| backend_ids.get(i))
+            else {
+                continue;
+            };
+            let Some(rect) = boxes.get(i).and_then(Value::as_array) else {
+                continue;
+            };
+            if rect.len() < 4 {
+                continue;
+            }
+            let bounds = Bounds {
+                x: rect[0].as_f64().unwrap_or(0.0),
+                y: rect[1].as_f64().unwrap_or(0.0),
+                width: rect[2].as_f64().unwrap_or(0.0),
+                height: rect[3].as_f64().unwrap_or(0.0),
+            };
+
+            // `styles[i]` is one string-index per entry of STYLES, in order.
+            let mut visible = bounds.width > 0.0 && bounds.height > 0.0;
+            if let Some(row) = styles.and_then(|s| s.get(i)).and_then(Value::as_array) {
+                if let Some(v) = row.first().and_then(Value::as_i64) {
+                    if lookup(v) == "hidden" {
+                        visible = false;
+                    }
+                }
+                if let Some(v) = row.get(1).and_then(Value::as_i64) {
+                    if lookup(v) == "0" {
+                        visible = false;
+                    }
+                }
+            }
+
+            out.insert(backend, LayoutInfo { bounds, visible });
+        }
+    }
+
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    node: &Value,
+    depth: usize,
+    in_shadow: bool,
+    inherited_frame: Option<&str>,
+    refs: &mut RefTable,
+    ax: &HashMap<i64, (String, String)>,
+    layout: &HashMap<i64, LayoutInfo>,
+    counter: &mut u64,
+    out: &mut Vec<Node>,
+) {
+    let node_type = node.get("nodeType").and_then(Value::as_i64).unwrap_or(0);
+    let backend_node_id = node.get("backendNodeId").and_then(Value::as_i64).unwrap_or(-1);
+    let frame_id = node
+        .get("frameId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| inherited_frame.map(str::to_string));
+
+    // Element nodes only; text is folded into its parent below.
+    if node_type == 1 && backend_node_id >= 0 {
+        let tag = node
+            .get("nodeName")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_lowercase();
+
+        let mut attrs = BTreeMap::new();
+        if let Some(list) = node.get("attributes").and_then(Value::as_array) {
+            for pair in list.chunks(2) {
+                if let [k, v] = pair {
+                    if let (Some(k), Some(v)) = (k.as_str(), v.as_str()) {
+                        attrs.insert(k.to_string(), v.to_string());
+                    }
+                }
+            }
+        }
+
+        let text = direct_text(node);
+        let (role, name) = ax
+            .get(&backend_node_id)
+            .map(|(r, n)| (Some(r.clone()), Some(n.clone())))
+            .unwrap_or((None, None));
+        let li = layout.get(&backend_node_id);
+        let disabled = attrs.contains_key("disabled")
+            || attrs.get("aria-disabled").is_some_and(|v| v == "true");
+
+        *counter += 1;
+        let node_ref = refs.mint(*counter, backend_node_id, &tag);
+
+        out.push(Node {
+            node_ref,
+            backend_node_id,
+            frame_id: frame_id.clone(),
+            interactive: is_interactive(&tag, role.as_deref(), &attrs) && !disabled,
+            tag,
+            role: role.filter(|r| !r.is_empty()),
+            name: name.filter(|n| !n.is_empty()),
+            text,
+            attrs,
+            bounds: li.map(|l| l.bounds),
+            visible: li.map(|l| l.visible).unwrap_or(false),
+            disabled,
+            depth,
+            in_shadow,
+            shadow_root_type: node
+                .get("shadowRootType")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
+    }
+
+    let next_depth = if node_type == 1 { depth + 1 } else { depth };
+
+    for child in node.get("children").and_then(Value::as_array).into_iter().flatten() {
+        walk(child, next_depth, in_shadow, frame_id.as_deref(), refs, ax, layout, counter, out);
+    }
+    // Shadow roots — open *and* closed, because CDP sees below the JS boundary.
+    for root in node.get("shadowRoots").and_then(Value::as_array).into_iter().flatten() {
+        walk(root, next_depth, true, frame_id.as_deref(), refs, ax, layout, counter, out);
+    }
+    // Nested documents: same-process iframes arrive inline here. Out-of-process
+    // iframes do not, and need their own attached session (see page::frames).
+    if let Some(content) = node.get("contentDocument") {
+        walk(content, next_depth, in_shadow, frame_id.as_deref(), refs, ax, layout, counter, out);
+    }
+}
+
+/// Concatenates the immediate text-node children of an element.
+fn direct_text(node: &Value) -> Option<String> {
+    let children = node.get("children").and_then(Value::as_array)?;
+    let mut buf = String::new();
+    for c in children {
+        if c.get("nodeType").and_then(Value::as_i64) == Some(3) {
+            if let Some(v) = c.get("nodeValue").and_then(Value::as_str) {
+                buf.push_str(v);
+            }
+        }
+    }
+    let trimmed = buf.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ref_syntax_is_forgiving() {
+        for form in ["@node-42", "node-42", "@42", "42", " @node-42 "] {
+            assert_eq!(parse_ref(form), Some(42), "failed on {form:?}");
+        }
+        assert_eq!(parse_ref("@node-"), None);
+        assert_eq!(parse_ref("button"), None);
+    }
+
+    #[test]
+    fn stale_refs_fail_loudly_after_a_generation_bump() {
+        let mut refs = RefTable::default();
+        let r = refs.mint(1, 900, "button");
+        assert_eq!(refs.resolve(&r, refs.generation()).unwrap().backend_node_id, 900);
+
+        let now = refs.bump();
+        let err = refs.resolve(&r, now).unwrap_err();
+        // The message has to tell the agent what to *do*, not just that it failed.
+        let msg = err.to_string();
+        assert!(msg.contains("stale"), "{msg}");
+        assert!(msg.contains("brow snapshot"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_and_malformed_refs_are_distinguished() {
+        let refs = RefTable::default();
+        assert!(matches!(refs.resolve("@node-7", 0), Err(RefError::Unknown(_))));
+        assert!(matches!(refs.resolve("nope", 0), Err(RefError::Malformed(_))));
+    }
+
+    #[test]
+    fn interactivity_covers_tags_roles_and_handlers() {
+        let mut attrs = BTreeMap::new();
+        assert!(is_interactive("button", None, &attrs));
+        assert!(is_interactive("div", Some("checkbox"), &attrs));
+        assert!(!is_interactive("div", Some("presentation"), &attrs));
+
+        attrs.insert("tabindex".into(), "0".into());
+        assert!(is_interactive("div", None, &attrs));
+        attrs.insert("tabindex".into(), "-1".into());
+        assert!(
+            !is_interactive("div", None, &attrs),
+            "tabindex=-1 is programmatic focus, not a user affordance"
+        );
+
+        attrs.clear();
+        attrs.insert("contenteditable".into(), "true".into());
+        assert!(is_interactive("div", None, &attrs));
+        attrs.insert("contenteditable".into(), "false".into());
+        assert!(!is_interactive("div", None, &attrs));
+    }
+
+    #[test]
+    fn walk_folds_text_into_its_element_and_pierces_shadow() {
+        let doc = json!({
+            "nodeType": 9, "backendNodeId": 1, "nodeName": "#document",
+            "documentURL": "http://x/",
+            "children": [{
+                "nodeType": 1, "backendNodeId": 2, "nodeName": "BUTTON",
+                "attributes": ["id", "go"],
+                "children": [{ "nodeType": 3, "backendNodeId": 3, "nodeValue": "  Create\n account " }],
+                "shadowRoots": [{
+                    "nodeType": 11, "backendNodeId": 4, "nodeName": "#document-fragment",
+                    "shadowRootType": "closed",
+                    "children": [{
+                        "nodeType": 1, "backendNodeId": 5, "nodeName": "SPAN",
+                        "children": [{ "nodeType": 3, "backendNodeId": 6, "nodeValue": "inside closed" }]
+                    }]
+                }]
+            }]
+        });
+
+        let mut refs = RefTable::default();
+        let mut nodes = Vec::new();
+        let mut counter = 0;
+        walk(&doc, 0, false, None, &mut refs, &HashMap::new(), &HashMap::new(), &mut counter, &mut nodes);
+
+        assert_eq!(nodes.len(), 2, "two elements: button and the shadow span");
+        let button = &nodes[0];
+        assert_eq!(button.tag, "button");
+        assert_eq!(button.text.as_deref(), Some("Create account"));
+        assert_eq!(button.attrs.get("id").map(String::as_str), Some("go"));
+        assert!(button.interactive);
+        assert!(!button.in_shadow);
+
+        let span = &nodes[1];
+        assert!(span.in_shadow, "a closed shadow root's contents must be reachable");
+        assert_eq!(span.text.as_deref(), Some("inside closed"));
+    }
+
+    #[test]
+    fn text_rendering_stays_compact() {
+        let snap = Snapshot {
+            generation: 3,
+            url: "http://x/".into(),
+            title: "T".into(),
+            nodes: vec![Node {
+                node_ref: "@node-1".into(),
+                backend_node_id: 2,
+                frame_id: None,
+                tag: "button".into(),
+                role: Some("button".into()),
+                name: Some("Create account".into()),
+                text: None,
+                attrs: BTreeMap::from([("id".into(), "go".into())]),
+                bounds: Some(Bounds { x: 420.0, y: 610.0, width: 220.0, height: 48.0 }),
+                visible: true,
+                disabled: false,
+                interactive: true,
+                depth: 2,
+                in_shadow: false,
+                shadow_root_type: None,
+            }],
+        };
+        let text = snap.render_text(true);
+        assert!(text.contains("generation 3"));
+        let line = text.lines().last().unwrap();
+        assert_eq!(line, "@node-1 button \"Create account\" id=go [420,610 220x48]");
+    }
+
+    #[test]
+    fn truncation_collapses_whitespace() {
+        assert_eq!(truncate("a\n  b   c", 80), "a b c");
+        assert_eq!(truncate("abcdef", 4), "abc…");
+    }
+}

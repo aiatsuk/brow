@@ -1,0 +1,38 @@
+[package]
+name = "brow"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Local-first browser harness for AI agents: persistent Chromium over direct CDP, no Playwright, no cloud"
+license = "MIT"
+repository = "https://github.com/iatsuk/brow"
+default-run = "brow"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "fs",
+    "signal",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
