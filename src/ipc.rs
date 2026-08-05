@@ -139,6 +139,41 @@ pub enum Request {
     Close {
         session: String,
     },
+
+    // ---- background jobs ---------------------------------------------------
+    JobStart {
+        /// Free text for whoever reads the job later. It does **not** drive
+        /// execution: the daemon never calls a model, so the steps are the plan.
+        intent: String,
+        steps: Vec<String>,
+        #[serde(default = "yes")]
+        headless: bool,
+    },
+    JobList,
+    JobStatus {
+        id: String,
+        /// Log lines already seen, so `--follow` can poll for the rest.
+        #[serde(default)]
+        log_from: usize,
+    },
+    /// Answers a `needs_decision` park. For agents.
+    JobAnswer {
+        id: String,
+        answer: String,
+    },
+    /// Answers a `waiting_for_approval` park. For humans.
+    JobApprove {
+        id: String,
+        #[serde(default)]
+        reject: bool,
+    },
+    JobStop {
+        id: String,
+    },
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn fifty() -> usize {

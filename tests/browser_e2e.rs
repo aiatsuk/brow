@@ -35,6 +35,7 @@ async fn tree_input_and_evaluation() {
     if !common::chrome_available() {
         return common::skip("tree_input_and_evaluation");
     }
+    let _slot = common::browser_slot();
     let fixture = common::serve();
     let (launched, mut page, _scratch) = open_fixture("tree", &fixture.url("/")).await;
 
@@ -180,6 +181,7 @@ async fn refs_are_scoped_to_a_document_generation() {
     if !common::chrome_available() {
         return common::skip("refs_are_scoped_to_a_document_generation");
     }
+    let _slot = common::browser_slot();
     let fixture = common::serve();
     let (launched, mut page, _scratch) = open_fixture("refs", &fixture.url("/")).await;
 
@@ -235,6 +237,7 @@ async fn screenshots_cover_viewport_document_and_node() {
     if !common::chrome_available() {
         return common::skip("screenshots_cover_viewport_document_and_node");
     }
+    let _slot = common::browser_slot();
     let fixture = common::serve();
     let (launched, mut page, scratch) = open_fixture("shots", &fixture.url("/")).await;
     let snap = page.snapshot().await.expect("snapshot");
@@ -331,6 +334,7 @@ async fn spa_route_changes_also_invalidate_refs() {
     if !common::chrome_available() {
         return common::skip("spa_route_changes_also_invalidate_refs");
     }
+    let _slot = common::browser_slot();
     let fixture = common::serve();
     let (launched, mut page, _scratch) = open_fixture("spa", &fixture.url("/")).await;
 
@@ -377,6 +381,7 @@ async fn accessibility_names_cross_same_origin_iframes() {
     if !common::chrome_available() {
         return common::skip("accessibility_names_cross_same_origin_iframes");
     }
+    let _slot = common::browser_slot();
     let fixture = common::serve();
     let (launched, mut page, _scratch) = open_fixture("frames", &fixture.url("/frames")).await;
     let snap = page.snapshot().await.expect("snapshot");
@@ -458,6 +463,7 @@ async fn oversized_captures_are_cut_rather_than_silently_duplicated() {
     if !common::chrome_available() {
         return common::skip("oversized_captures_are_cut_rather_than_silently_duplicated");
     }
+    let _slot = common::browser_slot();
     let fixture = common::serve();
     let (launched, mut page, _scratch) = open_fixture("huge", &fixture.url("/")).await;
 

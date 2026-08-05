@@ -1,7 +1,7 @@
 use clap::Parser;
 use serde_json::json;
 
-use brow::cli::{parse_point, parse_rect, Cli, Command, DaemonAction};
+use brow::cli::{parse_point, parse_rect, Cli, Command, DaemonAction, JobAction};
 use brow::client::{self, Client};
 use brow::ipc::{Request, Response, ShotTarget, Target};
 use brow::{daemon, paths};
@@ -39,6 +39,12 @@ async fn run(cli: &Cli) -> anyhow::Result<std::process::ExitCode> {
     // The daemon lifecycle commands do not go over the socket.
     if let Command::Daemon { action } = &cli.command {
         return daemon_command(action, cli.json).await;
+    }
+    // `job logs --follow` is a loop of ordinary requests rather than a streaming
+    // response: it keeps the protocol strictly request/response, and the polling
+    // cost is trivial next to running a browser.
+    if let Command::Job { action: JobAction::Logs { id, follow } } = &cli.command {
+        return follow_logs(id, *follow, cli.json).await;
     }
 
     let request = build_request(cli)?;
@@ -157,6 +163,28 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
             steps: *steps,
         },
         Command::Close => Request::Close { session },
+        Command::Job { action } => match action {
+            JobAction::Start { intent, steps, headed } => Request::JobStart {
+                intent: intent.clone(),
+                steps: steps.clone(),
+                headless: !headed,
+            },
+            JobAction::List => Request::JobList,
+            JobAction::Status { id } => Request::JobStatus {
+                id: id.clone(),
+                log_from: 0,
+            },
+            JobAction::Answer { id, answer } => Request::JobAnswer {
+                id: id.clone(),
+                answer: answer.clone(),
+            },
+            JobAction::Approve { id, reject } => Request::JobApprove {
+                id: id.clone(),
+                reject: *reject,
+            },
+            JobAction::Stop { id } => Request::JobStop { id: id.clone() },
+            JobAction::Logs { .. } => unreachable!("handled before this point"),
+        },
         Command::Sessions => Request::Sessions,
         Command::Status => Request::Status,
         Command::Daemon { .. } => unreachable!("handled before this point"),
@@ -212,6 +240,63 @@ fn render(response: Response, as_json: bool) -> std::process::ExitCode {
             }
             std::process::ExitCode::from(1)
         }
+    }
+}
+
+/// Prints a job's log, optionally until it reaches a terminal state.
+///
+/// Stops on a park as well as on completion: a job waiting for a decision or an
+/// approval is waiting for *the caller*, so blocking there would deadlock the
+/// person who has to answer.
+async fn follow_logs(
+    id: &str,
+    follow: bool,
+    as_json: bool,
+) -> anyhow::Result<std::process::ExitCode> {
+    let mut client = Client::connect_or_start().await?;
+    let mut cursor = 0usize;
+
+    loop {
+        let response = client
+            .request(Request::JobStatus {
+                id: id.to_string(),
+                log_from: cursor,
+            })
+            .await?;
+
+        let Response::Ok { data, .. } = &response else {
+            return Ok(render(response, as_json));
+        };
+
+        if as_json {
+            println!("{}", serde_json::to_string(&data).unwrap_or_default());
+        } else {
+            for line in data["log"].as_array().into_iter().flatten() {
+                if let Some(text) = line["text"].as_str() {
+                    println!("{text}");
+                }
+            }
+        }
+        cursor = data["log_total"].as_u64().unwrap_or(0) as usize;
+
+        let terminal = data["terminal"].as_bool().unwrap_or(true);
+        let parked = data["parked"].as_bool().unwrap_or(false);
+        if !follow || terminal || parked {
+            if !as_json && parked {
+                // The reason it stopped following is the actionable part.
+                if let Response::Ok { text: Some(text), .. } = &response {
+                    print!("{text}");
+                }
+            }
+            let failed = data["state"].as_str() == Some("failed");
+            return Ok(if failed {
+                std::process::ExitCode::from(1)
+            } else {
+                std::process::ExitCode::SUCCESS
+            });
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     }
 }
 

@@ -143,6 +143,44 @@ with the overlay — that is what a user would have to do too. Reach for `--forc
 only when you have confirmed the overlay is irrelevant (a transparent wrapper, a
 decorative layer).
 
+## Long work: background jobs
+
+For anything that would take many turns of clicking — walking a signup flow,
+re-checking a deploy, exercising a long form — hand it to a job instead of
+driving it step by step. A job runs in its own browser and keeps going after your
+command returns.
+
+```bash
+brow job start --intent "check signup still works after the deploy" \
+  --step "open staging.example.com/signup" \
+  --step 'fill "Email" = qa@example.com' \
+  --step 'click "Create account"' \
+  --step "screenshot" \
+  --step "check-errors"
+```
+
+Steps: `open <url>` · `click <text>` · `fill <field>=<value>` · `press <chord>` ·
+`wait <ms>` · `screenshot` · `check-errors`.
+
+Then `brow job logs <id> --follow`. It stops following when the job finishes
+**or when the job needs you** — which is the part to pay attention to.
+
+A job never guesses and never calls a model. It stops in one of two ways:
+
+- **`needs_decision`** — several elements matched your text. It lists them; you
+  pick: `brow job answer <id> 1`. This one is yours to answer.
+- **`waiting_for_approval`** — the next click looks irreversible ("Delete
+  workspace", "Send", "Pay"). **This one is not yours to answer.** Show the user
+  the action and the screenshot the job captured, and let them run
+  `brow job approve <id>` or `--reject`. `brow job answer` is refused here on
+  purpose.
+
+Other useful commands: `brow job list`, `brow job status <id>`,
+`brow job stop <id>`.
+
+If the daemon restarts, running jobs come back as `interrupted` and cannot be
+resumed — start them again rather than assuming they continued.
+
 ## Multiple flows at once
 
 Sessions are independent browsers with independent profiles:

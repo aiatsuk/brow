@@ -14,9 +14,9 @@ an agent drives them with.
 
 ## Status
 
-**Iteration 2.** Everything below works and is covered by tests that run against
-a real Chromium. Background jobs, video recording, the site graph and framework
-adapters are not built yet.
+**Iteration 3.** Everything below works and is covered by tests that run against
+a real Chromium. Video recording, the site graph and framework adapters are not
+built yet.
 
 ## Install
 
@@ -64,6 +64,41 @@ brow sessions
 brow daemon status
 brow daemon stop
 ```
+
+## Background jobs
+
+A job runs a plan in its own browser and keeps going after the command returns.
+
+```bash
+brow job start --intent "check the signup flow still works" \
+  --step "open staging.example.com/signup" \
+  --step 'fill "Email" = qa@example.com' \
+  --step 'click "Create account"' \
+  --step "screenshot" \
+  --step "check-errors"
+
+brow job logs job_0199c… --follow
+brow job list
+```
+
+**The daemon never calls a language model.** A job is executed by heuristics,
+treated as the lower bound on competence rather than as judgement. When the
+heuristics are not enough it stops and asks, and *who* it asks depends on the
+question:
+
+| Parked as | Question | Who answers |
+|---|---|---|
+| `needs_decision` | three controls match `"Continue"` — which one? | the **agent**, with `brow job answer <id> <index>` |
+| `waiting_for_approval` | the next click says "Delete workspace" | a **human**, with `brow job approve <id>` |
+
+Answering the wrong kind of gate is refused, so an agent cannot satisfy its own
+approval request. An approval carries a screenshot of what the job was looking
+at, and is void if the page navigates while it is pending — an approval granted
+against a page that has since changed is about something else.
+
+Jobs do not survive a daemon restart (see the limits below). Interrupted jobs
+come back as `interrupted` with their logs intact rather than pretending they can
+resume.
 
 ## What it does
 

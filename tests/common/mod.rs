@@ -58,6 +58,8 @@ fn handle(mut stream: TcpStream) -> std::io::Result<()> {
         "/slow" => ("200 OK", "text/html; charset=utf-8", SLOW_PAGE),
         "/events" => ("200 OK", "text/html; charset=utf-8", EVENTS_PAGE),
         "/frames" => ("200 OK", "text/html; charset=utf-8", FRAMES_PAGE),
+        "/ambiguous" => ("200 OK", "text/html; charset=utf-8", AMBIGUOUS_PAGE),
+        "/danger" => ("200 OK", "text/html; charset=utf-8", DANGER_PAGE),
         "/frame-inner" => ("200 OK", "text/html; charset=utf-8", FRAME_INNER_PAGE),
         "/gestures" => ("200 OK", "text/html; charset=utf-8", GESTURES_PAGE),
         "/api/ok" => ("200 OK", "application/json", r#"{"ok":true}"#),
@@ -147,6 +149,37 @@ pub const EVENTS_PAGE: &str = r##"<!doctype html>
   ]).then(function () { document.getElementById('done').textContent = 'yes'; });
   setTimeout(function () { window.__nope.boom(); }, 30);
 </script>
+</body></html>"##;
+
+/// Three controls that all say "Continue". A job must refuse to pick one.
+pub const AMBIGUOUS_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>ambiguous</title></head>
+<body style="margin:0">
+  <button id="a" aria-label="Continue as guest">Continue as guest</button>
+  <button id="b" aria-label="Continue, second option">Continue, second option</button>
+  <a id="c" href="#next" aria-label="Continue to checkout">Continue to checkout</a>
+  <div id="picked">none</div>
+  <script>
+    for (const el of document.querySelectorAll('button, a')) {
+      el.addEventListener('click', function (e) {
+        e.preventDefault();
+        document.getElementById('picked').textContent = this.id;
+      });
+    }
+  </script>
+</body></html>"##;
+
+/// One unmistakably destructive control.
+pub const DANGER_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>danger</title></head>
+<body style="margin:0">
+  <button id="del">Delete workspace</button>
+  <div id="state">intact</div>
+  <script>
+    document.getElementById('del').addEventListener('click', function () {
+      document.getElementById('state').textContent = 'deleted';
+    });
+  </script>
 </body></html>"##;
 
 /// A same-origin iframe whose controls are labelled *only* by `aria-label`.
@@ -257,6 +290,48 @@ pub fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
     let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
     let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
     Some((w, h))
+}
+
+/// How many Chromium instances the whole test suite may run at once.
+///
+/// `cargo test` runs each test binary in parallel *and* threads within each one,
+/// so without a bound the suite launches upwards of fifteen browsers on one
+/// machine and starts failing on timeouts that have nothing to do with the code.
+const BROWSER_SLOTS: usize = 4;
+
+/// A reservation for one concurrent browser, released when dropped.
+///
+/// Uses `flock` on a small pool of files so the limit holds *across* test
+/// binaries, which a `Mutex` or a thread-count flag cannot do.
+#[allow(dead_code)]
+pub struct BrowserSlot(std::fs::File);
+
+/// Blocks until a slot is free.
+#[allow(dead_code)]
+pub fn browser_slot() -> BrowserSlot {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = std::path::Path::new("/tmp/brow-test-slots");
+    let _ = std::fs::create_dir_all(dir);
+    loop {
+        for i in 0..BROWSER_SLOTS {
+            let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(dir.join(format!("{i}.lock")))
+            else {
+                continue;
+            };
+            // SAFETY: `file` is open and outlives the lock it takes.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return BrowserSlot(file);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// True when a browser is available; the browser-level tests skip without one.

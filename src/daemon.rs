@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 
 use crate::browser::{self, launch::Headless, LaunchOptions, Launched};
 use crate::ipc::{Hello, Request, Response, ShotTarget, Target, PROTOCOL_VERSION};
+use crate::jobs;
 use crate::page::{
     capture, ImageFormat, MouseButton, Page, PageError, Point, PointTarget, ScreenshotTarget,
 };
@@ -33,6 +34,7 @@ struct Session {
 
 pub struct Daemon {
     sessions: HashMap<String, Session>,
+    jobs: jobs::JobStore,
     started: Instant,
     shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -48,8 +50,18 @@ pub async fn serve() -> anyhow::Result<()> {
     let _ = std::fs::write(paths::pid_file(), std::process::id().to_string());
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    // Jobs from previous daemon lifetimes come back as `interrupted` with their
+    // logs intact, so `brow job status` can still explain what happened.
+    let previous = jobs::load_previous(&paths::jobs_root()).await;
+    if !previous.is_empty() {
+        tracing::info!(count = previous.len(), "recovered job manifests");
+    }
     let daemon = Arc::new(Mutex::new(Daemon {
         sessions: HashMap::new(),
+        jobs: jobs::JobStore {
+            finished: previous,
+            ..Default::default()
+        },
         started: Instant::now(),
         shutdown: shutdown_tx,
     }));
@@ -468,6 +480,110 @@ impl Daemon {
                     Err(e) => Response::error(format!("could not write {}: {e}", path.display())),
                 }
             }
+            Request::JobStart { intent, steps, headless } => {
+                self.job_start(intent, steps, headless).await
+            }
+            Request::JobList => {
+                let mut rows = Vec::new();
+                let mut text = String::new();
+                // Running first, then history, newest last.
+                let mut live: Vec<jobs::JobRecord> = Vec::new();
+                for handle in self.jobs.handles.values() {
+                    live.push(handle.record.lock().await.clone());
+                }
+                live.sort_by_key(|r| r.created_ms);
+                for r in self.jobs.finished.iter().cloned().chain(live) {
+                    text.push_str(&format!(
+                        "{}  {:<20} step {}/{}  {}\n",
+                        r.id,
+                        r.state.label(),
+                        r.cursor.min(r.steps.len()),
+                        r.steps.len(),
+                        r.intent
+                    ));
+                    rows.push(json!({
+                        "id": r.id,
+                        "state": r.state.label(),
+                        "cursor": r.cursor,
+                        "steps": r.steps.len(),
+                        "intent": r.intent,
+                    }));
+                }
+                if text.is_empty() {
+                    text.push_str("no jobs\n");
+                }
+                Response::ok_text(json!(rows), text)
+            }
+            Request::JobStatus { id, log_from } => match self.job_record(&id).await {
+                Some(r) => {
+                    let tail: Vec<&jobs::LogLine> = r.log.iter().skip(log_from).collect();
+                    let mut text = r.render_status();
+                    for line in &tail {
+                        text.push_str(&format!("  {}\n", line.text));
+                    }
+                    Response::ok_text(
+                        json!({
+                            "id": r.id,
+                            "state": r.state.label(),
+                            "terminal": r.state.is_terminal(),
+                            "parked": r.state.is_parked(),
+                            "cursor": r.cursor,
+                            "steps": r.steps.len(),
+                            "intent": r.intent,
+                            "pending": r.pending,
+                            "error": r.error,
+                            "artifacts": r.artifacts,
+                            "log": tail,
+                            "log_total": r.log.len(),
+                        }),
+                        text,
+                    )
+                }
+                None => no_job(&id),
+            },
+            Request::JobAnswer { id, answer } => {
+                self.job_control(
+                    &id,
+                    jobs::Control::Answer(answer),
+                    jobs::JobState::NeedsDecision,
+                    "is not waiting for a decision",
+                )
+                .await
+            }
+            Request::JobApprove { id, reject } => {
+                let control = if reject {
+                    jobs::Control::Reject
+                } else {
+                    jobs::Control::Approve
+                };
+                self.job_control(
+                    &id,
+                    control,
+                    jobs::JobState::WaitingForApproval,
+                    "is not waiting for approval",
+                )
+                .await
+            }
+            Request::JobStop { id } => {
+                let Some(handle) = self.jobs.handles.get(&id) else {
+                    return no_job(&id);
+                };
+                // Both paths, because a job is either parked (reading control) or
+                // mid-step (watching the stop signal), and we do not know which.
+                // `try_send` rather than `send`: awaiting a full channel here would
+                // block every other request, since dispatch holds the daemon lock.
+                let _ = handle.control.try_send(jobs::Control::Stop);
+                let _ = handle.stop.send(true);
+                {
+                    let mut r = handle.record.lock().await;
+                    if !r.state.is_terminal() {
+                        r.state = jobs::JobState::Stopped;
+                        jobs::persist(&r).await;
+                    }
+                }
+                self.reap_job(&id).await;
+                Response::ok_text(json!({ "stopped": id }), format!("stopped {id}"))
+            }
             Request::Console { session, errors, limit } => {
                 let Some(s) = self.sessions.get(&session) else {
                     return no_session(&session);
@@ -665,6 +781,157 @@ impl Daemon {
         )
     }
 
+    /// Starts a job in its own browser and returns without waiting for it.
+    ///
+    /// The job's browser is *not* one of the named sessions: a job runs
+    /// unattended for a long time and must not have its page navigated out from
+    /// under it by an interactive command. It also gets its own window, because
+    /// only one page per browser window is `visible` and a background tab renders
+    /// nothing.
+    async fn job_start(&mut self, intent: String, steps: Vec<String>, headless: bool) -> Response {
+        let parsed: Result<Vec<jobs::Step>, String> =
+            steps.iter().map(|s| jobs::Step::parse(s)).collect();
+        let steps = match parsed {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => return Response::error("a job needs at least one --step"),
+            Err(e) => {
+                return Response::error_hint(e, "run `brow job start --help` for the step syntax")
+            }
+        };
+
+        self.jobs.seq += 1;
+        let id = jobs::new_job_id(self.jobs.seq);
+        let artifacts = paths::job(&id);
+        if let Err(e) = tokio::fs::create_dir_all(&artifacts).await {
+            return Response::error(format!("could not create {}: {e}", artifacts.display()));
+        }
+
+        let mut opts = LaunchOptions::new(artifacts.join("profile"));
+        opts.headless = if headless { Headless::New } else { Headless::Off };
+        let launched = match browser::launch(&opts).await {
+            Ok(l) => l,
+            Err(e) => return Response::error(format!("could not start a browser: {e}")),
+        };
+        let page = match Page::create(Arc::clone(&launched.client), "about:blank").await {
+            Ok(p) => p,
+            Err(e) => {
+                let mut launched = launched;
+                let _ = launched.child.kill();
+                let _ = launched.child.wait();
+                return page_error(e);
+            }
+        };
+
+        let record = Arc::new(Mutex::new(jobs::JobRecord {
+            id: id.clone(),
+            intent: intent.clone(),
+            state: jobs::JobState::Queued,
+            steps,
+            cursor: 0,
+            log: Vec::new(),
+            artifacts: artifacts.clone(),
+            pending: None,
+            error: None,
+            created_ms: jobs::now_ms(),
+        }));
+        // Depth 1: control messages are rare, and a backlog would mean answers
+        // arriving for questions the job has already given up on.
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(1);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+
+        let runner = jobs::Runner {
+            record: Arc::clone(&record),
+            control: control_rx,
+            stop: stop_rx,
+        };
+        let mut page = page;
+        let mut launched = launched;
+        tokio::spawn(async move {
+            runner.run(&mut page).await;
+            // The browser belongs to the job, so it goes when the job does.
+            let _ = launched.child.kill();
+            let _ = launched.child.wait();
+        });
+
+        self.jobs.handles.insert(
+            id.clone(),
+            jobs::JobHandle {
+                record,
+                control: control_tx,
+                stop: stop_tx,
+            },
+        );
+
+        Response::ok_text(
+            json!({ "id": id, "artifacts": artifacts, "state": "queued" }),
+            format!("{id} started\nwatch it with: brow job logs {id} --follow"),
+        )
+    }
+
+    /// Current record for a job, live or historical.
+    async fn job_record(&mut self, id: &str) -> Option<jobs::JobRecord> {
+        let live = match self.jobs.handles.get(id) {
+            Some(handle) => Some(handle.record.lock().await.clone()),
+            None => None,
+        };
+        if let Some(record) = live {
+            // Reaping on read keeps the live table from accumulating handles for
+            // jobs that finished while nobody was looking.
+            if record.state.is_terminal() {
+                self.reap_job(id).await;
+            }
+            return Some(record);
+        }
+        self.jobs.finished.iter().find(|r| r.id == id).cloned()
+    }
+
+    /// Moves a finished job out of the live table so its handle is released.
+    async fn reap_job(&mut self, id: &str) {
+        let Some(handle) = self.jobs.handles.get(id) else {
+            return;
+        };
+        let record = handle.record.lock().await.clone();
+        if record.state.is_terminal() {
+            self.jobs.handles.remove(id);
+            self.jobs.finished.push(record);
+        }
+    }
+
+    /// Delivers a control message, refusing it if the job is not waiting for
+    /// that particular kind of answer.
+    async fn job_control(
+        &mut self,
+        id: &str,
+        control: jobs::Control,
+        expected: jobs::JobState,
+        complaint: &str,
+    ) -> Response {
+        let Some(handle) = self.jobs.handles.get(id) else {
+            return no_job(id);
+        };
+        let state = handle.record.lock().await.state;
+        if state != expected {
+            // Answering the wrong kind of park is the mistake worth catching: an
+            // agent must not be able to satisfy a human approval gate.
+            return Response::error_hint(
+                format!("{id} {complaint} (it is {})", state.label()),
+                match expected {
+                    jobs::JobState::WaitingForApproval => {
+                        "approvals are for a human to give; an agent answers decisions with \
+                         `brow job answer`"
+                    }
+                    _ => "check `brow job status <id>` for what it is actually waiting on",
+                },
+            );
+        }
+        // `try_send` for the same reason as stop: dispatch holds the daemon lock,
+        // so it must never await on a job that is not reading.
+        match handle.control.try_send(control) {
+            Ok(()) => Response::ok_text(json!({ "id": id, "delivered": true }), format!("{id}: ok")),
+            Err(_) => Response::error(format!("{id} stopped listening before the answer arrived")),
+        }
+    }
+
     async fn close_session(&mut self, name: &str) {
         let Some(mut s) = self.sessions.remove(name) else {
             return;
@@ -679,6 +946,13 @@ impl Daemon {
         let _ = s.launched.child.wait();
         tracing::info!(session = name, profile = %s.profile.display(), "session closed");
     }
+}
+
+fn no_job(id: &str) -> Response {
+    Response::error_hint(
+        format!("no job called {id:?}"),
+        "run `brow job list` to see jobs, including ones from earlier daemon lifetimes",
+    )
 }
 
 fn no_session(session: &str) -> Response {

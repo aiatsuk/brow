@@ -51,6 +51,16 @@ pub fn artifacts(session: &str) -> PathBuf {
     root().join("artifacts").join(sanitize(session))
 }
 
+/// Root of all job directories.
+pub fn jobs_root() -> PathBuf {
+    root().join("jobs")
+}
+
+/// One job's artifacts and manifest.
+pub fn job(id: &str) -> PathBuf {
+    jobs_root().join(sanitize(id))
+}
+
 /// Creates the state tree with private permissions.
 ///
 /// The socket lives inside a `0700` directory; anything that can open it can

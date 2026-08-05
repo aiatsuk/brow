@@ -86,6 +86,7 @@ fn cli_drives_a_browser_through_the_daemon() {
     if !common::chrome_available() {
         return common::skip("cli_drives_a_browser_through_the_daemon");
     }
+    let _slot = common::browser_slot();
     let h = Harness::new("cli");
     let fixture = common::serve();
 
@@ -220,6 +221,7 @@ fn a_dead_daemon_takes_its_browsers_with_it_and_recovers_cleanly() {
     if !common::chrome_available() {
         return common::skip("a_dead_daemon_takes_its_browsers_with_it_and_recovers_cleanly");
     }
+    let _slot = common::browser_slot();
     let h = Harness::new("crash");
     let fixture = common::serve();
 

@@ -43,6 +43,7 @@ async fn console_and_network_are_captured_and_redacted() {
     if !common::chrome_available() {
         return common::skip("console_and_network_are_captured_and_redacted");
     }
+    let _slot = common::browser_slot();
     let fixture = common::serve();
     let (launched, page, _scratch) = open_fixture("events", &fixture.url("/events")).await;
     let log = Arc::clone(&page.events);
@@ -147,6 +148,7 @@ async fn touch_gestures_are_distinguishable_by_the_page() {
     if !common::chrome_available() {
         return common::skip("touch_gestures_are_distinguishable_by_the_page");
     }
+    let _slot = common::browser_slot();
     let fixture = common::serve();
     let (launched, mut page, _scratch) = open_fixture("gestures", &fixture.url("/gestures")).await;
 

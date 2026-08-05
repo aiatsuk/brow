@@ -208,11 +208,63 @@ pub enum Command {
     /// Show daemon status.
     Status,
 
+    /// Run and inspect background jobs.
+    ///
+    /// A job executes a deterministic plan in its own browser and keeps running
+    /// after this command returns. The daemon never calls a language model: when
+    /// the plan is ambiguous the job parks and asks you, and when the next action
+    /// looks irreversible it parks and asks a human.
+    Job {
+        #[command(subcommand)]
+        action: JobAction,
+    },
+
     /// Manage the background daemon.
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum JobAction {
+    /// Start a job and return immediately.
+    Start {
+        /// What this job is for, in your own words. Recorded, not executed.
+        #[arg(long)]
+        intent: String,
+        /// One step. Repeat for each.
+        ///
+        /// open <url> · click <text> · fill <field>=<value> · press <chord> ·
+        /// wait <ms> · screenshot · check-errors
+        #[arg(long = "step", value_name = "STEP", required = true)]
+        steps: Vec<String>,
+        /// Show the browser window.
+        #[arg(long)]
+        headed: bool,
+    },
+    /// List jobs, including ones from previous daemon lifetimes.
+    List,
+    /// Show a job's state and what it is waiting for.
+    Status { id: String },
+    /// Print a job's log, optionally waiting for more.
+    Logs {
+        id: String,
+        /// Keep printing until the job reaches a terminal state.
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Answer a needs_decision park, by option index.
+    Answer { id: String, answer: String },
+    /// Approve a waiting_for_approval park. Intended for a human.
+    Approve {
+        id: String,
+        /// Refuse instead, failing the job.
+        #[arg(long)]
+        reject: bool,
+    },
+    /// Stop a running job.
+    Stop { id: String },
 }
 
 #[derive(Subcommand, Debug)]

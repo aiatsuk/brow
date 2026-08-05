@@ -21,6 +21,7 @@ pub mod cli;
 pub mod client;
 pub mod daemon;
 pub mod ipc;
+pub mod jobs;
 pub mod page;
 pub mod paths;
 pub mod redact;
