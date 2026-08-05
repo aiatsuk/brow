@@ -3,3 +3,6 @@
 .DS_Store
 /artifacts
 *.profraw
+
+# local Claude Code settings
+.claude/
