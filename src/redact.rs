@@ -2,7 +2,8 @@
 //!
 //! Anything captured from a page can end up in an agent's context, in a log file
 //! and in a bug report. Redacting at the point of capture — rather than at the
-//! point of display — means a secret is never written to disk in the first place,
+//! point of display — means a secret matched by these rules is never written to
+//! disk in the first place,
 //! so there is no later code path that can accidentally leak it.
 //!
 //! The tradeoff is real and worth stating: over-redaction destroys debuggability.
@@ -80,7 +81,7 @@ pub fn url(raw: &str) -> String {
     };
 
     let mut out = match before_frag.split_once('?') {
-        None => before_frag.to_string(),
+        None => redact_url_userinfo(before_frag),
         Some((base, query)) => {
             let redacted: Vec<String> = query
                 .split('&')
@@ -89,7 +90,7 @@ pub fn url(raw: &str) -> String {
                     _ => pair.to_string(),
                 })
                 .collect();
-            format!("{base}?{}", redacted.join("&"))
+            format!("{}?{}", redact_url_userinfo(base), redacted.join("&"))
         }
     };
 
@@ -110,6 +111,30 @@ pub fn url(raw: &str) -> String {
         out.push_str(&redacted);
     }
     out
+}
+
+/// Masks the RFC 3986 `userinfo@` authority component. Passwords in URL
+/// userinfo are credentials even when no query parameter carries a recognizable
+/// name. The username is masked too because it can itself be sensitive.
+fn redact_url_userinfo(base: &str) -> String {
+    let Some(scheme) = base.find("://") else {
+        return base.to_string();
+    };
+    let authority_start = scheme + 3;
+    let authority_end = base[authority_start..]
+        .find('/')
+        .map(|offset| authority_start + offset)
+        .unwrap_or(base.len());
+    let authority = &base[authority_start..authority_end];
+    let Some(at) = authority.rfind('@') else {
+        return base.to_string();
+    };
+    format!(
+        "{}{}@{}",
+        &base[..authority_start],
+        MASK,
+        &base[authority_start + at + 1..]
+    )
 }
 
 fn is_secret_param(name: &str) -> bool {
@@ -172,7 +197,9 @@ pub fn text(input: &str) -> String {
             Token::Jwt => {
                 let value = &rest[at..];
                 let end = value
-                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'))
+                    .find(|c: char| {
+                        !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+                    })
                     .unwrap_or(value.len());
                 let candidate = &value[..end];
                 // A JWT is three dot-separated segments. `eyJ` at the start of an
@@ -226,7 +253,10 @@ mod tests {
 
     #[test]
     fn ordinary_headers_survive() {
-        assert_eq!(header("Content-Type", "application/json"), "application/json");
+        assert_eq!(
+            header("Content-Type", "application/json"),
+            "application/json"
+        );
         assert_eq!(header("X-Request-Id", "abc-123-def"), "abc-123-def");
         // ...but a token embedded in an ordinary header is still caught.
         assert_eq!(
@@ -255,12 +285,30 @@ mod tests {
             format!("https://app.test/callback#access_token={MASK}&state=xyz")
         );
         // A plain anchor is not a credential.
-        assert_eq!(url("https://docs.test/page#installation"), "https://docs.test/page#installation");
+        assert_eq!(
+            url("https://docs.test/page#installation"),
+            "https://docs.test/page#installation"
+        );
+    }
+
+    #[test]
+    fn url_userinfo_is_redacted_before_storage() {
+        assert_eq!(
+            url("https://alice:swordfish@app.test/private?view=full"),
+            format!("https://{MASK}@app.test/private?view=full")
+        );
+        assert_eq!(
+            url("https://alice@app.test/private"),
+            format!("https://{MASK}@app.test/private")
+        );
     }
 
     #[test]
     fn malformed_urls_still_get_redacted() {
-        assert_eq!(url("not a url?token=secret"), format!("not a url?token={MASK}"));
+        assert_eq!(
+            url("not a url?token=secret"),
+            format!("not a url?token={MASK}")
+        );
         assert_eq!(url(""), "");
     }
 

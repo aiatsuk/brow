@@ -161,7 +161,8 @@ pub enum Request {
         id: String,
         answer: String,
     },
-    /// Answers a `waiting_for_approval` park. For humans.
+    /// Answers a `waiting_for_approval` park. Intended for a human operator, but
+    /// the current local protocol does not authenticate human presence.
     JobApprove {
         id: String,
         #[serde(default)]
@@ -206,8 +207,15 @@ pub enum Target {
 pub enum ShotTarget {
     Viewport,
     FullPage,
-    Node { node_ref: String },
-    Rect { x: f64, y: f64, width: f64, height: f64 },
+    Node {
+        node_ref: String,
+    },
+    Rect {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,7 +275,9 @@ mod tests {
             },
             Request::Click {
                 session: "default".into(),
-                target: Target::Ref { node_ref: "@node-4".into() },
+                target: Target::Ref {
+                    node_ref: "@node-4".into(),
+                },
                 button: "left".into(),
                 count: 2,
                 modifiers: 0,
@@ -276,7 +286,10 @@ mod tests {
         ];
         for req in reqs {
             let line = serde_json::to_string(&req).unwrap();
-            assert!(!line.contains('\n'), "framing requires one line per message");
+            assert!(
+                !line.contains('\n'),
+                "framing requires one line per message"
+            );
             let back: Request = serde_json::from_str(&line).unwrap();
             assert_eq!(
                 serde_json::to_string(&back).unwrap(),
@@ -293,7 +306,12 @@ mod tests {
         )
         .unwrap();
         match req {
-            Request::Click { count, force, modifiers, .. } => {
+            Request::Click {
+                count,
+                force,
+                modifiers,
+                ..
+            } => {
                 assert_eq!(count, 1);
                 assert!(!force);
                 assert_eq!(modifiers, 0);
@@ -308,7 +326,12 @@ mod tests {
         let schema = serde_json::to_string(&Request::Ping).unwrap();
         assert_eq!(schema, r#"{"op":"ping"}"#);
         let names = [
-            "Runtime.evaluate", "Target.", "Browser.", "Network.", "cdp", "raw",
+            "Runtime.evaluate",
+            "Target.",
+            "Browser.",
+            "Network.",
+            "cdp",
+            "raw",
         ];
         let all = format!("{:?}", std::any::type_name::<Request>());
         for n in names {

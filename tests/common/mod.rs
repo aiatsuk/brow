@@ -10,12 +10,99 @@ use std::path::PathBuf;
 
 pub struct Fixture {
     pub base: String,
-    _shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    state: std::sync::Arc<FixtureState>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct FixtureState {
+    danger_mutation_requested: std::sync::atomic::AtomicBool,
+    danger_mutation_observed: std::sync::atomic::AtomicBool,
+    danger_target_clicked: std::sync::atomic::AtomicBool,
+    decision_mutation_requested: std::sync::atomic::AtomicBool,
+    decision_mutation_observed: std::sync::atomic::AtomicBool,
+    decision_target_clicked: std::sync::atomic::AtomicBool,
+    delayed_danger_released: std::sync::atomic::AtomicBool,
 }
 
 impl Fixture {
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
+    }
+
+    /// Tells the mutation fixture to rename its destructive control in place.
+    #[allow(dead_code)]
+    pub fn mutate_danger_target(&self) {
+        self.state
+            .danger_mutation_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Waits until the fixture page confirms that the DOM mutation ran.
+    #[allow(dead_code)]
+    pub fn wait_for_danger_target_mutation(&self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self
+                .state
+                .danger_mutation_observed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("danger fixture did not confirm its target mutation within {timeout:?}");
+    }
+
+    /// Whether the destructive control was actually clicked.
+    #[allow(dead_code)]
+    pub fn danger_target_clicked(&self) -> bool {
+        self.state
+            .danger_target_clicked
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Tells the ambiguity fixture to rename the option selected by the test.
+    #[allow(dead_code)]
+    pub fn mutate_decision_target(&self) {
+        self.state
+            .decision_mutation_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Waits until the ambiguity fixture confirms its in-place rename.
+    #[allow(dead_code)]
+    pub fn wait_for_decision_target_mutation(&self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self
+                .state
+                .decision_mutation_observed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("decision fixture did not confirm its target mutation within {timeout:?}");
+    }
+
+    /// Whether the ambiguity fixture's renamed option was actually clicked.
+    #[allow(dead_code)]
+    pub fn decision_target_clicked(&self) -> bool {
+        self.state
+            .decision_target_clicked
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Lets the delayed destructive page finish loading after test setup.
+    #[allow(dead_code)]
+    pub fn release_delayed_danger(&self) {
+        self.state
+            .delayed_danger_released
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -24,23 +111,49 @@ pub fn serve() -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
     let port = listener.local_addr().unwrap().port();
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = std::sync::Arc::clone(&shutdown);
+    let state = std::sync::Arc::new(FixtureState::default());
+    let server_state = std::sync::Arc::clone(&state);
+    listener
+        .set_nonblocking(true)
+        .expect("make fixture listener nonblocking");
 
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            std::thread::spawn(move || {
-                let _ = handle(stream);
-            });
+    let thread = std::thread::spawn(move || {
+        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let request_state = std::sync::Arc::clone(&server_state);
+                    std::thread::spawn(move || {
+                        let _ = handle(stream, &request_state);
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
         }
     });
 
     Fixture {
         base: format!("http://127.0.0.1:{port}"),
-        _shutdown: shutdown,
+        shutdown,
+        state,
+        thread: Some(thread),
     }
 }
 
-fn handle(mut stream: TcpStream) -> std::io::Result<()> {
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn handle(mut stream: TcpStream, state: &FixtureState) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
@@ -53,22 +166,123 @@ fn handle(mut stream: TcpStream) -> std::io::Result<()> {
     }
 
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
-    let (status, content_type, body) = match path.split('?').next().unwrap_or("/") {
-        "/second" => ("200 OK", "text/html; charset=utf-8", SECOND_PAGE),
-        "/slow" => ("200 OK", "text/html; charset=utf-8", SLOW_PAGE),
-        "/events" => ("200 OK", "text/html; charset=utf-8", EVENTS_PAGE),
-        "/frames" => ("200 OK", "text/html; charset=utf-8", FRAMES_PAGE),
-        "/ambiguous" => ("200 OK", "text/html; charset=utf-8", AMBIGUOUS_PAGE),
-        "/danger" => ("200 OK", "text/html; charset=utf-8", DANGER_PAGE),
-        "/frame-inner" => ("200 OK", "text/html; charset=utf-8", FRAME_INNER_PAGE),
-        "/gestures" => ("200 OK", "text/html; charset=utf-8", GESTURES_PAGE),
-        "/api/ok" => ("200 OK", "application/json", r#"{"ok":true}"#),
-        "/missing-endpoint" => ("404 Not Found", "application/json", r#"{"error":"nope"}"#),
-        _ => ("200 OK", "text/html; charset=utf-8", MAIN_PAGE),
+    let (status, content_type, extra_headers, body) = match path.split('?').next().unwrap_or("/") {
+        "/second" => ("200 OK", "text/html; charset=utf-8", "", SECOND_PAGE),
+        "/slow" => ("200 OK", "text/html; charset=utf-8", "", SLOW_PAGE),
+        "/events" => ("200 OK", "text/html; charset=utf-8", "", EVENTS_PAGE),
+        "/frames" => ("200 OK", "text/html; charset=utf-8", "", FRAMES_PAGE),
+        "/ambiguous" => ("200 OK", "text/html; charset=utf-8", "", AMBIGUOUS_PAGE),
+        "/ambiguous-mutating" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            "",
+            MUTATING_AMBIGUOUS_PAGE,
+        ),
+        "/danger" => ("200 OK", "text/html; charset=utf-8", "", DANGER_PAGE),
+        "/danger-evidence-delayed" => {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !state
+                .delayed_danger_released
+                .load(std::sync::atomic::Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            (
+                "200 OK",
+                "text/html; charset=utf-8",
+                "",
+                MUTATING_DANGER_PAGE,
+            )
+        }
+        "/danger-mutating" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            "",
+            MUTATING_DANGER_PAGE,
+        ),
+        "/danger-mutation-state"
+            if state
+                .danger_mutation_requested
+                .load(std::sync::atomic::Ordering::Acquire) =>
+        {
+            ("200 OK", "text/plain; charset=utf-8", "", "mutate")
+        }
+        "/danger-mutation-state" => ("200 OK", "text/plain; charset=utf-8", "", "wait"),
+        "/danger-mutation-observed" => {
+            state
+                .danger_mutation_observed
+                .store(true, std::sync::atomic::Ordering::Release);
+            ("200 OK", "text/plain; charset=utf-8", "", "ok")
+        }
+        "/danger-target-clicked" => {
+            state
+                .danger_target_clicked
+                .store(true, std::sync::atomic::Ordering::Release);
+            (
+                "200 OK",
+                "text/html; charset=utf-8",
+                "",
+                CLICKED_DANGER_PAGE,
+            )
+        }
+        "/decision-mutation-state"
+            if state
+                .decision_mutation_requested
+                .load(std::sync::atomic::Ordering::Acquire) =>
+        {
+            ("200 OK", "text/plain; charset=utf-8", "", "mutate")
+        }
+        "/decision-mutation-state" => ("200 OK", "text/plain; charset=utf-8", "", "wait"),
+        "/decision-mutation-observed" => {
+            state
+                .decision_mutation_observed
+                .store(true, std::sync::atomic::Ordering::Release);
+            ("200 OK", "text/plain; charset=utf-8", "", "ok")
+        }
+        "/decision-target-clicked" => {
+            state
+                .decision_target_clicked
+                .store(true, std::sync::atomic::Ordering::Release);
+            (
+                "200 OK",
+                "text/html; charset=utf-8",
+                "",
+                CLICKED_DANGER_PAGE,
+            )
+        }
+        "/frame-inner" => ("200 OK", "text/html; charset=utf-8", "", FRAME_INNER_PAGE),
+        "/gestures" => ("200 OK", "text/html; charset=utf-8", "", GESTURES_PAGE),
+        "/redirect-start" => (
+            "302 Found",
+            "text/plain; charset=utf-8",
+            "Location: /redirect-middle\r\n",
+            "redirecting",
+        ),
+        "/redirect-middle" => (
+            "307 Temporary Redirect",
+            "text/plain; charset=utf-8",
+            "Location: /redirect-final\r\n",
+            "redirecting again",
+        ),
+        "/redirect-final" => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            "",
+            REDIRECT_FINAL_PAGE,
+        ),
+        "/api/ok" => ("200 OK", "application/json", "", r#"{"ok":true}"#),
+        "/missing-endpoint" => (
+            "404 Not Found",
+            "application/json",
+            "",
+            r#"{"error":"nope"}"#,
+        ),
+        _ => ("200 OK", "text/html; charset=utf-8", "", MAIN_PAGE),
     };
 
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{extra_headers}\
          Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
@@ -131,6 +345,10 @@ pub const SECOND_PAGE: &str = r##"<!doctype html>
 <html><head><meta charset="utf-8"><title>second page</title></head>
 <body><h1>Second</h1><button id="only">Only button</button></body></html>"##;
 
+pub const REDIRECT_FINAL_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>redirect complete</title></head>
+<body><h1 id="redirect-complete">Redirect complete</h1></body></html>"##;
+
 /// Exercises every console level, an uncaught exception, a successful request
 /// carrying a credential in its query string, and a 404.
 pub const EVENTS_PAGE: &str = r##"<!doctype html>
@@ -169,6 +387,47 @@ pub const AMBIGUOUS_PAGE: &str = r##"<!doctype html>
   </script>
 </body></html>"##;
 
+/// The selected ambiguity option can be renamed in place after the job parks.
+pub const MUTATING_AMBIGUOUS_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>mutating ambiguity</title></head>
+<body style="margin:0">
+  <button id="a" aria-label="Continue as guest">Continue as guest</button>
+  <button id="b" aria-label="Continue, second option">Continue, second option</button>
+  <a id="c" href="#next" aria-label="Continue to checkout">Continue to checkout</a>
+  <div id="picked">none</div>
+  <script>
+    var chosen = document.getElementById('b');
+    chosen.addEventListener('click', function () {
+      document.getElementById('picked').textContent = 'b';
+      var marker = new XMLHttpRequest();
+      marker.open('POST', '/decision-target-clicked', false);
+      marker.send(null);
+    });
+
+    var mutationPoll = setInterval(function () {
+      fetch('/decision-mutation-state?' + Date.now(), { cache: 'no-store' })
+        .then(function (response) { return response.text(); })
+        .then(function (command) {
+          if (command.trim() !== 'mutate') return;
+          clearInterval(mutationPoll);
+          // Preserve document, session, frame, backend id, and tag. Only the
+          // meaning visible to the person choosing this option changes.
+          chosen.setAttribute('aria-label', 'Delete production database');
+          chosen.textContent = 'Delete production database';
+          return new Promise(function (resolve) {
+            requestAnimationFrame(function () { requestAnimationFrame(resolve); });
+          }).then(function () {
+            return fetch('/decision-mutation-observed?' + Date.now(), {
+              method: 'POST',
+              cache: 'no-store'
+            });
+          });
+        })
+        .catch(function () {});
+    }, 25);
+  </script>
+</body></html>"##;
+
 /// One unmistakably destructive control.
 pub const DANGER_PAGE: &str = r##"<!doctype html>
 <html><head><meta charset="utf-8"><title>danger</title></head>
@@ -181,6 +440,55 @@ pub const DANGER_PAGE: &str = r##"<!doctype html>
     });
   </script>
 </body></html>"##;
+
+/// A destructive control whose accessible label can be changed without a
+/// navigation or node replacement, under explicit control of the test process.
+pub const MUTATING_DANGER_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>mutating danger</title></head>
+<body style="margin:0">
+  <button id="del">Delete workspace</button>
+  <div id="state">intact</div>
+  <script>
+    var button = document.getElementById('del');
+    button.addEventListener('click', function () {
+      document.getElementById('state').textContent = 'clicked';
+      // Synchronous on purpose: if brow dispatches a click, the test server's
+      // external marker is committed before the handler can return.
+      var marker = new XMLHttpRequest();
+      marker.open('POST', '/danger-target-clicked', false);
+      marker.send(null);
+    });
+
+    var mutationPoll = setInterval(function () {
+      fetch('/danger-mutation-state?' + Date.now(), { cache: 'no-store' })
+        .then(function (response) { return response.text(); })
+        .then(function (command) {
+          if (command.trim() !== 'mutate') return;
+          clearInterval(mutationPoll);
+          // Keep the exact DOM node and document, but change what the approved
+          // control now means. A generation-only approval check misses this.
+          button.setAttribute('aria-label', 'Delete production database');
+          button.textContent = 'Delete production database';
+          document.getElementById('state').textContent = 'mutated';
+          // Acknowledge after a rendering turn so a subsequent CDP
+          // accessibility read cannot race the DOM mutation.
+          return new Promise(function (resolve) {
+            requestAnimationFrame(function () { requestAnimationFrame(resolve); });
+          }).then(function () {
+            return fetch('/danger-mutation-observed?' + Date.now(), {
+              method: 'POST',
+              cache: 'no-store'
+            });
+          });
+        })
+        .catch(function () {});
+    }, 25);
+  </script>
+</body></html>"##;
+
+pub const CLICKED_DANGER_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>destructive target clicked</title></head>
+<body><div id="state">clicked</div></body></html>"##;
 
 /// A same-origin iframe whose controls are labelled *only* by `aria-label`.
 ///
@@ -336,7 +644,11 @@ pub fn browser_slot() -> BrowserSlot {
 
 /// True when a browser is available; the browser-level tests skip without one.
 pub fn chrome_available() -> bool {
-    brow::browser::find().is_ok()
+    let available = brow::browser::find().is_ok();
+    if !available && std::env::var_os("BROW_REQUIRE_CHROME").is_some() {
+        panic!("BROW_REQUIRE_CHROME is set but no Chromium-family browser was found");
+    }
+    available
 }
 
 /// Prints a skip notice once, so a skipped test is visible rather than silent.

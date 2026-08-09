@@ -6,10 +6,15 @@
 //! looks plausible, which is the worst kind of bug — so the conversion happens in
 //! exactly one place here, using the visual viewport's page offset.
 
+use std::ffi::OsString;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
 
 use crate::cdp::{CdpClient, CdpError};
 
@@ -78,6 +83,19 @@ pub enum Region {
 /// to never ask for more than the limit, so the clamp below is a correctness
 /// requirement rather than a nicety.
 const MAX_OUTPUT_PIXELS: f64 = 16_384.0;
+/// Maximum output-pixel area of one CDP screenshot response.
+///
+/// CDP embeds images as base64 in one JSON frame. Eight million worst-case RGBA
+/// pixels are 32 MB before PNG compression and about 43 MB after base64, leaving
+/// ample framing headroom below the transport's 64 MiB per-frame limit.
+const MAX_CAPTURE_FRAME_PIXELS: u64 = 8_000_000;
+/// Hard bound for an in-memory stitched RGBA result (256 MiB before encoding).
+const MAX_STITCH_PIXELS: u64 = 64_000_000;
+static CAPTURE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// A stitched capture can own up to 256 MiB of RGBA plus one decoded tile and
+/// the encoded result. Serialize this path process-wide so concurrent sessions
+/// cannot multiply that peak until streaming PNG assembly replaces it.
+static TILED_CAPTURE_SLOT: Semaphore = Semaphore::const_new(1);
 
 pub struct Capture {
     pub bytes: Vec<u8>,
@@ -85,6 +103,10 @@ pub struct Capture {
     pub clip: Option<Clip>,
     /// Set when the requested region had to be shrunk to fit Chromium's limits.
     pub truncated: Option<String>,
+    /// True when a full-page PNG was assembled from multiple safe CDP clips.
+    pub tiled: bool,
+    /// Number of CDP image clips represented by this capture.
+    pub tile_count: usize,
 }
 
 impl Capture {
@@ -92,7 +114,35 @@ impl Capture {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(path, &self.bytes).await?;
+        let sequence = CAPTURE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = OsString::from(path.file_name().unwrap_or_default());
+        temp_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+        let temp = path.with_file_name(temp_name);
+        let result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)
+                .await?;
+            file.write_all(&self.bytes).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&temp, path).await?;
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                // The manifest may be fsynced immediately after this returns. Sync
+                // the directory too, so it can never durably point at evidence
+                // whose rename existed only in the kernel cache.
+                tokio::fs::File::open(parent).await?.sync_all().await?;
+            }
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temp).await;
+        }
+        result?;
         Ok(path.to_path_buf())
     }
 }
@@ -108,20 +158,24 @@ impl Capture {
 fn clamp_clip(clip: Clip, scale: f64, device_ratio: f64) -> (Clip, Option<String>) {
     let factor = (scale * device_ratio).max(0.01);
     let max_css = MAX_OUTPUT_PIXELS / factor;
-
-    if clip.width <= max_css && clip.height <= max_css {
-        return (clip, None);
-    }
-
-    let clamped = Clip {
+    let mut clamped = Clip {
         width: clip.width.min(max_css),
         height: clip.height.min(max_css),
         ..clip
     };
+    let max_css_area = MAX_CAPTURE_FRAME_PIXELS as f64 / (factor * factor);
+    if clamped.width > 0.0 && clamped.width * clamped.height > max_css_area {
+        clamped.height = (max_css_area / clamped.width).max(1.0 / factor);
+    }
+    if clamped == clip {
+        return (clip, None);
+    }
+
     let note = format!(
         "requested {:.0}x{:.0} CSS px at {factor:.0}x, which is {:.0}x{:.0} output pixels; \
-         Chromium silently repeats content past {MAX_OUTPUT_PIXELS:.0}, so the capture was \
-         cut to {:.0}x{:.0} CSS px",
+         a single safe capture is limited to {MAX_OUTPUT_PIXELS:.0} pixels per axis and \
+         {MAX_CAPTURE_FRAME_PIXELS} pixels total, so the capture was cut to \
+         {:.0}x{:.0} CSS px",
         clip.width,
         clip.height,
         clip.width * factor,
@@ -154,7 +208,11 @@ async fn device_pixel_ratio(client: &CdpClient, session_id: &str) -> f64 {
         )
         .await;
     res.ok()
-        .and_then(|v| v.get("result").and_then(|r| r.get("value")).and_then(Value::as_f64))
+        .and_then(|v| {
+            v.get("result")
+                .and_then(|r| r.get("value"))
+                .and_then(Value::as_f64)
+        })
         // Assuming 1 would under-clamp on HiDPI, which is the failure we are
         // guarding against, so guess high when we cannot tell.
         .filter(|r| *r > 0.0)
@@ -167,16 +225,252 @@ async fn metrics(client: &CdpClient, session_id: &str) -> Result<Metrics, CdpErr
         .await?;
     // Prefer the `css*` fields: the legacy ones are in device pixels on some
     // platforms and silently disagree with `clip`, which is always CSS pixels.
-    let visual = m.get("cssVisualViewport").or_else(|| m.get("visualViewport"));
+    let visual = m
+        .get("cssVisualViewport")
+        .or_else(|| m.get("visualViewport"));
     let content = m.get("cssContentSize").or_else(|| m.get("contentSize"));
     let num = |v: Option<&Value>, k: &str| -> f64 {
-        v.and_then(|v| v.get(k)).and_then(Value::as_f64).unwrap_or(0.0)
+        v.and_then(|v| v.get(k))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
     };
     Ok(Metrics {
         page_x: num(visual, "pageX"),
         page_y: num(visual, "pageY"),
         content_width: num(content, "width"),
         content_height: num(content, "height"),
+    })
+}
+
+fn capture_error(method: &str, message: impl Into<String>) -> CdpError {
+    CdpError::Protocol {
+        method: method.into(),
+        code: 0,
+        message: message.into(),
+        data: None,
+    }
+}
+
+async fn capture_clip_png(
+    client: &CdpClient,
+    session_id: &str,
+    clip: Clip,
+) -> Result<Vec<u8>, CdpError> {
+    let res = client
+        .call_on(
+            session_id,
+            "Page.captureScreenshot",
+            json!({
+                "format": "png",
+                "captureBeyondViewport": true,
+                "fromSurface": true,
+                "clip": {
+                    "x": clip.x,
+                    "y": clip.y,
+                    "width": clip.width,
+                    "height": clip.height,
+                    "scale": 1.0,
+                }
+            }),
+        )
+        .await?;
+    decode_base64_image(&res)
+}
+
+fn decode_base64_image(res: &Value) -> Result<Vec<u8>, CdpError> {
+    let data = res
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| capture_error("Page.captureScreenshot", "response carried no image data"))?;
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| {
+            capture_error(
+                "Page.captureScreenshot",
+                format!("image was not valid base64: {e}"),
+            )
+        })
+}
+
+#[derive(Debug)]
+struct RgbaTile {
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+}
+
+fn decode_png(bytes: &[u8], max_pixels: u64) -> Result<RgbaTile, CdpError> {
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(
+        png::Transformations::EXPAND | png::Transformations::STRIP_16 | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| capture_error("png.decode", e.to_string()))?;
+    let decoded_pixels = u64::from(reader.info().width)
+        .checked_mul(u64::from(reader.info().height))
+        .ok_or_else(|| capture_error("png.decode", "decoded PNG dimensions overflow"))?;
+    if decoded_pixels > max_pixels {
+        return Err(capture_error(
+            "png.decode",
+            format!(
+                "decoded PNG declares {decoded_pixels} pixels; the safe decode limit is \
+                 {max_pixels} pixels"
+            ),
+        ));
+    }
+    let size = reader
+        .output_buffer_size()
+        .ok_or_else(|| capture_error("png.decode", "decoded PNG size overflow"))?;
+    let mut raw = vec![0; size];
+    let info = reader
+        .next_frame(&mut raw)
+        .map_err(|e| capture_error("png.decode", e.to_string()))?;
+    raw.truncate(info.buffer_size());
+
+    let pixels = match info.color_type {
+        png::ColorType::Rgba => raw,
+        png::ColorType::Rgb => raw
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => raw
+            .chunks_exact(2)
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+        png::ColorType::Grayscale => raw.into_iter().flat_map(|v| [v, v, v, 255]).collect(),
+        png::ColorType::Indexed => {
+            return Err(capture_error(
+                "png.decode",
+                "palette PNG remained indexed after expansion",
+            ))
+        }
+    };
+    Ok(RgbaTile {
+        width: info.width as usize,
+        height: info.height as usize,
+        pixels,
+    })
+}
+
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, CdpError> {
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| capture_error("png.encode", e.to_string()))?;
+        writer
+            .write_image_data(rgba)
+            .map_err(|e| capture_error("png.encode", e.to_string()))?;
+    }
+    Ok(encoded)
+}
+
+/// Captures a full page as a grid of clips that each remain below Chromium's
+/// silent 16,384-output-pixel corruption threshold, then stitches them in memory.
+async fn capture_tiled_full_page(
+    client: &CdpClient,
+    session_id: &str,
+    full: Clip,
+    device_ratio: f64,
+) -> Result<Capture, CdpError> {
+    let output_width = (full.width * device_ratio).round().max(1.0) as u64;
+    let output_height = (full.height * device_ratio).round().max(1.0) as u64;
+    let pixels = output_width
+        .checked_mul(output_height)
+        .ok_or_else(|| capture_error("tiled capture", "output dimensions overflow"))?;
+    if pixels > MAX_STITCH_PIXELS {
+        return Err(capture_error(
+            "tiled capture",
+            format!(
+                "full-page image would require {pixels} pixels ({output_width}x{output_height}); \
+                 the safe in-memory stitch limit is {MAX_STITCH_PIXELS} pixels"
+            ),
+        ));
+    }
+    let width = u32::try_from(output_width)
+        .map_err(|_| capture_error("tiled capture", "output width exceeds PNG limits"))?;
+    let height = u32::try_from(output_height)
+        .map_err(|_| capture_error("tiled capture", "output height exceeds PNG limits"))?;
+    let _memory_slot = TILED_CAPTURE_SLOT
+        .acquire()
+        .await
+        .map_err(|_| capture_error("tiled capture", "capture memory scheduler is closed"))?;
+    let rgba_len = usize::try_from(pixels)
+        .ok()
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| capture_error("tiled capture", "RGBA allocation size overflow"))?;
+    let mut rgba = vec![0_u8; rgba_len];
+
+    // Leave output-pixel headroom for floating-point/device-scale rounding. The
+    // width is chosen first, then height is derived from the per-frame area
+    // budget; this avoids hundreds of tiny square tiles on a very narrow page.
+    let factor = device_ratio.max(0.01);
+    let max_axis_output = (MAX_OUTPUT_PIXELS - 2.0) as u64;
+    let full_output_width = (full.width * factor).ceil().max(1.0) as u64;
+    let tile_output_width = full_output_width.min(max_axis_output).max(1);
+    let tile_output_height = (MAX_CAPTURE_FRAME_PIXELS / tile_output_width)
+        .min(max_axis_output)
+        .max(1);
+    let tile_css_width = (tile_output_width as f64 / factor).max(1.0 / factor);
+    let tile_css_height = (tile_output_height as f64 / factor).max(1.0 / factor);
+    let mut tile_count = 0;
+    let mut y = 0.0;
+    while y < full.height {
+        let css_height = tile_css_height.min(full.height - y);
+        let dst_y = (y * device_ratio).round() as usize;
+        let next_y = ((y + css_height) * device_ratio).round() as usize;
+        let copy_height = next_y.saturating_sub(dst_y);
+        let mut x = 0.0;
+        while x < full.width {
+            let css_width = tile_css_width.min(full.width - x);
+            let dst_x = (x * device_ratio).round() as usize;
+            let next_x = ((x + css_width) * device_ratio).round() as usize;
+            let copy_width = next_x.saturating_sub(dst_x);
+            let bytes = capture_clip_png(
+                client,
+                session_id,
+                Clip {
+                    x: full.x + x,
+                    y: full.y + y,
+                    width: css_width,
+                    height: css_height,
+                },
+            )
+            .await?;
+            let tile = decode_png(&bytes, MAX_CAPTURE_FRAME_PIXELS)?;
+            if tile.width < copy_width || tile.height < copy_height {
+                return Err(capture_error(
+                    "tiled capture",
+                    format!(
+                        "Chromium returned tile {}x{}, smaller than required {}x{} at ({x},{y})",
+                        tile.width, tile.height, copy_width, copy_height
+                    ),
+                ));
+            }
+            for row in 0..copy_height {
+                let src = row * tile.width * 4;
+                let dst = ((dst_y + row) * width as usize + dst_x) * 4;
+                let len = copy_width * 4;
+                rgba[dst..dst + len].copy_from_slice(&tile.pixels[src..src + len]);
+            }
+            tile_count += 1;
+            x += css_width;
+        }
+        y += css_height;
+    }
+
+    Ok(Capture {
+        bytes: encode_png(width, height, &rgba)?,
+        format: ImageFormat::Png,
+        clip: Some(full),
+        truncated: None,
+        tiled: true,
+        tile_count,
     })
 }
 
@@ -192,6 +486,7 @@ pub async fn capture(
     // means one CSS pixel maps to one device pixel's worth of detail.
     const CLIP_SCALE: f64 = 1.0;
 
+    let full_page = matches!(&region, Region::FullPage);
     let clip: Option<Clip> = match region {
         Region::Viewport => None,
         Region::FullPage => {
@@ -245,7 +540,33 @@ pub async fn capture(
     let mut truncated = None;
     let clip = match clip {
         Some(c) => {
+            if !c.x.is_finite()
+                || !c.y.is_finite()
+                || !c.width.is_finite()
+                || !c.height.is_finite()
+                || c.width <= 0.0
+                || c.height <= 0.0
+            {
+                return Err(capture_error(
+                    "Page.captureScreenshot",
+                    "capture coordinates must be finite and width/height must be positive",
+                ));
+            }
             let dpr = device_pixel_ratio(client, session_id).await;
+            let output_width = (c.width * CLIP_SCALE * dpr).ceil().max(1.0) as u64;
+            let output_height = (c.height * CLIP_SCALE * dpr).ceil().max(1.0) as u64;
+            let oversized = output_width > MAX_OUTPUT_PIXELS as u64
+                || output_height > MAX_OUTPUT_PIXELS as u64
+                || output_width.saturating_mul(output_height) > MAX_CAPTURE_FRAME_PIXELS;
+            if full_page && oversized {
+                if format != ImageFormat::Png {
+                    return Err(capture_error(
+                        "tiled capture",
+                        "oversized full-page capture requires PNG for lossless stitching; rerun with --format png",
+                    ));
+                }
+                return capture_tiled_full_page(client, session_id, c, dpr).await;
+            }
             let (clamped, note) = clamp_clip(c, CLIP_SCALE, dpr);
             truncated = note;
             Some(clamped)
@@ -278,25 +599,16 @@ pub async fn capture(
     let res = client
         .call_on(session_id, "Page.captureScreenshot", params)
         .await?;
-    let data = res
-        .get("data")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CdpError::Protocol {
-            method: "Page.captureScreenshot".into(),
-            code: 0,
-            message: "response carried no image data".into(),
-            data: None,
-        })?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .map_err(|e| CdpError::Protocol {
-            method: "Page.captureScreenshot".into(),
-            code: 0,
-            message: format!("image was not valid base64: {e}"),
-            data: None,
-        })?;
+    let bytes = decode_base64_image(&res)?;
 
-    Ok(Capture { bytes, format, clip, truncated })
+    Ok(Capture {
+        bytes,
+        format,
+        clip,
+        truncated,
+        tiled: false,
+        tile_count: 1,
+    })
 }
 
 /// Axis-aligned bounding box over every quad a node occupies.
@@ -367,6 +679,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn oversized_tile_dimensions_are_rejected_before_pixel_allocation() {
+        let width = 4_000;
+        let height = 2_001;
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, width, height);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&vec![0; (width * height) as usize])
+                .unwrap();
+        }
+        let error = decode_png(&encoded, MAX_CAPTURE_FRAME_PIXELS).unwrap_err();
+        assert!(
+            error.to_string().contains("8004000 pixels"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn bounding_box_spans_every_quad() {
         // An inline element wrapped across two lines produces two quads.
         let quads = json!({ "quads": [
@@ -374,7 +707,15 @@ mod tests {
             [ 0.0, 30.0, 40.0, 30.0, 40.0, 50.0,  0.0, 50.0]
         ]});
         let b = bounding_box(&quads).unwrap();
-        assert_eq!(b, Clip { x: 0.0, y: 10.0, width: 50.0, height: 40.0 });
+        assert_eq!(
+            b,
+            Clip {
+                x: 0.0,
+                y: 10.0,
+                width: 50.0,
+                height: 40.0
+            }
+        );
     }
 
     #[test]
@@ -386,7 +727,12 @@ mod tests {
 
     #[test]
     fn a_clip_within_the_limit_is_untouched() {
-        let c = Clip { x: 0.0, y: 0.0, width: 1280.0, height: 4000.0 };
+        let c = Clip {
+            x: 0.0,
+            y: 0.0,
+            width: 1280.0,
+            height: 4000.0,
+        };
         let (out, note) = clamp_clip(c, 1.0, 1.0);
         assert_eq!(out, c);
         assert!(note.is_none());
@@ -394,9 +740,14 @@ mod tests {
 
     #[test]
     fn a_tall_page_is_cut_and_says_so() {
-        let c = Clip { x: 0.0, y: 0.0, width: 800.0, height: 20_000.0 };
+        let c = Clip {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 20_000.0,
+        };
         let (out, note) = clamp_clip(c, 1.0, 1.0);
-        assert_eq!(out.height, MAX_OUTPUT_PIXELS);
+        assert_eq!(out.height, 10_000.0, "the response byte budget is tighter");
         assert_eq!(out.width, 800.0, "the narrow axis must not be touched");
         assert!(note.unwrap().contains("16384"));
     }
@@ -406,28 +757,47 @@ mod tests {
         // The bug this guards: 10000 CSS px passes any CSS-pixel check, but on a
         // HiDPI display it is 20000 output pixels and Chromium silently repeats
         // the content past 16384.
-        let c = Clip { x: 0.0, y: 0.0, width: 800.0, height: 10_000.0 };
+        let c = Clip {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 10_000.0,
+        };
 
         let (out, note) = clamp_clip(c, 1.0, 1.0);
         assert_eq!(out.height, 10_000.0, "fine at 1x");
         assert!(note.is_none());
 
         let (out, note) = clamp_clip(c, 1.0, 2.0);
-        assert_eq!(out.height, 8_192.0, "at 2x the same clip must be halved");
+        assert_eq!(
+            out.height, 2_500.0,
+            "2x must also fit the frame area budget"
+        );
         let note = note.expect("truncation at 2x must be reported");
         assert!(note.contains("20000 output pixels"), "{note}");
 
         // clip.scale multiplies on top of the device ratio.
         let (out, _) = clamp_clip(c, 2.0, 2.0);
-        assert_eq!(out.height, 4_096.0);
+        assert_eq!(out.height, 625.0);
     }
 
     #[test]
     fn clamping_preserves_the_origin() {
-        let c = Clip { x: 120.0, y: 640.0, width: 30_000.0, height: 30_000.0 };
+        let c = Clip {
+            x: 120.0,
+            y: 640.0,
+            width: 30_000.0,
+            height: 30_000.0,
+        };
         let (out, _) = clamp_clip(c, 1.0, 1.0);
         assert_eq!((out.x, out.y), (120.0, 640.0));
-        assert_eq!((out.width, out.height), (MAX_OUTPUT_PIXELS, MAX_OUTPUT_PIXELS));
+        assert_eq!(
+            (out.width, out.height),
+            (
+                MAX_OUTPUT_PIXELS,
+                MAX_CAPTURE_FRAME_PIXELS as f64 / MAX_OUTPUT_PIXELS
+            )
+        );
     }
 
     #[test]

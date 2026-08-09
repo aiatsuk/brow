@@ -33,16 +33,16 @@ brow snapshot
 http://example.com/  "Example"
 generation 2
 
-@node-12 button "Create account" id=go [420,610 220x48]
-@node-14 input type=text placeholder="Email address" [420,540 220x40]
-@node-19 a "Pricing" href=/pricing [120,40 60x20]
+@node-2-12 button "Create account" id=go [420,610 220x48]
+@node-2-14 input type=text placeholder="Email address" [420,540 220x40]
+@node-2-19 a "Pricing" href=/pricing [120,40 60x20]
 ```
 
 Act on refs, never on coordinates unless you have no alternative:
 
 ```bash
-brow fill @node-14 'someone@example.com'
-brow click @node-12
+brow fill @node-2-14 'someone@example.com'
+brow click @node-2-12
 brow press Enter
 ```
 
@@ -56,19 +56,19 @@ error, not a wrong click — that is deliberate, and the error tells you what to
 |---|---|
 | Go to a page | `brow open <url>` |
 | See what is on it | `brow snapshot` (add `--all` for every visible node) |
-| Click | `brow click @node-12` (`--button right`, `--double`, `--force`) |
-| Hover | `brow hover @node-12` |
-| Fill a field | `brow fill @node-14 'text'` |
+| Click | `brow click @node-2-12` (`--button right`, `--double`, `--force`) |
+| Hover | `brow hover @node-2-12` |
+| Fill a field | `brow fill @node-2-14 'text'` |
 | Type into focus | `brow type 'text'` (`--by-key` if the app listens to keydown) |
 | Keys | `brow press Enter` · `brow press Ctrl+A` · `brow press Escape` |
 | Scroll | `brow scroll down 800` |
-| Screenshot | `brow screenshot` · `--full-page` · `--node @node-12` · `-o path.png` |
+| Screenshot | `brow screenshot` · `--full-page` · `--node @node-2-12` · `-o path.png` |
 | Read page state | `brow eval "document.querySelector('#status').textContent"` |
 | Console + exceptions | `brow console` (`--errors` for problems only) |
 | Network | `brow network` (`--failed` for failures and 4xx/5xx) |
-| Touch | `brow tap @node-12` · `brow long-press @node-12` · `brow swipe --from 320,700 --to 320,160` |
+| Touch | `brow tap @node-2-12` · `brow long-press @node-2-12` · `brow swipe --from 320,700 --to 320,160` |
 | Pinch zoom | `brow pinch --center 400,400 --scale 1.8` |
-| Drag | `brow drag --from @node-31 --to @node-40` |
+| Drag | `brow drag --from @node-2-31 --to @node-2-40` |
 | Several browsers | `--session qa` on any command |
 | Finish | `brow close` |
 
@@ -82,8 +82,9 @@ brow network --failed     # did a request 404 or blow up CORS?
 ```
 
 This is usually faster and far more conclusive than screenshotting and
-speculating. Credentials are already stripped from the output, so it is safe to
-quote back to the user.
+speculating. Known credential headers, query keys, URL userinfo, Bearer values
+and JWT shapes are stripped before storage, but arbitrary PII and unknown secret
+formats are not. Inspect output before quoting it back.
 
 Two things to know:
 
@@ -92,6 +93,8 @@ Two things to know:
   never reads stays unfinished forever — that is normal, not a hang.
 - Capture keeps the most recent 2000 entries per session and says how many it
   dropped.
+- If output reports `event_stream_gaps` or `complete: false`, say that the view is
+  incomplete; never turn a missing event into “no errors” or “no requests”.
 
 ## Touch
 
@@ -173,7 +176,11 @@ A job never guesses and never calls a model. It stops in one of two ways:
   workspace", "Send", "Pay"). **This one is not yours to answer.** Show the user
   the action and the screenshot the job captured, and let them run
   `brow job approve <id>` or `--reject`. `brow job answer` is refused here on
-  purpose.
+  purpose. The daemon does not yet authenticate human presence, so this rule is
+  an agent operating constraint as well as a product workflow. The pending
+  action is bound to a fresh exact-node fingerprint and screenshot and is checked
+  again immediately before the press, but same-uid IPC is not proof that a human
+  invoked the approval command.
 
 Other useful commands: `brow job list`, `brow job status <id>`,
 `brow job stop <id>`.
@@ -183,7 +190,9 @@ resumed — start them again rather than assuming they continued.
 
 ## Multiple flows at once
 
-Sessions are independent browsers with independent profiles:
+Sessions are separate browsers with independent profiles. Different sessions run
+concurrently; commands within one session are serialized to preserve browser
+state ordering:
 
 ```bash
 brow --session admin open app.example.com/admin
@@ -193,6 +202,10 @@ brow sessions
 
 Use this for anything involving two accounts, or to keep a logged-in session
 while you poke at something else.
+
+Cross-origin out-of-process iframes are included recursively. If snapshot prints
+`coverage_gap`, do not act as if the missing frame was inspected; retry once, then
+report the exact gap if it remains.
 
 ## What to hand back to the human
 

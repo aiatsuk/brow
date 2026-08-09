@@ -1,8 +1,9 @@
 //! Spawning Chromium with a private CDP pipe on fds 3 and 4.
 
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
@@ -10,6 +11,12 @@ use serde_json::json;
 use crate::cdp::{cloexec_pipe, CdpClient, PipeTransport};
 
 use super::discover::{self, Installed};
+
+/// On platforms without `pipe2(O_CLOEXEC)`, `pipe` + `fcntl` has an unavoidable
+/// in-process inheritance window. Every brow browser spawn is serialized across
+/// pipe creation and `Command::spawn`, so a concurrent launch cannot fork while
+/// another launch's descriptors are temporarily inheritable.
+static BROWSER_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// How the browser window is presented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -88,7 +95,10 @@ fn base_args(opts: &LaunchOptions) -> Vec<String> {
         // prompt that no automated job can answer.
         "--use-mock-keychain".into(),
         "--password-store=basic".into(),
-        format!("--window-size={},{}", opts.window_size.0, opts.window_size.1),
+        format!(
+            "--window-size={},{}",
+            opts.window_size.0, opts.window_size.1
+        ),
     ];
 
     if opts.headless == Headless::New {
@@ -101,14 +111,75 @@ fn base_args(opts: &LaunchOptions) -> Vec<String> {
     args
 }
 
+fn validate_extra_args(args: &[String]) -> anyhow::Result<()> {
+    const PROTECTED: &[&str] = &[
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--remote-debugging-address",
+        "--remote-debugging-pipe",
+        "--remote-debugging-port",
+        "--user-data-dir",
+    ];
+    if let Some(arg) = args.iter().find(|arg| {
+        PROTECTED
+            .iter()
+            .any(|flag| arg.as_str() == *flag || arg.starts_with(&format!("{flag}=")))
+    }) {
+        anyhow::bail!("extra browser flag {arg:?} would override a security invariant");
+    }
+    Ok(())
+}
+
+/// Moves pipe ends away from Chromium's required fd 3/4 slots.
+///
+/// `dup2(fd, fd)` is a no-op and therefore does not clear `FD_CLOEXEC`. Without
+/// this normalization a freshly allocated pipe end that happens to be fd 3 or 4
+/// disappears during `exec`, making `--remote-debugging-pipe` fail intermittently.
+fn move_above_stdio(mut fds: [RawFd; 4]) -> std::io::Result<[RawFd; 4]> {
+    for i in 0..fds.len() {
+        if fds[i] > 4 {
+            continue;
+        }
+        // SAFETY: fds[i] is owned and open. F_DUPFD_CLOEXEC creates a distinct
+        // descriptor >= 5, after which the original is closed exactly once.
+        let moved = unsafe { libc::fcntl(fds[i], libc::F_DUPFD_CLOEXEC, 5) };
+        if moved == -1 {
+            let error = std::io::Error::last_os_error();
+            for fd in fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(error);
+        }
+        unsafe { libc::close(fds[i]) };
+        fds[i] = moved;
+    }
+    Ok(fds)
+}
+
 /// Launches a browser and completes the protocol handshake.
 pub async fn launch(opts: &LaunchOptions) -> anyhow::Result<Launched> {
+    validate_extra_args(&opts.extra_args)?;
     let browser = discover::find()?;
     std::fs::create_dir_all(&opts.user_data_dir)?;
 
+    let spawn_guard = BROWSER_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     // us -> browser becomes the child's fd 3; browser -> us becomes its fd 4.
     let (child_read, our_write) = cloexec_pipe()?;
-    let (our_read, child_write) = cloexec_pipe()?;
+    let (our_read, child_write) = match cloexec_pipe() {
+        Ok(pair) => pair,
+        Err(error) => {
+            unsafe {
+                libc::close(child_read);
+                libc::close(our_write);
+            }
+            return Err(error.into());
+        }
+    };
+    let [child_read, our_write, our_read, child_write] =
+        move_above_stdio([child_read, our_write, our_read, child_write])?;
 
     let mut cmd = Command::new(&browser.path);
     cmd.args(base_args(opts))
@@ -136,7 +207,7 @@ pub async fn launch(opts: &LaunchOptions) -> anyhow::Result<Launched> {
         });
     }
 
-    let child = cmd.spawn().map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         // SAFETY: we still own all four fds; the child never started.
         unsafe {
             libc::close(child_read);
@@ -154,6 +225,7 @@ pub async fn launch(opts: &LaunchOptions) -> anyhow::Result<Launched> {
         libc::close(child_read);
         libc::close(child_write);
     }
+    drop(spawn_guard);
 
     // SAFETY: `our_write`/`our_read` are owned, open, and handed over exactly once.
     let transport = unsafe { PipeTransport::from_raw_fds(our_write, our_read) };
@@ -161,13 +233,28 @@ pub async fn launch(opts: &LaunchOptions) -> anyhow::Result<Launched> {
 
     // Handshake. Over a pipe there is no /json/version to poll, so the first
     // successful command *is* the readiness signal.
-    let version = tokio::time::timeout(
+    let handshake = tokio::time::timeout(
         Duration::from_secs(30),
         client.call("Browser.getVersion", json!({})),
     )
-    .await
-    .map_err(|_| anyhow::anyhow!("{browser} did not answer Browser.getVersion within 30s"))?
-    .map_err(|e| anyhow::anyhow!("{browser} rejected the protocol handshake: {e}"))?;
+    .await;
+    let version = match handshake {
+        Ok(Ok(version)) => version,
+        Ok(Err(error)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow::anyhow!(
+                "{browser} rejected the protocol handshake: {error}"
+            ));
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow::anyhow!(
+                "{browser} did not answer Browser.getVersion within 30s"
+            ));
+        }
+    };
 
     let product = version
         .get("product")
@@ -205,7 +292,9 @@ mod tests {
         let args = base_args(&opts);
         assert!(args.iter().any(|a| a == "--remote-debugging-pipe"));
         assert!(
-            !args.iter().any(|a| a.starts_with("--remote-debugging-port")),
+            !args
+                .iter()
+                .any(|a| a.starts_with("--remote-debugging-port")),
             "a listening debug port would let any local process drive this browser"
         );
     }
@@ -215,7 +304,10 @@ mod tests {
         let mut opts = LaunchOptions::new(PathBuf::from("/tmp/x"));
         opts.extra_args = vec!["--window-size=1,1".into()];
         let args = base_args(&opts);
-        let ours = args.iter().position(|a| a == "--window-size=1280,800").unwrap();
+        let ours = args
+            .iter()
+            .position(|a| a == "--window-size=1280,800")
+            .unwrap();
         let theirs = args.iter().position(|a| a == "--window-size=1,1").unwrap();
         assert!(theirs > ours);
     }
@@ -225,5 +317,17 @@ mod tests {
         let mut opts = LaunchOptions::new(PathBuf::from("/tmp/x"));
         opts.headless = Headless::Off;
         assert!(!base_args(&opts).iter().any(|a| a.starts_with("--headless")));
+    }
+
+    #[test]
+    fn extra_args_cannot_override_security_boundaries() {
+        for flag in [
+            "--no-sandbox",
+            "--remote-debugging-port=9222",
+            "--user-data-dir=/tmp/shared",
+        ] {
+            assert!(validate_extra_args(&[flag.to_string()]).is_err(), "{flag}");
+        }
+        assert!(validate_extra_args(&["--window-size=1,1".into()]).is_ok());
     }
 }

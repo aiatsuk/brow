@@ -70,7 +70,11 @@ impl Client {
             hello.protocol
         );
 
-        Ok(Self { reader, writer, hello })
+        Ok(Self {
+            reader,
+            writer,
+            hello,
+        })
     }
 
     /// Sends one request and reads its response.

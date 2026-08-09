@@ -7,9 +7,10 @@
 //!   * accessibility role and name (`Accessibility.getFullAXTree`),
 //!   * layout box and computed visibility (`DOMSnapshot.captureSnapshot`).
 //!
-//! References are `@node-N`, valid only for the *generation* of the document they
-//! were minted in. Navigating bumps the generation and every prior ref becomes a
-//! loud error rather than a silent mis-click.
+//! References are `@node-G-N`, valid only for the *generation* and execution
+//! target they were minted in. Navigating or changing the attached target tree
+//! bumps `G`; every prior ref then becomes a loud error rather than a silent
+//! mis-click.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -18,7 +19,7 @@ use serde_json::{json, Value};
 
 use crate::cdp::{CdpClient, CdpError};
 
-/// Axis-aligned box in CSS pixels, in document coordinates.
+/// Axis-aligned box in CSS pixels, in the top-level viewport's coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Bounds {
     pub x: f64,
@@ -34,6 +35,10 @@ pub struct Node {
     #[serde(rename = "ref")]
     pub node_ref: String,
     pub backend_node_id: i64,
+    /// Renderer target and flat CDP session that own `backend_node_id`.
+    /// Backend ids are not globally unique across OOPIF renderer processes.
+    pub target_id: String,
+    pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_id: Option<String>,
     pub tag: String,
@@ -57,6 +62,69 @@ pub struct Node {
     pub shadow_root_type: Option<String>,
 }
 
+/// A ref's immutable browser-side identity.
+///
+/// `backend_node_id` is meaningful only inside `session_id`; including the
+/// execution target, frame and generation prevents an id collision or renderer
+/// swap from turning an old approval/ref into a different live node.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeIdentity {
+    pub target_id: String,
+    pub session_id: String,
+    pub frame_id: String,
+    pub backend_node_id: i64,
+    pub generation: u64,
+}
+
+/// Opaque, per-Page keyed equality token for unredacted action semantics.
+///
+/// Debug deliberately reveals nothing and serde skips the field on the enclosing
+/// fingerprint, preventing a low-entropy secret URL from becoming an offline hash
+/// oracle in logs or manifests.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct ActionSemanticsToken(u64);
+
+impl ActionSemanticsToken {
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Debug for ActionSemanticsToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[opaque]")
+    }
+}
+
+/// Identity plus freshly-read semantics, used to revalidate an approved target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeFingerprint {
+    pub identity: NodeIdentity,
+    pub tag: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accessible_label: Option<String>,
+    /// Fresh action-relevant DOM attributes. These close the gap where the same
+    /// backend node and label are retained but its destination or submit behavior
+    /// changes while an approval is pending.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub action_attributes: BTreeMap<String, String>,
+    /// Keyed equality token over unredacted raw + effective action semantics.
+    #[serde(skip)]
+    pub(crate) action_semantics_token: ActionSemanticsToken,
+}
+
+/// A renderer subtree that could not be observed completely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageGap {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    pub reason: String,
+}
+
 /// A whole-page capture plus the ref table it minted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -64,6 +132,9 @@ pub struct Snapshot {
     pub url: String,
     pub title: String,
     pub nodes: Vec<Node>,
+    /// Never silently omit an unattached, failed, or racing renderer subtree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_gaps: Vec<CoverageGap>,
 }
 
 impl Snapshot {
@@ -81,6 +152,20 @@ impl Snapshot {
         let mut out = String::new();
         out.push_str(&format!("{}  \"{}\"\n", self.url, self.title));
         out.push_str(&format!("generation {}\n\n", self.generation));
+
+        for gap in &self.coverage_gaps {
+            out.push_str("coverage_gap");
+            if let Some(frame) = &gap.frame_id {
+                out.push_str(&format!(" frame={frame}"));
+            }
+            if let Some(target) = &gap.target_id {
+                out.push_str(&format!(" target={target}"));
+            }
+            out.push_str(&format!(" reason={}\n", truncate(&gap.reason, 160)));
+        }
+        if !self.coverage_gaps.is_empty() {
+            out.push('\n');
+        }
 
         let nodes: Vec<&Node> = if interactive_only {
             self.interactive().collect()
@@ -147,13 +232,15 @@ fn truncate(s: &str, max: usize) -> String {
 pub struct RefTable {
     generation: u64,
     entries: HashMap<u64, RefEntry>,
+    identity_sequences: HashMap<NodeIdentity, u64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RefEntry {
-    pub backend_node_id: i64,
-    pub generation: u64,
+    pub identity: NodeIdentity,
     pub tag: String,
+    pub role: Option<String>,
+    pub accessible_label: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -188,24 +275,71 @@ impl RefTable {
     /// them.
     pub fn bump(&mut self) -> u64 {
         self.generation += 1;
+        self.identity_sequences.clear();
         self.generation
     }
 
     /// Adopts the page's current generation.
     pub fn set_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.identity_sequences.clear();
+        }
         self.generation = generation;
     }
 
-    fn mint(&mut self, n: u64, backend_node_id: i64, tag: &str) -> String {
+    /// Starts a replacement snapshot while preserving refs for browser-side
+    /// identities that are still present in the same document generation.
+    pub fn next_snapshot(&self, generation: u64) -> Self {
+        Self {
+            generation,
+            entries: HashMap::new(),
+            identity_sequences: if self.generation == generation {
+                self.identity_sequences.clone()
+            } else {
+                HashMap::new()
+            },
+        }
+    }
+
+    /// Forget identities absent from the completed snapshot. Their numeric refs
+    /// are never reused because the Page counter is monotonic, but retaining every
+    /// transient SPA node for an entire document generation would be unbounded.
+    pub fn prune_absent_identities(&mut self) {
+        let entries = &self.entries;
+        self.identity_sequences
+            .retain(|_, sequence| entries.contains_key(sequence));
+    }
+
+    #[cfg(test)]
+    fn remembered_identity_count(&self) -> usize {
+        self.identity_sequences.len()
+    }
+
+    fn mint(
+        &mut self,
+        counter: &mut u64,
+        identity: NodeIdentity,
+        tag: &str,
+        role: Option<&str>,
+        accessible_label: Option<&str>,
+    ) -> String {
+        let n = if let Some(sequence) = self.identity_sequences.get(&identity) {
+            *sequence
+        } else {
+            *counter = counter.saturating_add(1);
+            self.identity_sequences.insert(identity.clone(), *counter);
+            *counter
+        };
         self.entries.insert(
             n,
             RefEntry {
-                backend_node_id,
-                generation: self.generation,
+                identity,
                 tag: tag.to_string(),
+                role: role.map(str::to_string),
+                accessible_label: accessible_label.map(str::to_string),
             },
         );
-        format!("@node-{n}")
+        format!("@node-{}-{n}", self.generation)
     }
 
     /// Resolves a ref against the page's *current* generation.
@@ -215,15 +349,25 @@ impl RefTable {
     /// page moves on afterwards. Comparing against the table's own generation
     /// would call every stale ref valid.
     pub fn resolve(&self, node_ref: &str, current: u64) -> Result<RefEntry, RefError> {
-        let n = parse_ref(node_ref).ok_or_else(|| RefError::Malformed(node_ref.to_string()))?;
+        let parsed =
+            parse_ref_parts(node_ref).ok_or_else(|| RefError::Malformed(node_ref.to_string()))?;
+        if let Some(had) = parsed.generation {
+            if had != current {
+                return Err(RefError::Stale {
+                    node_ref: node_ref.to_string(),
+                    had,
+                    now: current,
+                });
+            }
+        }
         let entry = self
             .entries
-            .get(&n)
+            .get(&parsed.sequence)
             .ok_or_else(|| RefError::Unknown(node_ref.to_string()))?;
-        if entry.generation != current {
+        if entry.identity.generation != current {
             return Err(RefError::Stale {
                 node_ref: node_ref.to_string(),
-                had: entry.generation,
+                had: entry.identity.generation,
                 now: current,
             });
         }
@@ -233,10 +377,28 @@ impl RefTable {
 
 /// Accepts `@node-42`, `node-42`, `@42` and `42`.
 pub fn parse_ref(s: &str) -> Option<u64> {
+    parse_ref_parts(s).map(|p| p.sequence)
+}
+
+struct ParsedRef {
+    generation: Option<u64>,
+    sequence: u64,
+}
+
+fn parse_ref_parts(s: &str) -> Option<ParsedRef> {
     let s = s.trim();
     let s = s.strip_prefix('@').unwrap_or(s);
     let s = s.strip_prefix("node-").unwrap_or(s);
-    s.parse::<u64>().ok()
+    if let Some((generation, sequence)) = s.split_once('-') {
+        return Some(ParsedRef {
+            generation: Some(generation.parse().ok()?),
+            sequence: sequence.parse().ok()?,
+        });
+    }
+    Some(ParsedRef {
+        generation: None,
+        sequence: s.parse().ok()?,
+    })
 }
 
 /// Tags that are interactive regardless of what the accessibility tree thinks.
@@ -246,9 +408,25 @@ const INTERACTIVE_TAGS: &[&str] = &[
 
 /// Roles that mean "a user can act on this".
 const INTERACTIVE_ROLES: &[&str] = &[
-    "button", "link", "checkbox", "radio", "textbox", "combobox", "listbox", "menuitem",
-    "menuitemcheckbox", "menuitemradio", "option", "searchbox", "slider", "spinbutton",
-    "switch", "tab", "treeitem", "gridcell", "columnheader",
+    "button",
+    "link",
+    "checkbox",
+    "radio",
+    "textbox",
+    "combobox",
+    "listbox",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "searchbox",
+    "slider",
+    "spinbutton",
+    "switch",
+    "tab",
+    "treeitem",
+    "gridcell",
+    "columnheader",
 ];
 
 fn is_interactive(tag: &str, role: Option<&str>, attrs: &BTreeMap<String, String>) -> bool {
@@ -263,10 +441,7 @@ fn is_interactive(tag: &str, role: Option<&str>, attrs: &BTreeMap<String, String
     if attrs.contains_key("onclick") {
         return true;
     }
-    if attrs
-        .get("contenteditable")
-        .is_some_and(|v| v != "false")
-    {
+    if attrs.get("contenteditable").is_some_and(|v| v != "false") {
         return true;
     }
     // tabindex="-1" is programmatic focus only, not a user affordance.
@@ -278,45 +453,138 @@ fn is_interactive(tag: &str, role: Option<&str>, attrs: &BTreeMap<String, String
     false
 }
 
-/// Captures a full unified snapshot of the page attached to `session_id`.
-pub async fn capture(
+/// Affine map from one renderer target's viewport to the top-level viewport.
+/// The router derives this from each owner iframe's content quad.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ViewportTransform {
+    pub xx: f64,
+    pub xy: f64,
+    pub yx: f64,
+    pub yy: f64,
+    pub tx: f64,
+    pub ty: f64,
+}
+
+impl ViewportTransform {
+    pub const IDENTITY: Self = Self {
+        xx: 1.0,
+        xy: 0.0,
+        yx: 0.0,
+        yy: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+
+    pub(crate) fn point(self, x: f64, y: f64) -> (f64, f64) {
+        (
+            self.tx + self.xx * x + self.xy * y,
+            self.ty + self.yx * x + self.yy * y,
+        )
+    }
+
+    fn bounds(self, b: Bounds) -> Bounds {
+        let corners = [
+            self.point(b.x, b.y),
+            self.point(b.x + b.width, b.y),
+            self.point(b.x + b.width, b.y + b.height),
+            self.point(b.x, b.y + b.height),
+        ];
+        let min_x = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        let min_y = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let max_x = corners
+            .iter()
+            .map(|p| p.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let max_y = corners
+            .iter()
+            .map(|p| p.1)
+            .fold(f64::NEG_INFINITY, f64::max);
+        Bounds {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x,
+            height: max_y - min_y,
+        }
+    }
+}
+
+pub(crate) struct CaptureContext<'a> {
+    pub target_id: &'a str,
+    pub session_id: &'a str,
+    pub root_frame_id: &'a str,
+    pub generation: u64,
+    pub transform: ViewportTransform,
+    /// The DOMSnapshot layout is document-relative; refs/actions use viewport
+    /// coordinates, so remove the renderer target's current scroll offset first.
+    pub page_x: f64,
+    pub page_y: f64,
+    pub depth_offset: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalFrame {
+    pub frame_id: String,
+    pub owner_backend_node_id: i64,
+}
+
+pub(crate) struct CapturedTarget {
+    pub url: String,
+    pub title: String,
+    pub nodes: Vec<Node>,
+    pub external_frames: Vec<ExternalFrame>,
+    /// Explicit degradation notices for optional enrichment. Callers surface
+    /// these as coverage gaps instead of silently presenting a complete tree.
+    pub warnings: Vec<String>,
+}
+
+/// Captures one renderer target. `Page` calls this once per recursively attached
+/// OOPIF session and joins the returned fragments.
+pub(crate) async fn capture_target(
     client: &CdpClient,
-    session_id: &str,
+    context: &CaptureContext<'_>,
     refs: &mut RefTable,
-) -> Result<Snapshot, CdpError> {
+    counter: &mut u64,
+) -> Result<CapturedTarget, CdpError> {
     // These are idempotent; re-enabling on every snapshot keeps us correct after a
     // renderer swap without tracking per-target enable state.
-    let _ = client.call_on(session_id, "DOM.enable", json!({})).await;
-    let _ = client
-        .call_on(session_id, "Accessibility.enable", json!({}))
+    client
+        .call_on(context.session_id, "DOM.enable", json!({}))
+        .await?;
+    let accessibility_enable = client
+        .call_on(context.session_id, "Accessibility.enable", json!({}))
         .await;
 
     let doc = client
         .call_on(
-            session_id,
+            context.session_id,
             "DOM.getDocument",
             json!({ "depth": -1, "pierce": true }),
         )
         .await?;
 
-    let frames = frame_ids(client, session_id).await;
-    let ax = ax_index(client, session_id, &frames).await;
-    let layout = layout_index(client, session_id).await;
+    let frames = frame_ids(client, context.session_id).await?;
+    let (ax, mut warnings) = ax_index(client, context.session_id, &frames).await;
+    if let Err(error) = accessibility_enable {
+        warnings.push(format!("Accessibility.enable failed: {error}"));
+    }
+    let layout = layout_index(client, context.session_id).await?;
 
     let mut nodes = Vec::new();
-    let mut counter: u64 = 0;
+    let mut external_frames = Vec::new();
     if let Some(root) = doc.get("root") {
         walk(
             root,
-            0,
+            context.depth_offset,
             false,
-            None,
+            Some(context.root_frame_id),
             (0.0, 0.0),
+            context,
             refs,
             &ax,
             &layout,
-            &mut counter,
+            counter,
             &mut nodes,
+            &mut external_frames,
         );
     }
 
@@ -333,22 +601,20 @@ pub async fn capture(
         .and_then(|n| n.text.clone())
         .unwrap_or_default();
 
-    Ok(Snapshot {
-        generation: refs.generation(),
+    Ok(CapturedTarget {
         url,
         title,
         nodes,
+        external_frames,
+        warnings,
     })
 }
 
 /// Every frame in this session's tree, main frame first.
-async fn frame_ids(client: &CdpClient, session_id: &str) -> Vec<String> {
-    let Ok(tree) = client
+async fn frame_ids(client: &CdpClient, session_id: &str) -> Result<Vec<String>, CdpError> {
+    let tree = client
         .call_on(session_id, "Page.getFrameTree", json!({}))
-        .await
-    else {
-        return Vec::new();
-    };
+        .await?;
     let mut out = Vec::new();
     fn walk_frames(node: &Value, out: &mut Vec<String>) {
         if let Some(id) = node
@@ -370,7 +636,7 @@ async fn frame_ids(client: &CdpClient, session_id: &str) -> Vec<String> {
     if let Some(root) = tree.get("frameTree") {
         walk_frames(root, &mut out);
     }
-    out
+    Ok(out)
 }
 
 /// backendDOMNodeId -> (role, accessible name), across every frame.
@@ -388,8 +654,9 @@ async fn ax_index(
     client: &CdpClient,
     session_id: &str,
     frames: &[String],
-) -> HashMap<i64, (String, String)> {
+) -> (HashMap<i64, (String, String)>, Vec<String>) {
     let mut out = HashMap::new();
+    let mut warnings = Vec::new();
 
     // An empty frame list still gets the default whole-session call, so a failure
     // to read the frame tree degrades rather than blanks the accessibility data.
@@ -400,13 +667,17 @@ async fn ax_index(
     };
 
     for params in calls {
-        let Ok(tree) = client
+        let tree = match client
             .call_on(session_id, "Accessibility.getFullAXTree", params)
             .await
-        else {
-            // Accessibility is enrichment, never a hard dependency: a page tree
-            // without roles is degraded, not broken.
-            continue;
+        {
+            Ok(tree) => tree,
+            Err(error) => {
+                // Accessibility is enrichment, never a hard dependency: a page tree
+                // without roles is degraded, not broken, but it is never silent.
+                warnings.push(format!("Accessibility.getFullAXTree failed: {error}"));
+                continue;
+            }
         };
         let Some(list) = tree.get("nodes").and_then(Value::as_array) else {
             continue;
@@ -433,7 +704,7 @@ async fn ax_index(
             out.insert(backend, (role, name));
         }
     }
-    out
+    (out, warnings)
 }
 
 struct LayoutInfo {
@@ -447,11 +718,14 @@ struct LayoutInfo {
 /// (all documents) in a single round trip. Nodes with `display:none` have no
 /// layout object at all and are therefore simply absent — which is exactly the
 /// visibility signal we want, for free.
-async fn layout_index(client: &CdpClient, session_id: &str) -> HashMap<i64, LayoutInfo> {
+async fn layout_index(
+    client: &CdpClient,
+    session_id: &str,
+) -> Result<HashMap<i64, LayoutInfo>, CdpError> {
     const STYLES: [&str; 3] = ["visibility", "opacity", "pointer-events"];
     let mut out = HashMap::new();
 
-    let Ok(snap) = client
+    let snap = client
         .call_on(
             session_id,
             "DOMSnapshot.captureSnapshot",
@@ -461,10 +735,7 @@ async fn layout_index(client: &CdpClient, session_id: &str) -> HashMap<i64, Layo
                 "includePaintOrder": false,
             }),
         )
-        .await
-    else {
-        return out;
-    };
+        .await?;
 
     let strings: Vec<&str> = snap
         .get("strings")
@@ -479,7 +750,7 @@ async fn layout_index(client: &CdpClient, session_id: &str) -> HashMap<i64, Layo
     };
 
     let Some(documents) = snap.get("documents").and_then(Value::as_array) else {
-        return out;
+        return Ok(out);
     };
 
     for doc in documents {
@@ -499,7 +770,10 @@ async fn layout_index(client: &CdpClient, session_id: &str) -> HashMap<i64, Layo
             .map(|a| a.iter().map(|v| v.as_i64().unwrap_or(-1)).collect())
             .unwrap_or_default();
         let empty = Vec::new();
-        let boxes = layout.get("bounds").and_then(Value::as_array).unwrap_or(&empty);
+        let boxes = layout
+            .get("bounds")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
         let styles = layout.get("styles").and_then(Value::as_array);
 
         for (i, &node_idx) in node_index.iter().enumerate() {
@@ -541,7 +815,7 @@ async fn layout_index(client: &CdpClient, session_id: &str) -> HashMap<i64, Layo
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Walks the pierced DOM, minting refs and joining in accessibility and layout.
@@ -560,19 +834,28 @@ fn walk(
     in_shadow: bool,
     inherited_frame: Option<&str>,
     offset: (f64, f64),
+    context: &CaptureContext<'_>,
     refs: &mut RefTable,
     ax: &HashMap<i64, (String, String)>,
     layout: &HashMap<i64, LayoutInfo>,
     counter: &mut u64,
     out: &mut Vec<Node>,
+    external_frames: &mut Vec<ExternalFrame>,
 ) {
     let node_type = node.get("nodeType").and_then(Value::as_i64).unwrap_or(0);
-    let backend_node_id = node.get("backendNodeId").and_then(Value::as_i64).unwrap_or(-1);
-    let frame_id = node
-        .get("frameId")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| inherited_frame.map(str::to_string));
+    let backend_node_id = node
+        .get("backendNodeId")
+        .and_then(Value::as_i64)
+        .unwrap_or(-1);
+    let reported_frame = node.get("frameId").and_then(Value::as_str);
+    // On an <iframe>, `frameId` identifies the *owned child*, while the iframe
+    // element and its backend id belong to the containing document. Prefer the
+    // inherited document identity for every element; pass the reported child id
+    // only when descending into an inline same-process contentDocument.
+    let execution_frame = inherited_frame
+        .or(reported_frame)
+        .unwrap_or(context.root_frame_id)
+        .to_string();
 
     // Element nodes only; text is folded into its parent below.
     if node_type == 1 && backend_node_id >= 0 {
@@ -598,27 +881,39 @@ fn walk(
             .get(&backend_node_id)
             .map(|(r, n)| (Some(r.clone()), Some(n.clone())))
             .unwrap_or((None, None));
+        let role = role.filter(|r| !r.is_empty());
+        let name = name.filter(|n| !n.is_empty());
         let li = layout.get(&backend_node_id);
         let disabled = attrs.contains_key("disabled")
             || attrs.get("aria-disabled").is_some_and(|v| v == "true");
 
-        *counter += 1;
-        let node_ref = refs.mint(*counter, backend_node_id, &tag);
+        let identity = NodeIdentity {
+            target_id: context.target_id.to_string(),
+            session_id: context.session_id.to_string(),
+            frame_id: execution_frame.clone(),
+            backend_node_id,
+            generation: context.generation,
+        };
+        let node_ref = refs.mint(counter, identity, &tag, role.as_deref(), name.as_deref());
 
         out.push(Node {
             node_ref,
             backend_node_id,
-            frame_id: frame_id.clone(),
+            target_id: context.target_id.to_string(),
+            session_id: context.session_id.to_string(),
+            frame_id: Some(execution_frame.clone()),
             interactive: is_interactive(&tag, role.as_deref(), &attrs) && !disabled,
             tag,
-            role: role.filter(|r| !r.is_empty()),
-            name: name.filter(|n| !n.is_empty()),
+            role,
+            name,
             text,
             attrs,
-            bounds: li.map(|l| Bounds {
-                x: l.bounds.x + offset.0,
-                y: l.bounds.y + offset.1,
-                ..l.bounds
+            bounds: li.map(|l| {
+                context.transform.bounds(Bounds {
+                    x: l.bounds.x + offset.0 - context.page_x,
+                    y: l.bounds.y + offset.1 - context.page_y,
+                    ..l.bounds
+                })
             }),
             visible: li.map(|l| l.visible).unwrap_or(false),
             disabled,
@@ -629,16 +924,66 @@ fn walk(
                 .and_then(Value::as_str)
                 .map(str::to_string),
         });
+
+        if node
+            .get("nodeName")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("iframe"))
+            && node.get("contentDocument").is_none()
+        {
+            if let Some(frame_id) = reported_frame {
+                external_frames.push(ExternalFrame {
+                    frame_id: frame_id.to_string(),
+                    owner_backend_node_id: backend_node_id,
+                });
+            }
+        }
     }
 
     let next_depth = if node_type == 1 { depth + 1 } else { depth };
 
-    for child in node.get("children").and_then(Value::as_array).into_iter().flatten() {
-        walk(child, next_depth, in_shadow, frame_id.as_deref(), offset, refs, ax, layout, counter, out);
+    for child in node
+        .get("children")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        walk(
+            child,
+            next_depth,
+            in_shadow,
+            Some(&execution_frame),
+            offset,
+            context,
+            refs,
+            ax,
+            layout,
+            counter,
+            out,
+            external_frames,
+        );
     }
     // Shadow roots — open *and* closed, because CDP sees below the JS boundary.
-    for root in node.get("shadowRoots").and_then(Value::as_array).into_iter().flatten() {
-        walk(root, next_depth, true, frame_id.as_deref(), offset, refs, ax, layout, counter, out);
+    for root in node
+        .get("shadowRoots")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        walk(
+            root,
+            next_depth,
+            true,
+            Some(&execution_frame),
+            offset,
+            context,
+            refs,
+            ax,
+            layout,
+            counter,
+            out,
+            external_frames,
+        );
     }
     // Nested documents: same-process iframes arrive inline here. Out-of-process
     // iframes do not, and need their own attached session.
@@ -652,7 +997,20 @@ fn walk(
             .get(&backend_node_id)
             .map(|l| (l.bounds.x + offset.0, l.bounds.y + offset.1))
             .unwrap_or(offset);
-        walk(content, next_depth, in_shadow, frame_id.as_deref(), child_offset, refs, ax, layout, counter, out);
+        walk(
+            content,
+            next_depth,
+            in_shadow,
+            reported_frame.or(Some(&execution_frame)),
+            child_offset,
+            context,
+            refs,
+            ax,
+            layout,
+            counter,
+            out,
+            external_frames,
+        );
     }
 }
 
@@ -680,6 +1038,7 @@ mod tests {
         for form in ["@node-42", "node-42", "@42", "42", " @node-42 "] {
             assert_eq!(parse_ref(form), Some(42), "failed on {form:?}");
         }
+        assert_eq!(parse_ref("@node-7-42"), Some(42));
         assert_eq!(parse_ref("@node-"), None);
         assert_eq!(parse_ref("button"), None);
     }
@@ -687,8 +1046,27 @@ mod tests {
     #[test]
     fn stale_refs_fail_loudly_after_a_generation_bump() {
         let mut refs = RefTable::default();
-        let r = refs.mint(1, 900, "button");
-        assert_eq!(refs.resolve(&r, refs.generation()).unwrap().backend_node_id, 900);
+        let mut counter = 0;
+        let r = refs.mint(
+            &mut counter,
+            NodeIdentity {
+                target_id: "target".into(),
+                session_id: "session".into(),
+                frame_id: "frame".into(),
+                backend_node_id: 900,
+                generation: 0,
+            },
+            "button",
+            Some("button"),
+            Some("Create"),
+        );
+        assert_eq!(
+            refs.resolve(&r, refs.generation())
+                .unwrap()
+                .identity
+                .backend_node_id,
+            900
+        );
 
         let now = refs.bump();
         let err = refs.resolve(&r, now).unwrap_err();
@@ -699,10 +1077,82 @@ mod tests {
     }
 
     #[test]
+    fn repeated_snapshot_reuses_ref_only_for_the_same_identity() {
+        let identity = NodeIdentity {
+            target_id: "target".into(),
+            session_id: "session".into(),
+            frame_id: "frame".into(),
+            backend_node_id: 7,
+            generation: 4,
+        };
+        let mut counter = 0;
+        let mut first = RefTable::default();
+        first.set_generation(4);
+        let original = first.mint(
+            &mut counter,
+            identity.clone(),
+            "button",
+            Some("button"),
+            Some("Go"),
+        );
+
+        let mut second = first.next_snapshot(4);
+        let stable = second.mint(&mut counter, identity, "button", Some("button"), Some("Go"));
+        let different = second.mint(
+            &mut counter,
+            NodeIdentity {
+                target_id: "target".into(),
+                session_id: "session".into(),
+                frame_id: "frame".into(),
+                backend_node_id: 8,
+                generation: 4,
+            },
+            "button",
+            Some("button"),
+            Some("Other"),
+        );
+        assert_eq!(stable, original);
+        assert_ne!(different, original);
+    }
+
+    #[test]
+    fn same_generation_dom_churn_does_not_grow_identity_memory() {
+        let mut table = RefTable::default();
+        table.set_generation(9);
+        let mut counter = 0;
+        for backend_node_id in 1..=1_000 {
+            let mut next = table.next_snapshot(9);
+            next.mint(
+                &mut counter,
+                NodeIdentity {
+                    target_id: "target".into(),
+                    session_id: "session".into(),
+                    frame_id: "frame".into(),
+                    backend_node_id,
+                    generation: 9,
+                },
+                "button",
+                Some("button"),
+                Some("changing"),
+            );
+            next.prune_absent_identities();
+            assert_eq!(next.remembered_identity_count(), 1);
+            table = next;
+        }
+        assert_eq!(counter, 1_000, "removed identities must never recycle refs");
+    }
+
+    #[test]
     fn unknown_and_malformed_refs_are_distinguished() {
         let refs = RefTable::default();
-        assert!(matches!(refs.resolve("@node-7", 0), Err(RefError::Unknown(_))));
-        assert!(matches!(refs.resolve("nope", 0), Err(RefError::Malformed(_))));
+        assert!(matches!(
+            refs.resolve("@node-7", 0),
+            Err(RefError::Unknown(_))
+        ));
+        assert!(matches!(
+            refs.resolve("nope", 0),
+            Err(RefError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -749,8 +1199,32 @@ mod tests {
 
         let mut refs = RefTable::default();
         let mut nodes = Vec::new();
+        let mut external_frames = Vec::new();
         let mut counter = 0;
-        walk(&doc, 0, false, None, (0.0, 0.0), &mut refs, &HashMap::new(), &HashMap::new(), &mut counter, &mut nodes);
+        let context = CaptureContext {
+            target_id: "target",
+            session_id: "session",
+            root_frame_id: "frame",
+            generation: 0,
+            transform: ViewportTransform::IDENTITY,
+            page_x: 0.0,
+            page_y: 0.0,
+            depth_offset: 0,
+        };
+        walk(
+            &doc,
+            0,
+            false,
+            Some("frame"),
+            (0.0, 0.0),
+            &context,
+            &mut refs,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut counter,
+            &mut nodes,
+            &mut external_frames,
+        );
 
         assert_eq!(nodes.len(), 2, "two elements: button and the shadow span");
         let button = &nodes[0];
@@ -761,7 +1235,10 @@ mod tests {
         assert!(!button.in_shadow);
 
         let span = &nodes[1];
-        assert!(span.in_shadow, "a closed shadow root's contents must be reachable");
+        assert!(
+            span.in_shadow,
+            "a closed shadow root's contents must be reachable"
+        );
         assert_eq!(span.text.as_deref(), Some("inside closed"));
     }
 
@@ -774,13 +1251,20 @@ mod tests {
             nodes: vec![Node {
                 node_ref: "@node-1".into(),
                 backend_node_id: 2,
+                target_id: "target".into(),
+                session_id: "session".into(),
                 frame_id: None,
                 tag: "button".into(),
                 role: Some("button".into()),
                 name: Some("Create account".into()),
                 text: None,
                 attrs: BTreeMap::from([("id".into(), "go".into())]),
-                bounds: Some(Bounds { x: 420.0, y: 610.0, width: 220.0, height: 48.0 }),
+                bounds: Some(Bounds {
+                    x: 420.0,
+                    y: 610.0,
+                    width: 220.0,
+                    height: 48.0,
+                }),
                 visible: true,
                 disabled: false,
                 interactive: true,
@@ -788,11 +1272,15 @@ mod tests {
                 in_shadow: false,
                 shadow_root_type: None,
             }],
+            coverage_gaps: Vec::new(),
         };
         let text = snap.render_text(true);
         assert!(text.contains("generation 3"));
         let line = text.lines().last().unwrap();
-        assert_eq!(line, "@node-1 button \"Create account\" id=go [420,610 220x48]");
+        assert_eq!(
+            line,
+            "@node-1 button \"Create account\" id=go [420,610 220x48]"
+        );
     }
 
     #[test]

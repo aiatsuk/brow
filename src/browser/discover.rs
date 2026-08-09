@@ -106,7 +106,12 @@ fn candidates() -> Vec<PathBuf> {
             "microsoft-edge",
             "brave-browser",
         ] {
-            for dir in ["/usr/bin", "/usr/local/bin", "/snap/bin", "/opt/google/chrome"] {
+            for dir in [
+                "/usr/bin",
+                "/usr/local/bin",
+                "/snap/bin",
+                "/opt/google/chrome",
+            ] {
                 out.push(PathBuf::from(dir).join(name));
             }
         }
@@ -161,14 +166,21 @@ mod tests {
     #[test]
     fn classifies_by_path() {
         assert_eq!(
-            classify(Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")),
+            classify(Path::new(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            )),
             Flavor::Chrome
         );
-        assert_eq!(classify(Path::new("/usr/bin/chromium-browser")), Flavor::Chromium);
+        assert_eq!(
+            classify(Path::new("/usr/bin/chromium-browser")),
+            Flavor::Chromium
+        );
         assert_eq!(classify(Path::new("/usr/bin/brave-browser")), Flavor::Brave);
         // Edge's path also contains "chrome"-ish words on some platforms; edge wins.
         assert_eq!(
-            classify(Path::new("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge")),
+            classify(Path::new(
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+            )),
             Flavor::Edge
         );
     }

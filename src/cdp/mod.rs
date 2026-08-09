@@ -14,5 +14,5 @@
 pub mod conn;
 pub mod transport;
 
-pub use conn::{CdpClient, CdpError, CdpEvent, DEFAULT_TIMEOUT};
+pub use conn::{CdpClient, CdpError, CdpEvent, DEFAULT_TIMEOUT, EVENT_STREAM_GAP_METHOD};
 pub use transport::{cloexec_pipe, PipeTransport};

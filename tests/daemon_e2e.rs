@@ -6,7 +6,10 @@
 
 mod common;
 
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Output};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_brow");
 
@@ -64,6 +67,133 @@ impl Drop for Harness {
     }
 }
 
+/// Runs one CLI request on a separate thread so a concurrency assertion can
+/// fail on a deadline instead of hanging behind the operation it is testing.
+fn spawn_brow(
+    home: std::path::PathBuf,
+    args: &[&str],
+) -> (mpsc::Receiver<Output>, std::thread::JoinHandle<()>) {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let (tx, rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let output = Command::new(BIN)
+            .args(args)
+            .env("BROW_HOME", home)
+            .output()
+            .expect("run brow on worker thread");
+        let _ = tx.send(output);
+    });
+    (rx, thread)
+}
+
+fn output_json(label: &str, output: &Output) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "{label} failed with {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{label} printed non-JSON: {error}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+/// An HTTP response whose headers are withheld until the test releases it.
+/// Receiving `requested` proves the daemon is already inside Page.navigate.
+struct BlockingPage {
+    url: String,
+    requested: mpsc::Receiver<()>,
+    release: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BlockingPage {
+    fn new() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocking page");
+        let address = listener.local_addr().expect("blocking page address");
+        listener
+            .set_nonblocking(true)
+            .expect("make blocking page nonblocking");
+        let (requested_tx, requested) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            'accept: loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                let Ok(read_stream) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(read_stream);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => continue 'accept,
+                        Ok(_) if line == "\r\n" || line == "\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+                let _ = requested_tx.send(());
+                if release_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                    return;
+                }
+
+                let body = "<!doctype html><title>released</title><p>released</p>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                return;
+            }
+        });
+
+        Self {
+            url: format!("http://{address}/blocked"),
+            requested,
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    fn wait_until_requested(&self) {
+        self.requested
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the blocking navigation never reached its HTTP server");
+    }
+
+    fn release(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for BlockingPage {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// PIDs of Chromium processes started against our throwaway profile.
 fn chrome_pids(home: &std::path::Path) -> Vec<String> {
     // Match on the profile path only. A pattern starting with `--` is swallowed
@@ -111,7 +241,10 @@ fn cli_drives_a_browser_through_the_daemon() {
 
     // A browser really is running against our scratch profile.
     let pids = chrome_pids(&h.home);
-    assert!(!pids.is_empty(), "no Chromium process found for the test profile");
+    assert!(
+        !pids.is_empty(),
+        "no Chromium process found for the test profile"
+    );
 
     // ---- snapshot ---------------------------------------------------------
     let snap = h.json(&["snapshot"]);
@@ -155,9 +288,16 @@ fn cli_drives_a_browser_through_the_daemon() {
 
     // ---- errors are actionable --------------------------------------------
     let bad = h.run(&["click", "@node-99999"]);
-    assert_eq!(bad.status.code(), Some(1), "a failed action must exit non-zero");
+    assert_eq!(
+        bad.status.code(),
+        Some(1),
+        "a failed action must exit non-zero"
+    );
     let stderr = String::from_utf8_lossy(&bad.stderr);
-    assert!(stderr.contains("→"), "an error should carry a hint: {stderr}");
+    assert!(
+        stderr.contains("→"),
+        "an error should carry a hint: {stderr}"
+    );
 
     let bad = h.run(&["eval", "document.title = 'nope'"]);
     assert_eq!(bad.status.code(), Some(1));
@@ -189,7 +329,11 @@ fn cli_drives_a_browser_through_the_daemon() {
     // ---- teardown ----------------------------------------------------------
     h.ok(&["close"]);
     let sessions = h.json(&["sessions"]);
-    assert_eq!(sessions.as_array().unwrap().len(), 1, "close must drop just one");
+    assert_eq!(
+        sessions.as_array().unwrap().len(),
+        1,
+        "close must drop just one"
+    );
 
     h.ok(&["daemon", "stop"]);
     let status = h.ok(&["daemon", "status"]);
@@ -211,6 +355,106 @@ fn cli_drives_a_browser_through_the_daemon() {
 
     // The socket is gone, so the next `brow` will start a clean daemon.
     assert!(!h.home.join("run").join("brow.sock").exists());
+}
+
+/// A request that is demonstrably inside one browser must not become a daemon-
+/// wide critical section. This also pins down close ordering: close hides the
+/// session immediately, waits for its in-flight command, and never races CDP or
+/// lets a second browser reuse the same profile before teardown completes.
+#[test]
+fn a_slow_session_does_not_block_status_or_another_session() {
+    if !common::chrome_available() {
+        return common::skip("a_slow_session_does_not_block_status_or_another_session");
+    }
+    let _slot = common::browser_slot();
+    let h = Harness::new("concurrency");
+    let fixture = common::serve();
+
+    h.json(&["--session", "a", "open", &fixture.url("/")]);
+    h.json(&["--session", "b", "open", &fixture.url("/second")]);
+
+    let mut blocked = BlockingPage::new();
+    let (navigation_rx, navigation_thread) = spawn_brow(
+        h.home.clone(),
+        &["--session", "a", "open", &blocked.url, "--json"],
+    );
+    blocked.wait_until_requested();
+
+    // The HTTP request is accepted but has no response headers. Page.navigate in
+    // session A is therefore known to be awaiting the server at this point.
+    let (status_rx, status_thread) = spawn_brow(h.home.clone(), &["daemon", "status", "--json"]);
+    let (session_b_rx, session_b_thread) = spawn_brow(
+        h.home.clone(),
+        &["--session", "b", "eval", "document.title", "--json"],
+    );
+
+    let status_output = status_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("daemon status was blocked by session A");
+    let session_b_output = session_b_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("an operation in session B was blocked by session A");
+    status_thread.join().expect("status worker panicked");
+    session_b_thread.join().expect("session B worker panicked");
+
+    let status = output_json("daemon status", &status_output);
+    assert_eq!(status["sessions"], 2);
+    assert_eq!(
+        output_json("session B eval", &session_b_output),
+        "second page"
+    );
+
+    // Close marks A unavailable without taking A's busy state lock. Its command
+    // cannot finish until the server is released, but status and B stay usable.
+    let (close_rx, close_thread) =
+        spawn_brow(h.home.clone(), &["--session", "a", "close", "--json"]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let status = h.json(&["daemon", "status"]);
+        if status["sessions"] == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "close never made session A unavailable"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        matches!(close_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "close completed while session A still owned an in-flight operation"
+    );
+
+    let rejected = h.run(&["--session", "a", "eval", "document.title"]);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("no session named"),
+        "a closing session accepted another operation: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert_eq!(
+        h.json(&["--session", "b", "eval", "document.title"]),
+        "second page"
+    );
+
+    blocked.release();
+    let navigation_output = navigation_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the released navigation did not finish");
+    let close_output = close_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("close did not finish after the in-flight operation");
+    navigation_thread
+        .join()
+        .expect("navigation worker panicked");
+    close_thread.join().expect("close worker panicked");
+    output_json("session A navigation", &navigation_output);
+    let closed = output_json("session A close", &close_output);
+    assert_eq!(closed["closed"], "a");
+
+    let status = h.json(&["daemon", "status"]);
+    assert_eq!(status["sessions"], 1);
+    h.ok(&["daemon", "stop"]);
 }
 
 /// The CDP pipe is what makes the browser unreachable by any other process. The
@@ -267,7 +511,10 @@ fn a_dead_daemon_takes_its_browsers_with_it_and_recovers_cleanly() {
     let reopened = h.json(&["open", &fixture.url("/second")]);
     assert_eq!(reopened["reused"], false);
     let snap = h.json(&["snapshot"]);
-    assert_eq!(snap["title"], "second page", "the recovered session is not usable");
+    assert_eq!(
+        snap["title"], "second page",
+        "the recovered session is not usable"
+    );
 
     h.ok(&["daemon", "stop"]);
 }
@@ -310,7 +557,10 @@ fn concurrent_daemon_starts_leave_exactly_one_listener() {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
         .unwrap_or(0);
-    assert!(listeners <= 1, "{listeners} browd processes survived the race");
+    assert!(
+        listeners <= 1,
+        "{listeners} browd processes survived the race"
+    );
 
     h.ok(&["daemon", "stop"]);
 }

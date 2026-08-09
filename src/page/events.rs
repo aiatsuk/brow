@@ -11,14 +11,14 @@
 //! work. Until that exists, every entry is stamped when this process saw it, which
 //! is consistent, monotonic, and honest about being a few milliseconds late.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::cdp::{CdpClient, CdpEvent};
+use crate::cdp::{CdpClient, CdpEvent, EVENT_STREAM_GAP_METHOD};
 use crate::redact;
 
 /// Kept deliberately modest: this is a debugging window, not an archive.
@@ -62,6 +62,9 @@ pub struct NetworkEntry {
     pub seq: u64,
     pub t: f64,
     pub request_id: String,
+    /// Flat CDP session owning `request_id`; request ids are not globally unique
+    /// across recursively attached OOPIF renderers.
+    pub session_id: String,
     pub method: String,
     /// Already redacted; credential query parameters never reach this field.
     pub url: String,
@@ -114,12 +117,32 @@ struct Inner {
     next_seq: u64,
     console_dropped: u64,
     network_dropped: u64,
+    /// CDP event positions unavailable before they reached these rings, either
+    /// because the retained-byte budget rejected a browser event or this recorder
+    /// lagged the shared broadcast. Non-zero means results are incomplete.
+    event_stream_gaps: u64,
 }
 
 /// Bounded, thread-safe capture for one session.
 pub struct EventLog {
     inner: Mutex<Inner>,
     started: Instant,
+}
+
+pub(crate) struct RecorderTask {
+    abort: tokio::task::AbortHandle,
+}
+
+impl RecorderTask {
+    pub(crate) fn abort(&self) {
+        self.abort.abort();
+    }
+}
+
+impl Drop for RecorderTask {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
 }
 
 impl EventLog {
@@ -175,6 +198,12 @@ impl EventLog {
         (inner.console_dropped, inner.network_dropped)
     }
 
+    /// Number of unavailable upstream event positions observed by this recorder.
+    /// This is separate from old entries evicted by the console/network rings.
+    pub fn event_stream_gaps(&self) -> u64 {
+        self.inner.lock().expect("event log").event_stream_gaps
+    }
+
     /// Forgets everything captured so far.
     pub fn clear(&self) {
         let mut inner = self.inner.lock().expect("event log");
@@ -182,6 +211,12 @@ impl EventLog {
         inner.network.clear();
         inner.console_dropped = 0;
         inner.network_dropped = 0;
+        inner.event_stream_gaps = 0;
+    }
+
+    fn note_event_stream_gap(&self, count: u64) {
+        let mut inner = self.inner.lock().expect("event log");
+        inner.event_stream_gaps = inner.event_stream_gaps.saturating_add(count.max(1));
     }
 
     fn push_console(&self, mut entry: ConsoleEntry) {
@@ -209,10 +244,15 @@ impl EventLog {
     /// Linear from the back because responses arrive close behind their requests;
     /// with a 2000-entry ring the scan is bounded and an index would have to be
     /// rebuilt on every eviction anyway.
-    fn update_network(&self, request_id: &str, f: impl FnOnce(&mut NetworkEntry)) -> bool {
+    fn update_network(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        f: impl FnOnce(&mut NetworkEntry),
+    ) -> bool {
         let mut inner = self.inner.lock().expect("event log");
         for entry in inner.network.iter_mut().rev() {
-            if entry.request_id == request_id {
+            if entry.session_id == session_id && entry.request_id == request_id && !entry.finished {
                 f(entry);
                 return true;
             }
@@ -223,8 +263,57 @@ impl EventLog {
 
 /// Enables the domains that produce the events, then records them until the
 /// session ends.
-pub async fn spawn_recorder(client: &Arc<CdpClient>, session_id: &str) -> Arc<EventLog> {
+pub(crate) async fn spawn_recorder(
+    client: &Arc<CdpClient>,
+    session_id: &str,
+) -> (Arc<EventLog>, RecorderTask) {
     let log = EventLog::new();
+
+    // Subscribe before enabling domains. Chromium may synchronously flush buffered
+    // Log entries while `Log.enable` is in flight; subscribing afterwards loses
+    // them permanently.
+    let mut events = client.subscribe();
+    let sink = Arc::clone(&log);
+    let root_session_id = session_id.to_string();
+    let task = tokio::spawn(async move {
+        // Membership is consumed from this receiver's own ordered event stream.
+        // Consulting the router task's latest state races at attach/detach
+        // boundaries and can lose an early or final child event.
+        let mut membership = RecorderMembership::new(root_session_id);
+        loop {
+            let ev = match events.recv().await {
+                Ok(ev) => ev,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "event recorder lagged");
+                    sink.note_event_stream_gap(n);
+                    continue;
+                }
+                Err(_) => break,
+            };
+            if ev.method == EVENT_STREAM_GAP_METHOD {
+                // Browser-level gaps affect every page recorder. Session-level
+                // gaps affect the recursively owned root/OOPIF session graph.
+                if ev.session_id.is_none()
+                    || ev
+                        .session_id
+                        .as_deref()
+                        .is_some_and(|id| membership.owns(id))
+                {
+                    let count = ev
+                        .params
+                        .get("dropped")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1);
+                    sink.note_event_stream_gap(count);
+                }
+                continue;
+            }
+            if !membership.accepts(&ev) {
+                continue;
+            }
+            record(&sink, &ev);
+        }
+    });
 
     // `Runtime.enable` is already on from `Page::attach`; `Log` adds the messages
     // the browser itself generates (CSP violations, deprecations, network errors)
@@ -243,31 +332,114 @@ pub async fn spawn_recorder(client: &Arc<CdpClient>, session_id: &str) -> Arc<Ev
         )
         .await;
 
-    let mut events = client.subscribe();
-    let session_id = session_id.to_string();
-    let sink = Arc::clone(&log);
-    tokio::spawn(async move {
-        loop {
-            let ev = match events.recv().await {
-                Ok(ev) => ev,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(skipped = n, "event recorder lagged");
-                    continue;
-                }
-                Err(_) => break,
-            };
-            if ev.session_id.as_deref() != Some(session_id.as_str()) {
-                continue;
-            }
-            record(&sink, &ev);
-        }
-    });
+    (
+        log,
+        RecorderTask {
+            abort: task.abort_handle(),
+        },
+    )
+}
 
-    log
+struct RecorderMembership {
+    owned: HashSet<String>,
+    parent: HashMap<String, String>,
+    target_session: HashMap<String, String>,
+    session_target: HashMap<String, String>,
+}
+
+impl RecorderMembership {
+    fn new(root_session_id: String) -> Self {
+        Self {
+            owned: HashSet::from([root_session_id]),
+            parent: HashMap::new(),
+            target_session: HashMap::new(),
+            session_target: HashMap::new(),
+        }
+    }
+
+    fn owns(&self, session_id: &str) -> bool {
+        self.owned.contains(session_id)
+    }
+
+    fn remove_subtree(&mut self, session_id: &str) {
+        let mut remove = HashSet::from([session_id.to_string()]);
+        loop {
+            let before = remove.len();
+            for (child, parent) in &self.parent {
+                if remove.contains(parent) {
+                    remove.insert(child.clone());
+                }
+            }
+            if remove.len() == before {
+                break;
+            }
+        }
+        for session in remove {
+            self.owned.remove(&session);
+            self.parent.remove(&session);
+            if let Some(target) = self.session_target.remove(&session) {
+                if self.target_session.get(&target) == Some(&session) {
+                    self.target_session.remove(&target);
+                }
+            }
+        }
+    }
+
+    /// Updates causal membership and says whether this event belongs in the log.
+    fn accepts(&mut self, ev: &CdpEvent) -> bool {
+        match ev.method.as_str() {
+            "Target.attachedToTarget" => {
+                let Some(parent) = ev.session_id.as_deref().filter(|id| self.owns(id)) else {
+                    return false;
+                };
+                if ev
+                    .params
+                    .get("targetInfo")
+                    .and_then(|target| target.get("type"))
+                    .and_then(Value::as_str)
+                    != Some("iframe")
+                {
+                    return false;
+                }
+                let Some(session) = ev.params.get("sessionId").and_then(Value::as_str) else {
+                    return false;
+                };
+                let Some(target) = ev
+                    .params
+                    .get("targetInfo")
+                    .and_then(|target| target.get("targetId"))
+                    .and_then(Value::as_str)
+                else {
+                    return false;
+                };
+                let parent = parent.to_string();
+                let session = session.to_string();
+                let target = target.to_string();
+                if let Some(previous) = self.target_session.get(&target).cloned() {
+                    if previous != session {
+                        self.remove_subtree(&previous);
+                    }
+                }
+                self.owned.insert(session.clone());
+                self.parent.insert(session.clone(), parent);
+                self.target_session.insert(target.clone(), session.clone());
+                self.session_target.insert(session, target);
+                false
+            }
+            "Target.detachedFromTarget" => {
+                if let Some(session) = ev.params.get("sessionId").and_then(Value::as_str) {
+                    self.remove_subtree(session);
+                }
+                false
+            }
+            _ => ev.session_id.as_deref().is_some_and(|id| self.owns(id)),
+        }
+    }
 }
 
 fn record(log: &EventLog, ev: &CdpEvent) {
     let t = log.now();
+    let session_id = ev.session_id.as_deref().unwrap_or_default();
     match ev.method.as_str() {
         "Runtime.consoleAPICalled" => {
             let level = ev
@@ -278,7 +450,14 @@ fn record(log: &EventLog, ev: &CdpEvent) {
                 .to_string();
             let text = redact::text(&render_args(ev.params.get("args")));
             let (url, line) = first_frame(ev.params.get("stackTrace"));
-            log.push_console(ConsoleEntry { seq: 0, t, level, text, url, line });
+            log.push_console(ConsoleEntry {
+                seq: 0,
+                t,
+                level,
+                text,
+                url,
+                line,
+            });
         }
         "Runtime.exceptionThrown" => {
             let details = ev.params.get("exceptionDetails");
@@ -292,8 +471,10 @@ fn record(log: &EventLog, ev: &CdpEvent) {
             let url = details
                 .and_then(|d| d.get("url"))
                 .and_then(Value::as_str)
-                .map(str::to_string);
-            let line = details.and_then(|d| d.get("lineNumber")).and_then(Value::as_u64);
+                .map(redact::url);
+            let line = details
+                .and_then(|d| d.get("lineNumber"))
+                .and_then(Value::as_u64);
             log.push_console(ConsoleEntry {
                 seq: 0,
                 t,
@@ -319,7 +500,9 @@ fn record(log: &EventLog, ev: &CdpEvent) {
                 .and_then(|e| e.get("url"))
                 .and_then(Value::as_str)
                 .map(redact::url);
-            let line = entry.and_then(|e| e.get("lineNumber")).and_then(Value::as_u64);
+            let line = entry
+                .and_then(|e| e.get("lineNumber"))
+                .and_then(Value::as_u64);
             log.push_console(ConsoleEntry {
                 seq: 0,
                 t,
@@ -331,10 +514,42 @@ fn record(log: &EventLog, ev: &CdpEvent) {
         }
         "Network.requestWillBeSent" => {
             let request = ev.params.get("request");
+            let request_id = string_at(&ev.params, "requestId");
+
+            // Chromium reuses requestId across an HTTP redirect chain. The next
+            // requestWillBeSent carries the previous hop's response instead of
+            // emitting responseReceived/loadingFinished for that hop, so finish
+            // it before appending the new request.
+            if let Some(response) = ev.params.get("redirectResponse") {
+                let status = response.get("status").and_then(Value::as_i64);
+                let mime = response
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let from_cache = response
+                    .get("fromDiskCache")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let encoded_bytes = response.get("encodedDataLength").and_then(Value::as_f64);
+                if !log.update_network(session_id, &request_id, |entry| {
+                    entry.status = status;
+                    entry.mime = mime;
+                    entry.from_cache = from_cache;
+                    entry.encoded_bytes = encoded_bytes;
+                    entry.finished = true;
+                }) {
+                    tracing::warn!(
+                        %request_id,
+                        "redirect response had no matching in-flight network request"
+                    );
+                }
+            }
+
             log.push_network(NetworkEntry {
                 seq: 0,
                 t,
-                request_id: string_at(&ev.params, "requestId"),
+                request_id,
+                session_id: session_id.to_string(),
                 method: request
                     .and_then(|r| r.get("method"))
                     .and_then(Value::as_str)
@@ -362,7 +577,9 @@ fn record(log: &EventLog, ev: &CdpEvent) {
         }
         "Network.responseReceived" => {
             let response = ev.params.get("response");
-            let status = response.and_then(|r| r.get("status")).and_then(Value::as_i64);
+            let status = response
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_i64);
             let mime = response
                 .and_then(|r| r.get("mimeType"))
                 .and_then(Value::as_str)
@@ -371,7 +588,7 @@ fn record(log: &EventLog, ev: &CdpEvent) {
                 .and_then(|r| r.get("fromDiskCache"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            log.update_network(&string_at(&ev.params, "requestId"), |e| {
+            log.update_network(session_id, &string_at(&ev.params, "requestId"), |e| {
                 e.status = status;
                 e.mime = mime;
                 e.from_cache = from_cache;
@@ -379,7 +596,7 @@ fn record(log: &EventLog, ev: &CdpEvent) {
         }
         "Network.loadingFinished" => {
             let bytes = ev.params.get("encodedDataLength").and_then(Value::as_f64);
-            log.update_network(&string_at(&ev.params, "requestId"), |e| {
+            log.update_network(session_id, &string_at(&ev.params, "requestId"), |e| {
                 e.encoded_bytes = bytes;
                 e.finished = true;
             });
@@ -396,10 +613,14 @@ fn record(log: &EventLog, ev: &CdpEvent) {
                 .get("canceled")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            log.update_network(&string_at(&ev.params, "requestId"), |e| {
+            log.update_network(session_id, &string_at(&ev.params, "requestId"), |e| {
                 // A cancelled request is usually the page changing its mind, not a
                 // problem; label it so it does not read as an error.
-                e.error = Some(if canceled { format!("canceled ({error})") } else { error });
+                e.error = Some(if canceled {
+                    format!("canceled ({error})")
+                } else {
+                    error
+                });
                 e.finished = true;
             });
         }
@@ -461,7 +682,11 @@ fn render_remote_object(obj: &Value) -> String {
             .get("overflow")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        return format!("{{{}{}}}", props.join(", "), if overflow { ", …" } else { "" });
+        return format!(
+            "{{{}{}}}",
+            props.join(", "),
+            if overflow { ", …" } else { "" }
+        );
     }
     obj.get("type")
         .and_then(Value::as_str)
@@ -494,6 +719,56 @@ mod tests {
             params,
             session_id: Some("s".into()),
         }
+    }
+
+    fn session_event(session: &str, method: &str, params: Value) -> CdpEvent {
+        CdpEvent {
+            method: method.to_string(),
+            params,
+            session_id: Some(session.into()),
+        }
+    }
+
+    #[test]
+    fn recorder_membership_keeps_events_on_both_sides_of_attach_detach() {
+        let mut membership = RecorderMembership::new("root".into());
+        let child_console = session_event("child", "Runtime.consoleAPICalled", json!({}));
+        assert!(!membership.accepts(&child_console));
+
+        let attached = session_event(
+            "root",
+            "Target.attachedToTarget",
+            json!({
+                "sessionId": "child",
+                "targetInfo": {"targetId": "child-target", "type": "iframe"}
+            }),
+        );
+        assert!(!membership.accepts(&attached));
+        assert!(membership.accepts(&child_console));
+
+        let grandchild_attached = session_event(
+            "child",
+            "Target.attachedToTarget",
+            json!({
+                "sessionId": "grandchild",
+                "targetInfo": {"targetId": "grandchild-target", "type": "iframe"}
+            }),
+        );
+        membership.accepts(&grandchild_attached);
+        let grandchild_console = session_event("grandchild", "Runtime.consoleAPICalled", json!({}));
+        assert!(membership.accepts(&grandchild_console));
+
+        // The final child event is ordered before detach in this receiver and is
+        // retained. Only events after detach are rejected, including descendants.
+        assert!(membership.accepts(&child_console));
+        let detached = session_event(
+            "root",
+            "Target.detachedFromTarget",
+            json!({"sessionId": "child"}),
+        );
+        assert!(!membership.accepts(&detached));
+        assert!(!membership.accepts(&child_console));
+        assert!(!membership.accepts(&grandchild_console));
     }
 
     #[test]
@@ -547,11 +822,32 @@ mod tests {
                 }),
             ),
         );
+        record(
+            &log,
+            &event(
+                "Runtime.exceptionThrown",
+                json!({"exceptionDetails": {
+                    "text": "Uncaught",
+                    "url": "https://app.test/crash.js?access_token=exception-secret&page=2",
+                    "lineNumber": 7
+                }}),
+            ),
+        );
 
         let stored = format!("{:?}{:?}", log.console(false, 10), log.network(false, 10));
-        assert!(!stored.contains("sk_live_9f8a7b6c5d"), "token reached storage");
-        assert!(!stored.contains("abc123"), "query credential reached storage");
-        assert!(stored.contains("page=1"), "non-secret parameters must survive");
+        assert!(
+            !stored.contains("sk_live_9f8a7b6c5d"),
+            "token reached storage"
+        );
+        assert!(
+            !stored.contains("abc123"),
+            "query credential reached storage"
+        );
+        assert!(!stored.contains("exception-secret"), "exception URL leaked");
+        assert!(
+            stored.contains("page=1"),
+            "non-secret parameters must survive"
+        );
     }
 
     #[test]
@@ -591,6 +887,116 @@ mod tests {
     }
 
     #[test]
+    fn redirects_with_one_request_id_become_complete_hops() {
+        let log = EventLog::new();
+        record(
+            &log,
+            &event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "redirect-1", "type": "Document",
+                       "request": {"method": "GET", "url": "https://x.test/start"}}),
+            ),
+        );
+        record(
+            &log,
+            &event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "redirect-1", "type": "Document",
+                       "redirectResponse": {
+                           "status": 302, "mimeType": "text/html",
+                           "fromDiskCache": false, "encodedDataLength": 120.0
+                       },
+                       "request": {"method": "GET", "url": "https://x.test/middle"}}),
+            ),
+        );
+        record(
+            &log,
+            &event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "redirect-1", "type": "Document",
+                       "redirectResponse": {
+                           "status": 307, "mimeType": "text/html",
+                           "fromDiskCache": false, "encodedDataLength": 80.0
+                       },
+                       "request": {"method": "GET", "url": "https://x.test/final"}}),
+            ),
+        );
+        record(
+            &log,
+            &event(
+                "Network.responseReceived",
+                json!({"requestId": "redirect-1",
+                       "response": {"status": 200, "mimeType": "text/html"}}),
+            ),
+        );
+        record(
+            &log,
+            &event(
+                "Network.loadingFinished",
+                json!({"requestId": "redirect-1", "encodedDataLength": 2048.0}),
+            ),
+        );
+
+        let rows = log.network(false, 10);
+        assert_eq!(rows.len(), 3, "one row is required for each redirect hop");
+        assert_eq!(
+            rows.iter().map(|row| row.status).collect::<Vec<_>>(),
+            vec![Some(302), Some(307), Some(200)]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.url.rsplit('/').next().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["start", "middle", "final"]
+        );
+        assert!(
+            rows.iter().all(|row| row.finished),
+            "redirects must not leave phantom unfinished requests: {rows:#?}"
+        );
+        assert!(rows.iter().all(|row| row.request_id == "redirect-1"));
+    }
+
+    #[test]
+    fn identical_request_ids_in_two_sessions_never_cross_update() {
+        let log = EventLog::new();
+        let mut root_request = event(
+            "Network.requestWillBeSent",
+            json!({"requestId": "shared", "type": "XHR",
+                   "request": {"method": "GET", "url": "https://root.test/"}}),
+        );
+        root_request.session_id = Some("root".into());
+        record(&log, &root_request);
+        let mut child_request = event(
+            "Network.requestWillBeSent",
+            json!({"requestId": "shared", "type": "XHR",
+                   "request": {"method": "GET", "url": "https://child.test/"}}),
+        );
+        child_request.session_id = Some("child".into());
+        record(&log, &child_request);
+
+        let mut child_response = event(
+            "Network.responseReceived",
+            json!({"requestId": "shared", "response": {"status": 503}}),
+        );
+        child_response.session_id = Some("child".into());
+        record(&log, &child_response);
+        let mut child_finished = event(
+            "Network.loadingFinished",
+            json!({"requestId": "shared", "encodedDataLength": 10.0}),
+        );
+        child_finished.session_id = Some("child".into());
+        record(&log, &child_finished);
+
+        let rows = log.network(false, 10);
+        let root = rows.iter().find(|row| row.session_id == "root").unwrap();
+        let child = rows.iter().find(|row| row.session_id == "child").unwrap();
+        assert_eq!(root.status, None);
+        assert!(!root.finished);
+        assert_eq!(child.status, Some(503));
+        assert!(child.finished);
+    }
+
+    #[test]
     fn failures_and_cancellations_are_distinguished() {
         let log = EventLog::new();
         for (id, canceled) in [("r1", false), ("r2", true)] {
@@ -619,11 +1025,21 @@ mod tests {
     #[test]
     fn http_errors_count_as_failures() {
         let log = EventLog::new();
-        record(&log, &event("Network.requestWillBeSent",
-            json!({"requestId": "r1", "type": "XHR",
-                   "request": {"method": "GET", "url": "https://x.test/missing"}})));
-        record(&log, &event("Network.responseReceived",
-            json!({"requestId": "r1", "response": {"status": 404, "mimeType": "text/html"}})));
+        record(
+            &log,
+            &event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "r1", "type": "XHR",
+                   "request": {"method": "GET", "url": "https://x.test/missing"}}),
+            ),
+        );
+        record(
+            &log,
+            &event(
+                "Network.responseReceived",
+                json!({"requestId": "r1", "response": {"status": 404, "mimeType": "text/html"}}),
+            ),
+        );
         assert_eq!(log.network(true, 10).len(), 1);
         assert_eq!(log.network(false, 10).len(), 1);
     }
@@ -648,11 +1064,27 @@ mod tests {
     }
 
     #[test]
+    fn upstream_event_gaps_are_separate_from_ring_evictions() {
+        let log = EventLog::new();
+        assert_eq!(log.event_stream_gaps(), 0);
+        log.note_event_stream_gap(3);
+        assert_eq!(log.event_stream_gaps(), 3);
+        assert_eq!(log.dropped(), (0, 0));
+        log.clear();
+        assert_eq!(log.event_stream_gaps(), 0);
+    }
+
+    #[test]
     fn limit_returns_the_most_recent_entries_oldest_first() {
         let log = EventLog::new();
         for i in 0..10 {
-            record(&log, &event("Runtime.consoleAPICalled",
-                json!({"type": "log", "args": [{"type": "string", "value": format!("m{i}")}]})));
+            record(
+                &log,
+                &event(
+                    "Runtime.consoleAPICalled",
+                    json!({"type": "log", "args": [{"type": "string", "value": format!("m{i}")}]}),
+                ),
+            );
         }
         let rows = log.console(false, 3);
         assert_eq!(
@@ -677,7 +1109,11 @@ mod tests {
             ),
         );
         let rows = log.console(true, 10);
-        assert_eq!(rows.len(), 1, "CSP violations never appear as consoleAPICalled");
+        assert_eq!(
+            rows.len(),
+            1,
+            "CSP violations never appear as consoleAPICalled"
+        );
         assert!(rows[0].is_error());
     }
 }

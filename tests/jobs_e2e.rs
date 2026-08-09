@@ -208,6 +208,77 @@ fn an_ambiguous_step_parks_for_the_agent_instead_of_guessing() {
 }
 
 #[test]
+fn a_decision_is_refused_when_the_selected_target_changes_without_navigation() {
+    if !common::chrome_available() {
+        return common::skip(
+            "a_decision_is_refused_when_the_selected_target_changes_without_navigation",
+        );
+    }
+    let _slot = common::browser_slot();
+    let h = Harness::new("decision-target-changed");
+    let fixture = common::serve();
+
+    let started = h.json(&[
+        "job",
+        "start",
+        "--intent",
+        "choose the reviewed continuation only",
+        "--step",
+        &format!("open {}", fixture.url("/ambiguous-mutating")),
+        "--step",
+        "click Continue",
+        "--step",
+        "wait 500",
+    ]);
+    let id = started["id"].as_str().unwrap().to_string();
+
+    let parked = h.wait_for(&id, &["needs_decision", "failed", "succeeded"], 60);
+    assert_eq!(parked["state"], "needs_decision", "{parked:#}");
+    let options = parked["pending"]["options"]
+        .as_array()
+        .expect("the decision must expose its reviewed candidates");
+    let chosen = options
+        .iter()
+        .position(|option| {
+            option
+                .as_str()
+                .unwrap_or_default()
+                .contains("Continue, second option")
+        })
+        .expect("the fixture's mutable option");
+
+    fixture.mutate_decision_target();
+    fixture.wait_for_decision_target_mutation(std::time::Duration::from_secs(10));
+    assert!(!fixture.decision_target_clicked());
+
+    h.ok(&["job", "answer", &id, &chosen.to_string()]);
+    let status = h.wait_for(&id, &["failed", "succeeded", "waiting_for_approval"], 60);
+    assert_eq!(
+        status["state"], "failed",
+        "the stale choice was applied to a changed target: {status:#}"
+    );
+    assert_eq!(
+        status["cursor"], 1,
+        "the changed choice advanced: {status:#}"
+    );
+    let error = status["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("decision target changed while waiting")
+            && error.contains("No click was sent")
+            && error.contains("fresh decision")
+            && error.contains("Continue, second option")
+            && error.contains("Delete production database"),
+        "the decision failure was not actionable: {error}"
+    );
+    assert!(
+        !fixture.decision_target_clicked(),
+        "the renamed decision target received a click"
+    );
+
+    h.ok(&["daemon", "stop"]);
+}
+
+#[test]
 fn an_irreversible_action_waits_for_a_human() {
     if !common::chrome_available() {
         return common::skip("an_irreversible_action_waits_for_a_human");
@@ -224,7 +295,9 @@ fn an_irreversible_action_waits_for_a_human() {
         "--step",
         &format!("open {}", fixture.url("/danger")),
         "--step",
-        "click \"Delete workspace\"",
+        // The query deliberately omits "Delete". The gate must inspect the
+        // resolved element's real label, not trust a harmless-looking substring.
+        "click workspace",
     ]);
     let id = started["id"].as_str().unwrap().to_string();
 
@@ -266,10 +339,7 @@ fn an_irreversible_action_waits_for_a_human() {
     h.ok(&["job", "approve", &id, "--reject"]);
     let status = h.wait_for(&id, &["failed", "succeeded", "stopped"], 60);
     assert_eq!(status["state"], "failed", "{status:#}");
-    assert!(status["error"]
-        .as_str()
-        .unwrap_or("")
-        .contains("rejected"));
+    assert!(status["error"].as_str().unwrap_or("").contains("rejected"));
 
     h.ok(&["daemon", "stop"]);
 }
@@ -310,10 +380,151 @@ fn approving_lets_the_destructive_step_through() {
 }
 
 #[test]
+fn approval_is_refused_when_the_exact_target_changes_without_navigation() {
+    if !common::chrome_available() {
+        return common::skip(
+            "approval_is_refused_when_the_exact_target_changes_without_navigation",
+        );
+    }
+    let _slot = common::browser_slot();
+    let h = Harness::new("approval-target-changed");
+    let fixture = common::serve();
+
+    let started = h.json(&[
+        "job",
+        "start",
+        "--intent",
+        "delete the reviewed test workspace only",
+        "--step",
+        &format!("open {}", fixture.url("/danger-mutating")),
+        "--step",
+        "click workspace",
+        // If a broken implementation clicks through, exercise another step so
+        // the wrong path cannot hide behind an immediately terminal job.
+        "--step",
+        "wait 500",
+    ]);
+    let id = started["id"].as_str().unwrap().to_string();
+
+    let parked = h.wait_for(&id, &["waiting_for_approval", "failed", "succeeded"], 60);
+    assert_eq!(
+        parked["state"], "waiting_for_approval",
+        "the destructive target was not parked: {parked:#}"
+    );
+    assert!(parked["pending"]["action"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Delete workspace"));
+
+    // Mutate the *same node* after the gate is visibly parked. This leaves the
+    // document generation and immutable backend identity unchanged while the
+    // reviewed accessible label becomes a different destructive action.
+    fixture.mutate_danger_target();
+    fixture.wait_for_danger_target_mutation(std::time::Duration::from_secs(10));
+    assert!(!fixture.danger_target_clicked());
+
+    h.ok(&["job", "approve", &id]);
+    let status = h.wait_for(&id, &["failed", "succeeded"], 60);
+    assert_eq!(
+        status["state"], "failed",
+        "approval was applied to a changed target: {status:#}"
+    );
+    assert_eq!(
+        status["cursor"], 1,
+        "the changed click step advanced: {status:#}"
+    );
+    let error = status["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("approval target changed while waiting")
+            && error.contains("No click was sent")
+            && error.contains("fresh approval")
+            && error.contains("Delete workspace")
+            && error.contains("Delete production database"),
+        "the failure did not explain how to recover safely: {error}"
+    );
+
+    // The handler records the destructive side effect synchronously outside the
+    // browser, so a failed status cannot hide a click that was already dispatched.
+    assert!(
+        !fixture.danger_target_clicked(),
+        "the renamed destructive target received a click"
+    );
+
+    h.ok(&["daemon", "stop"]);
+}
+
+#[test]
+fn approval_fails_closed_when_evidence_cannot_be_written() {
+    if !common::chrome_available() {
+        return common::skip("approval_fails_closed_when_evidence_cannot_be_written");
+    }
+    let _slot = common::browser_slot();
+    let h = Harness::new("approval-evidence-failure");
+    let fixture = common::serve();
+
+    let started = h.json(&[
+        "job",
+        "start",
+        "--intent",
+        "delete only after reviewable evidence exists",
+        "--step",
+        &format!("open {}", fixture.url("/danger-evidence-delayed")),
+        "--step",
+        "click workspace",
+    ]);
+    let id = started["id"].as_str().unwrap().to_string();
+    let artifacts = std::path::PathBuf::from(
+        started["artifacts"]
+            .as_str()
+            .expect("job start must expose its artifact directory"),
+    );
+
+    // The page response is blocked until this exact output path has become a
+    // directory, forcing the real screenshot writer to fail deterministically.
+    let evidence_path = artifacts.join("approval-002.png");
+    std::fs::create_dir_all(&evidence_path).expect("block approval evidence output");
+    fixture.release_delayed_danger();
+
+    let status = h.wait_for(&id, &["failed", "succeeded", "waiting_for_approval"], 60);
+    assert_eq!(
+        status["state"], "failed",
+        "the job opened an approval gate without evidence: {status:#}"
+    );
+    assert_eq!(
+        status["cursor"], 1,
+        "the destructive step advanced: {status:#}"
+    );
+    assert!(
+        status["pending"].is_null(),
+        "an unusable gate was left open"
+    );
+    let error = status["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("mandatory approval evidence")
+            && error.contains("No approval was requested")
+            && error.contains("no click was sent"),
+        "the evidence failure was not actionable: {error}"
+    );
+    assert!(
+        !fixture.danger_target_clicked(),
+        "the destructive target was clicked without evidence"
+    );
+
+    h.ok(&["daemon", "stop"]);
+}
+
+#[test]
 fn a_bad_plan_is_rejected_before_a_browser_is_started() {
     let h = Harness::new("badplan");
 
-    let out = h.run(&["job", "start", "--intent", "x", "--step", "frobnicate everything"]);
+    let out = h.run(&[
+        "job",
+        "start",
+        "--intent",
+        "x",
+        "--step",
+        "frobnicate everything",
+    ]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("Known steps"), "{stderr}");
@@ -325,6 +536,36 @@ fn a_bad_plan_is_rejected_before_a_browser_is_started() {
     assert_eq!(count, 0, "a rejected plan left a job directory behind");
 
     h.run(&["daemon", "stop"]);
+}
+
+#[test]
+fn a_corrupt_manifest_is_reported_instead_of_disappearing() {
+    let h = Harness::new("corrupt-manifest");
+    let artifacts = h.home.join("jobs").join("job_corrupt_fixture");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    let manifest = artifacts.join("job.json");
+    std::fs::write(&manifest, b"{not valid json").unwrap();
+
+    let listed = h.json(&["job", "list"]);
+    let recovered = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["id"] == "job_corrupt_fixture")
+        .expect("a corrupt job must remain visible");
+    assert_eq!(recovered["state"], "failed");
+    let status = h.json(&["job", "status", "job_corrupt_fixture"]);
+    assert!(status["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("corrupt manifest"));
+    assert_eq!(
+        std::fs::read(&manifest).unwrap(),
+        b"{not valid json",
+        "diagnostics must not destroy the only recoverable evidence"
+    );
+
+    h.ok(&["daemon", "stop"]);
 }
 
 #[test]

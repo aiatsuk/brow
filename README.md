@@ -1,7 +1,8 @@
 # brow
 
 Local-first browser harness for AI agents. A persistent Chromium driven over the
-DevTools Protocol directly — no Playwright, no Puppeteer, no cloud, no telemetry.
+DevTools Protocol directly — no Playwright, no Puppeteer, no cloud, and no
+product telemetry implemented by the `brow` binary.
 
 ```text
 brow (CLI)  ──unix socket──▶  browd (daemon)  ──CDP pipe──▶  Chromium
@@ -14,9 +15,9 @@ an agent drives them with.
 
 ## Status
 
-**Iteration 3.** Everything below works and is covered by tests that run against
-a real Chromium. Video recording, the site graph and framework adapters are not
-built yet.
+**Iteration 3.** The core browser flows below are covered by real-Chromium E2E;
+supporting branches also have unit/integration coverage. Video recording, the
+site graph and framework adapters are not built yet.
 
 ## Install
 
@@ -34,9 +35,9 @@ locations, then `PATH`.
 
 ```bash
 brow open example.com               # starts the daemon and a browser if needed
-brow snapshot                       # interactive elements, with @node-N refs
-brow click @node-12
-brow fill @node-14 'someone@example.com'
+brow snapshot                       # interactive elements, with @node-G-N refs
+brow click @node-2-12
+brow fill @node-2-14 'someone@example.com'
 brow press Enter
 brow screenshot --full-page -o page.png
 brow eval "document.querySelector('#status').textContent"
@@ -48,15 +49,18 @@ brow close
 Touch and pointer gestures:
 
 ```bash
-brow tap @node-12
-brow long-press @node-12 --duration-ms 800
+brow tap @node-2-12
+brow long-press @node-2-12 --duration-ms 800
 brow swipe --from 320,720 --to 320,160 --duration-ms 450
 brow pinch --center 400,400 --scale 1.8
-brow drag --from @node-31 --to @node-40
+brow drag --from @node-2-31 --to @node-2-40
 ```
 
-Everything takes `--json` for machine-readable output and `--session NAME` to run
-several independent browsers at once.
+Everything takes `--json` for machine-readable output and `--session NAME` to
+keep several browsers with independent profiles. Different sessions execute
+concurrently; operations within one session are serialized so navigation,
+snapshot and input cannot race one another. Open/close and daemon shutdown are
+linearized explicitly.
 
 ```bash
 brow --session qa open staging.example.com
@@ -91,10 +95,16 @@ question:
 | `needs_decision` | three controls match `"Continue"` — which one? | the **agent**, with `brow job answer <id> <index>` |
 | `waiting_for_approval` | the next click says "Delete workspace" | a **human**, with `brow job approve <id>` |
 
-Answering the wrong kind of gate is refused, so an agent cannot satisfy its own
-approval request. An approval carries a screenshot of what the job was looking
-at, and is void if the page navigates while it is pending — an approval granted
-against a page that has since changed is about something else.
+Answering through the wrong verb is refused. The approval verb is intended for a
+human operator, but the local socket currently authenticates only the Unix user,
+not human presence; an agent running as that user could invoke it. Treat this as
+an explicit manual workflow boundary, not an authenticated security boundary.
+An approval carries an atomic screenshot and a fresh fingerprint of the exact
+selected node: renderer/session identity, tag, role, accessible label, raw and
+effective action semantics such as destination and form method. Any change, even
+without navigation, voids it. Geometry and compositor hit testing are repeated
+after hover immediately before trusted input, so a newly installed overlay is
+refused rather than pressed.
 
 Jobs do not survive a daemon restart (see the limits below). Interrupted jobs
 come back as `interrupted` with their logs intact rather than pretending they can
@@ -112,27 +122,28 @@ explanation rather than silently delivered somewhere else.
 **One page tree.** `brow snapshot` merges DOM structure, the accessibility tree,
 layout boxes and computed visibility into a single node model. It pierces shadow
 roots — including **closed** ones, because CDP operates below the JavaScript
-boundary — folds text into its owning element, and reads same-process iframes
-inline. The accessibility tree is fetched per frame and layout boxes are
-translated into top-level coordinates, because CDP gives neither of those for
-free: `Accessibility.getFullAXTree` does not cross an iframe boundary even
-same-origin, and `DOMSnapshot` reports each document's layout in its own frame's
-coordinate space.
+boundary — folds text into its owning element, and recursively attaches
+out-of-process cross-origin iframes. Target fragments are spliced beside their
+DOM owner in deterministic preorder. Accessibility is fetched per frame and
+action coordinates are transformed through every iframe owner to the top-level
+viewport. A target that cannot attach, initialize or capture becomes an explicit
+`coverage_gap`; it is never silently presented as a complete tree.
 
-**Refs that expire.** `@node-42` is valid only for the document generation it was
-minted in. Navigating, or an SPA `pushState`, invalidates every outstanding ref,
-and using a stale one is a loud error naming the fix instead of a click on
-whatever now occupies that position.
+**Refs that expire.** Emitted refs include their generation, for example
+`@node-7-42`. Navigating, an SPA `pushState`, or a relevant target-tree change
+invalidates outstanding refs. Repeated snapshots in one stable generation reuse
+a ref only for the same browser-side node identity and never recycle a removed
+node's number onto a different node.
 
 **Read-only evaluation that is actually enforced.** `brow eval` runs with V8's
 `throwOnSideEffect`, which aborts an expression the moment it tries to mutate
 anything. This is a real guarantee, not a convention — see the caveat below.
 
-**Secrets never reach disk.** Console output and network URLs are redacted at
-capture, not at display: credential headers by name, credential query parameters
-by name, and `Bearer` / JWT token shapes in free text. Redaction is narrow on
-purpose — a request id or a content hash is not a secret, and over-redaction
-destroys the debuggability the capture exists for.
+**Known credential shapes are redacted before event storage.** Console output,
+exception locations and network URLs are filtered at capture: credential headers
+and query parameters by name, plus `Bearer` / JWT shapes in free text. This is a
+narrow best-effort filter, not a guarantee for arbitrary PII, DOM text, images or
+unknown secret formats.
 
 **No listening debug port.** The browser is launched with
 `--remote-debugging-pipe` and speaks only to its parent process over inherited
@@ -147,19 +158,20 @@ somebody has to remember to update.
 
 ## Known limits
 
-Measured on Chrome, macOS, 2026-08-04.
+Verified on Chrome, macOS; original browser-limit probes 2026-08-04, current
+regression suite 2026-08-09.
 
 - **`throwOnSideEffect` is sound but conservative.** Nothing that mutates gets
   through, but some harmless reads are refused too:
   `document.querySelector('#x').textContent` is allowed, while
   `document.getElementById('x').textContent` and `el.getBoundingClientRect()` are
   not. The error message says so and suggests the rewrite.
-- **Captures cap at 16384 output pixels** per axis — that is CSS pixels × device
-  pixel ratio, so the ceiling is 8192 CSS px on a 2× display. Past it Chromium
-  does not fail: it returns an image of exactly the requested size whose rows
-  beyond the limit are verbatim copies of rows from the top. `brow` clamps every
-  clipped capture and reports what it cut, because nothing downstream can detect
-  the corruption.
+- **One Chromium screenshot frame is capped** at 16,384 output pixels per axis
+  and 8,000,000 pixels total. Oversized full-page PNGs are tiled and stitched up
+  to 64,000,000 output pixels; only one high-memory stitch runs process-wide.
+  Oversized full-page JPEG/WebP is refused because lossy tiles cannot be joined
+  faithfully. Explicit rect/node clips stay single-frame and are truncated with
+  a warning rather than accepting Chromium's silent repeated-row corruption.
 - **Only one page per browser window is `visible`.** Every other tab in the same
   window gets `requestAnimationFrame` at zero — frozen animations, no screencast
   frames, stalled `IntersectionObserver` — and no flag changes it. This is why
@@ -170,20 +182,29 @@ Measured on Chrome, macOS, 2026-08-04.
   fixed when the document is created. Gestures are delivered correctly either way,
   but a responsive site keeps its desktop layout until you reload.
 - **Event capture is bounded** at 2000 console entries and 2000 requests per
-  session, oldest dropped first; the count of what was dropped is reported rather
-  than hidden.
+  session, oldest dropped first. CDP frame, queue and retained-event byte budgets
+  are bounded too. Ring evictions and upstream stream gaps are reported
+  separately; console/network responses mark themselves incomplete after a gap.
 - **Event timestamps are receive time**, not browser event time. CDP mixes several
   clocks and reconciling them is not done yet.
-- **Out-of-process iframes** are not yet traversed. Same-process iframes are fully
-  supported — tree, accessible names, coordinates and clicks — but a cross-origin
-  frame runs in its own process and needs its own attached session, which is not
-  wired up yet.
+- **Transformed inline-frame bounds are approximate.** Trusted actions and node
+  screenshots use live DOM quads and are checked across iframe compositors, but
+  the informational `bounds` emitted for a same-process iframe nested under CSS
+  rotation/scale or thick borders are still based on translation-only snapshot
+  geometry. Cross-process OOPIF owner transforms do handle affine scale/rotation.
 - **The browser does not survive a daemon restart.** Closing the CDP pipe is
   Chromium's shutdown signal, so killing `browd` takes its browsers with it —
   verified, including that it leaves no orphans and that a stale socket is
   recovered cleanly on the next start. "Persistent" here means across CLI
   invocations, not across a daemon restart; the latter would need a supervisor
   process per browser holding the pipe.
+- **The approval command is not proof of human presence.** The Unix peer uid is
+  authenticated, but any process running as that user can invoke it. The exact
+  target/evidence binding is enforced; the human/operator distinction remains a
+  documented workflow boundary until an external trusted approval surface exists.
+- **Browser flags are not a strict egress firewall.** The `brow` binary has no
+  product telemetry and Chromium background services are disabled, but page and
+  browser traffic is not forced through a deny-by-default proxy.
 - **`navigator.webdriver` is `true`.** The pipe transport sets it unconditionally.
   `brow` makes no attempt to hide that it is automation — it is a tool for testing
   your own applications, and the relevant consequence is that your app may take a
@@ -198,13 +219,16 @@ Measured on Chrome, macOS, 2026-08-04.
 ## Development
 
 ```bash
-cargo test          # 49 tests; the e2e ones drive a real Chromium
-cargo clippy --all-targets
+cargo test          # 137 tests (109 unit + 28 integration in this worktree)
+BROW_REQUIRE_CHROME=1 cargo test # fail instead of skipping browser e2e
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 The browser tests skip themselves with a notice when no Chromium is installed.
 They serve their own fixture page from an in-process HTTP server, so the suite
 needs no network.
 
-`docs/research/` holds the protocol research this design is built on, including
-the experiments behind each claim above.
+`docs/research/` is dated protocol research behind the design, not a current-gap
+ledger. Current code/tests and this README take precedence where implementation
+has moved on.

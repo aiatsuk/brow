@@ -30,6 +30,19 @@ fn shutdown(mut launched: Launched) {
     let _ = launched.child.wait();
 }
 
+fn png_rgba(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(
+        png::Transformations::EXPAND | png::Transformations::STRIP_16 | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().expect("PNG header");
+    let mut pixels = vec![0; reader.output_buffer_size().expect("PNG buffer size")];
+    let info = reader.next_frame(&mut pixels).expect("PNG pixels");
+    pixels.truncate(info.buffer_size());
+    assert_eq!(info.color_type, png::ColorType::Rgba);
+    (info.width, info.height, pixels)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn tree_input_and_evaluation() {
     if !common::chrome_available() {
@@ -65,7 +78,10 @@ async fn tree_input_and_evaluation() {
         .iter()
         .find(|n| n.text.as_deref() == Some("Shadow action"))
         .expect("closed shadow DOM content must be reachable");
-    assert!(shadow.in_shadow, "node should be marked as living in a shadow root");
+    assert!(
+        shadow.in_shadow,
+        "node should be marked as living in a shadow root"
+    );
     assert_eq!(shadow.tag, "button");
 
     // Text-only nodes must not be handed out as interactive noise.
@@ -133,7 +149,10 @@ async fn tree_input_and_evaluation() {
         .await
         .expect_err("clicking through an overlay must be refused");
     assert!(
-        matches!(err, PageError::Action(brow::page::input::ActionError::Occluded { .. })),
+        matches!(
+            err,
+            PageError::Action(brow::page::input::ActionError::Occluded { .. })
+        ),
         "expected an occlusion error, got {err:?}"
     );
     let status = page
@@ -196,7 +215,8 @@ async fn refs_are_scoped_to_a_document_generation() {
 
     // A ref from before any snapshot is a different failure than a stale one.
     assert!(matches!(
-        page.click("@node-99999", MouseButton::Left, 1, 0, false).await,
+        page.click("@node-99999", MouseButton::Left, 1, 0, false)
+            .await,
         Err(PageError::Ref(brow::page::RefError::Unknown(_)))
     ));
 
@@ -311,14 +331,22 @@ async fn screenshots_cover_viewport_document_and_node() {
     // Explicit rectangle.
     let rect = page
         .screenshot(
-            ScreenshotTarget::Rect(Clip { x: 0.0, y: 0.0, width: 300.0, height: 150.0 }),
+            ScreenshotTarget::Rect(Clip {
+                x: 0.0,
+                y: 0.0,
+                width: 300.0,
+                height: 150.0,
+            }),
             ImageFormat::Png,
             None,
         )
         .await
         .expect("rect screenshot");
     let (rw, rh) = common::png_size(&rect.bytes).unwrap();
-    assert!((rw as i64 - 300).abs() <= 2 && (rh as i64 - 150).abs() <= 2, "{rw}x{rh}");
+    assert!(
+        (rw as i64 - 300).abs() <= 2 && (rh as i64 - 150).abs() <= 2,
+        "{rw}x{rh}"
+    );
 
     // And it round-trips to disk.
     let out = scratch.0.join("shot.png");
@@ -388,7 +416,8 @@ async fn accessibility_names_cross_same_origin_iframes() {
 
     // The control in the top-level document is the easy case.
     assert!(
-        snap.interactive().any(|n| n.name.as_deref() == Some("Outer close")),
+        snap.interactive()
+            .any(|n| n.name.as_deref() == Some("Outer close")),
         "the top-level icon button lost its accessible name"
     );
 
@@ -473,7 +502,12 @@ async fn oversized_captures_are_cut_rather_than_silently_duplicated() {
     // detect that, so the only defence is never to ask.
     let shot = page
         .screenshot(
-            ScreenshotTarget::Rect(Clip { x: 0.0, y: 0.0, width: 800.0, height: 20_000.0 }),
+            ScreenshotTarget::Rect(Clip {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 20_000.0,
+            }),
             ImageFormat::Png,
             None,
         )
@@ -490,18 +524,189 @@ async fn oversized_captures_are_cut_rather_than_silently_duplicated() {
         .truncated
         .expect("an oversized capture must say it was cut");
     assert!(note.contains("16384"), "{note}");
-    assert!(note.contains("20000"), "the note must state what was asked for: {note}");
+    assert!(
+        note.contains("20000"),
+        "the note must state what was asked for: {note}"
+    );
 
     // A capture inside the limit must not be flagged.
     let ok = page
         .screenshot(
-            ScreenshotTarget::Rect(Clip { x: 0.0, y: 0.0, width: 400.0, height: 400.0 }),
+            ScreenshotTarget::Rect(Clip {
+                x: 0.0,
+                y: 0.0,
+                width: 400.0,
+                height: 400.0,
+            }),
             ImageFormat::Png,
             None,
         )
         .await
         .expect("normal capture");
     assert!(ok.truncated.is_none());
+
+    // A full-page PNG does not have to be cut. It is captured as multiple safe
+    // clips and stitched, preserving pixels on both sides of Chromium's 16384px
+    // corruption boundary. Distinct edge colours catch both truncation and the
+    // much nastier old failure mode where Chrome repeats rows from the top.
+    let dimensions = page
+        .evaluate(
+            "document.documentElement.style.cssText='margin:0;padding:0';\
+             document.body.style.cssText='margin:0;padding:0;height:20000px;background:rgb(0,64,128)';\
+             document.body.innerHTML='<div style=\"position:fixed;z-index:1;top:0;left:0;width:100%;height:8px;background:rgb(0,255,0)\"></div>' +\
+               '<div style=\"height:64px;background:rgb(255,0,0)\"></div>' +\
+               '<div style=\"position:absolute;top:19936px;left:0;width:100%;height:64px;background:rgb(255,0,255)\"></div>';\
+             [document.scrollingElement.scrollWidth,document.scrollingElement.scrollHeight,window.devicePixelRatio]",
+            false,
+        )
+        .await
+        .expect("install tall capture fixture");
+    let dims = dimensions.as_array().expect("dimension array");
+    let expected_width = (dims[0].as_f64().unwrap() * dims[2].as_f64().unwrap()).round() as u32;
+    let expected_height = (dims[1].as_f64().unwrap() * dims[2].as_f64().unwrap()).round() as u32;
+
+    let full = page
+        .screenshot(ScreenshotTarget::FullPage, ImageFormat::Png, None)
+        .await
+        .expect("tiled full-page capture");
+    assert!(
+        full.tiled,
+        "an oversized full page should use tiled capture"
+    );
+    assert!(
+        full.tile_count >= 2,
+        "expected multiple clips, got {}",
+        full.tile_count
+    );
+    assert!(full.truncated.is_none());
+
+    let (full_width, full_height, pixels) = png_rgba(&full.bytes);
+    assert_eq!((full_width, full_height), (expected_width, expected_height));
+    let sample = |x: u32, y: u32| {
+        let offset = ((y * full_width + x) * 4) as usize;
+        &pixels[offset..offset + 4]
+    };
+    assert_eq!(sample(2, 2), [0, 255, 0, 255], "fixed header was lost");
+    assert_eq!(sample(2, 32), [255, 0, 0, 255], "top marker was lost");
+    assert_eq!(
+        sample(2, 16_385),
+        [0, 64, 128, 255],
+        "fixed header was duplicated at a tile boundary"
+    );
+    assert_eq!(
+        sample(2, full_height - 2),
+        [255, 0, 255, 255],
+        "bottom marker was truncated or replaced by repeated top-page pixels"
+    );
+
+    shutdown(launched);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tiled_full_page_capture_accounts_for_device_scale_factor() {
+    if !common::chrome_available() {
+        return common::skip("tiled_full_page_capture_accounts_for_device_scale_factor");
+    }
+    let _slot = common::browser_slot();
+    let fixture = common::serve();
+    let scratch = common::Scratch::new("huge-dpr2");
+    let mut opts = LaunchOptions::new(scratch.0.join("profile"));
+    opts.headless = Headless::New;
+    opts.window_size = (640, 400);
+    opts.extra_args.push("--force-device-scale-factor=2".into());
+
+    let launched = launch(&opts).await.expect("launch dpr2 chromium");
+    let mut page = Page::create(Arc::clone(&launched.client), &fixture.url("/"))
+        .await
+        .expect("open dpr2 fixture");
+    let dimensions = page
+        .evaluate(
+            "document.documentElement.style.cssText='margin:0;padding:0';\
+             document.body.style.cssText='margin:0;padding:0;height:8200px;background:rgb(12,34,56)';\
+             document.body.innerHTML='<div style=\"position:absolute;top:8176px;left:0;width:100%;height:24px;background:rgb(1,222,3)\"></div>';\
+             [document.scrollingElement.scrollWidth,document.scrollingElement.scrollHeight,window.devicePixelRatio]",
+            false,
+        )
+        .await
+        .expect("install dpr2 fixture");
+    let dims = dimensions.as_array().expect("dimension array");
+    let dpr = dims[2].as_f64().expect("devicePixelRatio");
+    assert!(
+        (dpr - 2.0).abs() < 0.01,
+        "Chrome ignored the DPR flag: {dpr}"
+    );
+
+    let full = page
+        .screenshot(ScreenshotTarget::FullPage, ImageFormat::Png, None)
+        .await
+        .expect("dpr2 tiled full-page capture");
+    assert!(full.tiled);
+    assert!(full.tile_count >= 2);
+    let (width, height, pixels) = png_rgba(&full.bytes);
+    let expected_width = (dims[0].as_f64().unwrap() * dpr).round() as u32;
+    let expected_height = (dims[1].as_f64().unwrap() * dpr).round() as u32;
+    assert_eq!((width, height), (expected_width, expected_height));
+    let bottom = (((height - 2) * width + 2) * 4) as usize;
+    assert_eq!(
+        &pixels[bottom..bottom + 4],
+        [1, 222, 3, 255],
+        "DPR-scaled bottom marker was lost"
+    );
+
+    shutdown(launched);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tiled_full_page_capture_handles_fractional_device_scale_factor() {
+    if !common::chrome_available() {
+        return common::skip("tiled_full_page_capture_handles_fractional_device_scale_factor");
+    }
+    let _slot = common::browser_slot();
+    let fixture = common::serve();
+    let scratch = common::Scratch::new("huge-dpr-fractional");
+    let mut opts = LaunchOptions::new(scratch.0.join("profile"));
+    opts.headless = Headless::New;
+    opts.window_size = (640, 400);
+    opts.extra_args
+        .push("--force-device-scale-factor=1.25".into());
+
+    let launched = launch(&opts).await.expect("launch fractional-DPR chromium");
+    let mut page = Page::create(Arc::clone(&launched.client), &fixture.url("/"))
+        .await
+        .expect("open fractional-DPR fixture");
+    let dimensions = page
+        .evaluate(
+            "document.documentElement.style.cssText='margin:0;padding:0';\
+             document.body.style.cssText='margin:0;padding:0;height:8200px;background:rgb(21,43,65)';\
+             document.body.innerHTML='<div style=\"position:absolute;top:8176px;left:0;width:100%;height:24px;background:rgb(231,17,99)\"></div>';\
+             [document.scrollingElement.scrollWidth,document.scrollingElement.scrollHeight,window.devicePixelRatio]",
+            false,
+        )
+        .await
+        .expect("install fractional-DPR fixture");
+    let dims = dimensions.as_array().expect("dimension array");
+    let dpr = dims[2].as_f64().expect("devicePixelRatio");
+    assert!(
+        (dpr - 1.25).abs() < 0.01,
+        "Chrome ignored the fractional DPR flag: {dpr}"
+    );
+
+    let full = page
+        .screenshot(ScreenshotTarget::FullPage, ImageFormat::Png, None)
+        .await
+        .expect("fractional-DPR tiled full-page capture");
+    assert!(full.tiled, "the per-frame area bound should require tiles");
+    assert!(full.tile_count >= 2);
+    let (width, height, pixels) = png_rgba(&full.bytes);
+    let expected_width = (dims[0].as_f64().unwrap() * dpr).round() as u32;
+    let expected_height = (dims[1].as_f64().unwrap() * dpr).round() as u32;
+    assert_eq!((width, height), (expected_width, expected_height));
+    let bottom = (((height - 2) * width + 2) * 4) as usize;
+    assert_eq!(
+        &pixels[bottom..bottom + 4],
+        [231, 17, 99, 255],
+        "fractional-DPR bottom marker was lost at a tile boundary"
+    );
 
     shutdown(launched);
 }

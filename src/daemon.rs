@@ -8,13 +8,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::browser::{self, launch::Headless, LaunchOptions, Launched};
 use crate::ipc::{Hello, Request, Response, ShotTarget, Target, PROTOCOL_VERSION};
@@ -24,19 +25,98 @@ use crate::page::{
 };
 use crate::paths;
 
+const MAX_CLICK_COUNT: i64 = 10;
+const MAX_GESTURE_DURATION_MS: u64 = 120_000;
+const MAX_GESTURE_STEPS: u32 = 1_000;
+
 struct Session {
     launched: Launched,
     page: Page,
     profile: PathBuf,
+}
+
+/// A named browser's mutable CDP state and the immutable fields needed to list it.
+///
+/// `state` is the only lock held while talking to that browser. The registry only
+/// stores these handles, so a slow command in one session never stalls another
+/// session (or daemon status/shutdown).
+struct SessionSlot {
+    state: Arc<Mutex<Option<Session>>>,
+    summary: OnceLock<SessionSummary>,
+    generation: AtomicU64,
+    closing: AtomicBool,
+    closed: tokio::sync::watch::Sender<bool>,
+}
+
+struct SessionSummary {
+    product: String,
     headless: bool,
     opened_at: SystemTime,
 }
 
+struct SessionGuard {
+    state: tokio::sync::OwnedMutexGuard<Option<Session>>,
+    slot: Arc<SessionSlot>,
+}
+
+impl std::ops::Deref for SessionGuard {
+    type Target = Session;
+
+    fn deref(&self) -> &Self::Target {
+        self.state
+            .as_ref()
+            .expect("a SessionGuard is only built for a live session")
+    }
+}
+
+impl std::ops::DerefMut for SessionGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.state
+            .as_mut()
+            .expect("a SessionGuard is only built for a live session")
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if let Some(session) = self.state.as_ref() {
+            self.slot
+                .generation
+                .store(session.page.generation(), Ordering::Release);
+        }
+    }
+}
+
+impl SessionSlot {
+    fn new() -> Self {
+        let (closed, _) = tokio::sync::watch::channel(false);
+        Self {
+            state: Arc::new(Mutex::new(None)),
+            summary: OnceLock::new(),
+            generation: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
+            closed,
+        }
+    }
+
+    async fn wait_closed(&self) {
+        let mut closed = self.closed.subscribe();
+        if !*closed.borrow() {
+            let _ = closed.changed().await;
+        }
+    }
+}
+
 pub struct Daemon {
-    sessions: HashMap<String, Session>,
-    jobs: jobs::JobStore,
+    sessions: Mutex<HashMap<String, Arc<SessionSlot>>>,
+    jobs: Mutex<jobs::JobStore>,
     started: Instant,
     shutdown: tokio::sync::watch::Sender<bool>,
+    /// Read permits allow normal requests to run concurrently. Shutdown takes
+    /// the sole write permit, waits for every accepted operation to finish, then
+    /// permanently closes admission before cleanup starts.
+    lifecycle: RwLock<()>,
+    shutting_down: AtomicBool,
 }
 
 /// Starts the daemon, serving until asked to stop.
@@ -56,20 +136,22 @@ pub async fn serve() -> anyhow::Result<()> {
     if !previous.is_empty() {
         tracing::info!(count = previous.len(), "recovered job manifests");
     }
-    let daemon = Arc::new(Mutex::new(Daemon {
-        sessions: HashMap::new(),
-        jobs: jobs::JobStore {
+    let daemon = Arc::new(Daemon {
+        sessions: Mutex::new(HashMap::new()),
+        jobs: Mutex::new(jobs::JobStore {
             finished: previous,
             ..Default::default()
-        },
+        }),
         started: Instant::now(),
-        shutdown: shutdown_tx,
-    }));
+        shutdown: shutdown_tx.clone(),
+        lifecycle: RwLock::new(()),
+        shutting_down: AtomicBool::new(false),
+    });
 
     tracing::info!(socket = %socket_path.display(), pid = std::process::id(), "browd listening");
 
     let signals = {
-        let daemon = Arc::clone(&daemon);
+        let shutdown = shutdown_tx.clone();
         async move {
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -79,18 +161,20 @@ pub async fn serve() -> anyhow::Result<()> {
                 _ = term.recv() => {}
             }
             tracing::info!("signal received, shutting down");
-            let _ = daemon.lock().await.shutdown.send(true);
+            let _ = shutdown.send(true);
         }
     };
     tokio::spawn(signals);
 
+    let mut connections = tokio::task::JoinSet::new();
     loop {
+        while connections.try_join_next().is_some() {}
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
                         let daemon = Arc::clone(&daemon);
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             if let Err(e) = handle_conn(stream, daemon).await {
                                 tracing::debug!(error = %e, "connection ended");
                             }
@@ -107,13 +191,21 @@ pub async fn serve() -> anyhow::Result<()> {
         }
     }
 
+    // Dispatch shutdown waits for all active requests via `lifecycle`, so tasks
+    // here are only flushing their final response or idling on a keep-alive
+    // socket. Give the shutdown caller a brief flush window, then abort idlers.
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+
     // Take every browser down with us rather than leaking Chromium processes.
-    let mut guard = daemon.lock().await;
-    let names: Vec<String> = guard.sessions.keys().cloned().collect();
-    for name in names {
-        guard.close_session(&name).await;
-    }
-    drop(guard);
+    daemon.stop_all_jobs().await;
+    // Close them concurrently: a command already running in one session must
+    // not delay cleanup of every other browser.
+    daemon.close_all_sessions().await;
 
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(paths::pid_file());
@@ -161,10 +253,7 @@ async fn bind(path: &std::path::Path) -> anyhow::Result<UnixListener> {
         // One that answers means a daemon is already running, and we must not
         // steal its socket.
         match UnixStream::connect(path).await {
-            Ok(_) => anyhow::bail!(
-                "another browd is already listening on {}",
-                path.display()
-            ),
+            Ok(_) => anyhow::bail!("another browd is already listening on {}", path.display()),
             Err(_) => {
                 tracing::warn!(socket = %path.display(), "removing stale socket");
                 let _ = std::fs::remove_file(path);
@@ -191,7 +280,11 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
 
     #[cfg(target_os = "linux")]
     {
-        let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         // SAFETY: `fd` is a live socket; `cred`/`len` are correctly sized.
         let rc = unsafe {
@@ -216,7 +309,7 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
     }
 }
 
-async fn handle_conn(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) -> anyhow::Result<()> {
+async fn handle_conn(stream: UnixStream, daemon: Arc<Daemon>) -> anyhow::Result<()> {
     // Defence in depth behind the 0700 directory: only this user may drive a
     // browser that holds this user's logged-in sessions.
     #[cfg(unix)]
@@ -245,15 +338,7 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) -> anyhow::
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => {
-                let stop = matches!(req, Request::Shutdown);
-                let mut guard = daemon.lock().await;
-                let resp = guard.dispatch(req).await;
-                if stop {
-                    let _ = guard.shutdown.send(true);
-                }
-                resp
-            }
+            Ok(req) => daemon.dispatch(req).await,
             Err(e) => Response::error_hint(
                 format!("unparseable request: {e}"),
                 "this is a bug in the brow CLI, or a version mismatch — try `brow daemon restart`",
@@ -267,48 +352,99 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) -> anyhow::
 }
 
 impl Daemon {
-    async fn dispatch(&mut self, req: Request) -> Response {
+    async fn dispatch(&self, req: Request) -> Response {
+        if matches!(&req, Request::Shutdown) {
+            let _exclusive = self.lifecycle.write().await;
+            let already = self.shutting_down.swap(true, Ordering::AcqRel);
+            let _ = self.shutdown.send(true);
+            return Response::ok_text(
+                json!({"stopping": true, "already_stopping": already}),
+                "browd stopping",
+            );
+        }
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Response::error("browd is shutting down; request was not started");
+        }
+        let _active = self.lifecycle.read().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Response::error("browd is shutting down; request was not started");
+        }
         match req {
             Request::Ping => Response::ok_text(json!({"pong": true}), "pong"),
-            Request::Shutdown => Response::ok_text(json!({"stopping": true}), "browd stopping"),
+            Request::Shutdown => {
+                unreachable!("shutdown is handled before normal request admission")
+            }
             Request::Status => {
                 let uptime = self.started.elapsed().as_secs();
+                let sessions = self
+                    .sessions
+                    .lock()
+                    .await
+                    .values()
+                    .filter(|slot| {
+                        slot.summary.get().is_some() && !slot.closing.load(Ordering::Acquire)
+                    })
+                    .count();
                 Response::ok_text(
                     json!({
                         "version": env!("CARGO_PKG_VERSION"),
                         "pid": std::process::id(),
                         "uptime_seconds": uptime,
-                        "sessions": self.sessions.len(),
+                        "sessions": sessions,
                     }),
                     format!(
                         "browd {} · pid {} · up {}s · {} session(s)",
                         env!("CARGO_PKG_VERSION"),
                         std::process::id(),
                         uptime,
-                        self.sessions.len()
+                        sessions
                     ),
                 )
             }
             Request::Sessions => {
                 let mut rows = Vec::new();
                 let mut text = String::new();
-                for (name, s) in &self.sessions {
-                    let age = s
+                let slots: Vec<(String, Arc<SessionSlot>)> = self
+                    .sessions
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|(name, slot)| (name.clone(), Arc::clone(slot)))
+                    .collect();
+                for (name, slot) in slots {
+                    if slot.closing.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let Some(summary) = slot.summary.get() else {
+                        continue;
+                    };
+                    let generation = match slot.state.try_lock() {
+                        Ok(state) => state
+                            .as_ref()
+                            .map(|session| session.page.generation())
+                            .unwrap_or_else(|| slot.generation.load(Ordering::Acquire)),
+                        Err(_) => slot.generation.load(Ordering::Acquire),
+                    };
+                    let age = summary
                         .opened_at
                         .elapsed()
                         .map(|d| d.as_secs())
                         .unwrap_or_default();
                     rows.push(json!({
                         "session": name,
-                        "headless": s.headless,
-                        "product": s.launched.product,
-                        "generation": s.page.generation(),
+                        "headless": summary.headless,
+                        "product": summary.product,
+                        "generation": generation,
                         "age_seconds": age,
                     }));
                     text.push_str(&format!(
                         "{name}  {}  generation {}  {}s\n",
-                        if s.headless { "headless" } else { "headed" },
-                        s.page.generation(),
+                        if summary.headless {
+                            "headless"
+                        } else {
+                            "headed"
+                        },
+                        generation,
                         age
                     ));
                 }
@@ -317,18 +453,19 @@ impl Daemon {
                 }
                 Response::ok_text(json!(rows), text)
             }
-            Request::Open { url, session, headless } => self.open(&session, &url, headless).await,
-            Request::Close { session } => {
-                if self.sessions.contains_key(&session) {
-                    self.close_session(&session).await;
-                    Response::ok_text(json!({"closed": session}), format!("closed {session}"))
-                } else {
-                    Response::error(format!("no session named {session:?}"))
-                }
-            }
-            Request::Snapshot { session, interactive } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return no_session(&session);
+            Request::Open {
+                url,
+                session,
+                headless,
+            } => self.open(&session, &url, headless).await,
+            Request::Close { session } => self.close(&session).await,
+            Request::Snapshot {
+                session,
+                interactive,
+            } => {
+                let mut s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 match s.page.snapshot().await {
                     Ok(snap) => {
@@ -341,6 +478,7 @@ impl Daemon {
                                 "url": snap.url,
                                 "title": snap.title,
                                 "nodes": snap.nodes,
+                                "coverage_gaps": snap.coverage_gaps,
                                 "counts": { "total": count, "interactive": interactive_count },
                             }),
                             text,
@@ -349,14 +487,31 @@ impl Daemon {
                     Err(e) => page_error(e),
                 }
             }
-            Request::Click { session, target, button, count, modifiers, force } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return no_session(&session);
+            Request::Click {
+                session,
+                target,
+                button,
+                count,
+                modifiers,
+                force,
+            } => {
+                if !(1..=MAX_CLICK_COUNT).contains(&count) {
+                    return Response::error(format!(
+                        "click count must be between 1 and {MAX_CLICK_COUNT}, got {count}"
+                    ));
+                }
+                let mut s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 let button = parse_button(&button);
                 match target {
                     Target::Ref { node_ref } => {
-                        match s.page.click(&node_ref, button, count, modifiers, force).await {
+                        match s
+                            .page
+                            .click(&node_ref, button, count, modifiers, force)
+                            .await
+                        {
                             Ok(p) => Response::ok_text(
                                 json!({"clicked": node_ref, "x": p.x, "y": p.y}),
                                 format!("clicked {node_ref} at {:.0},{:.0}", p.x, p.y),
@@ -365,7 +520,11 @@ impl Daemon {
                         }
                     }
                     Target::Point { x, y } => {
-                        match s.page.click_at(Point { x, y }, button, count, modifiers).await {
+                        match s
+                            .page
+                            .click_at(Point { x, y }, button, count, modifiers)
+                            .await
+                        {
                             Ok(()) => Response::ok_text(
                                 json!({"x": x, "y": y}),
                                 format!("clicked {x:.0},{y:.0}"),
@@ -376,8 +535,9 @@ impl Daemon {
                 }
             }
             Request::Hover { session, node_ref } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return no_session(&session);
+                let mut s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 match s.page.hover(&node_ref).await {
                     Ok(p) => Response::ok_text(
@@ -387,30 +547,42 @@ impl Daemon {
                     Err(e) => page_error(e),
                 }
             }
-            Request::Fill { session, node_ref, text } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return no_session(&session);
+            Request::Fill {
+                session,
+                node_ref,
+                text,
+            } => {
+                let mut s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 match s.page.fill(&node_ref, &text).await {
-                    Ok(()) => Response::ok_text(
-                        json!({"filled": node_ref}),
-                        format!("filled {node_ref}"),
-                    ),
+                    Ok(()) => {
+                        Response::ok_text(json!({"filled": node_ref}), format!("filled {node_ref}"))
+                    }
                     Err(e) => page_error(e),
                 }
             }
             Request::Press { session, chord } => {
-                let Some(s) = self.sessions.get(&session) else {
-                    return no_session(&session);
+                let s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 match s.page.press(&chord).await {
-                    Ok(()) => Response::ok_text(json!({"pressed": chord}), format!("pressed {chord}")),
+                    Ok(()) => {
+                        Response::ok_text(json!({"pressed": chord}), format!("pressed {chord}"))
+                    }
                     Err(e) => page_error(e),
                 }
             }
-            Request::Type { session, text, by_key } => {
-                let Some(s) = self.sessions.get(&session) else {
-                    return no_session(&session);
+            Request::Type {
+                session,
+                text,
+                by_key,
+            } => {
+                let s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 match s.page.type_text(&text, by_key).await {
                     Ok(()) => Response::ok_text(
@@ -421,8 +593,9 @@ impl Daemon {
                 }
             }
             Request::Scroll { session, dx, dy } => {
-                let Some(s) = self.sessions.get(&session) else {
-                    return no_session(&session);
+                let s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 match s.page.scroll(dx, dy).await {
                     Ok(()) => Response::ok_text(
@@ -432,9 +605,16 @@ impl Daemon {
                     Err(e) => page_error(e),
                 }
             }
-            Request::Screenshot { session, target, format, quality, out } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return no_session(&session);
+            Request::Screenshot {
+                session,
+                target,
+                format,
+                quality,
+                out,
+            } => {
+                let mut s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 let Some(fmt) = ImageFormat::parse(&format) else {
                     return Response::error(format!("unknown image format {format:?}"));
@@ -443,9 +623,17 @@ impl Daemon {
                     ShotTarget::Viewport => ScreenshotTarget::Viewport,
                     ShotTarget::FullPage => ScreenshotTarget::FullPage,
                     ShotTarget::Node { node_ref } => ScreenshotTarget::Node(node_ref),
-                    ShotTarget::Rect { x, y, width, height } => {
-                        ScreenshotTarget::Rect(capture::Clip { x, y, width, height })
-                    }
+                    ShotTarget::Rect {
+                        x,
+                        y,
+                        width,
+                        height,
+                    } => ScreenshotTarget::Rect(capture::Clip {
+                        x,
+                        y,
+                        width,
+                        height,
+                    }),
                 };
                 let shot = match s.page.screenshot(target, fmt, quality).await {
                     Ok(shot) => shot,
@@ -468,11 +656,19 @@ impl Daemon {
                         if let Some(warning) = &shot.truncated {
                             text.push_str(&format!("\nnote: {warning}"));
                         }
+                        if shot.tiled {
+                            text.push_str(&format!(
+                                "\nnote: stitched full-page capture from {} tiles",
+                                shot.tile_count
+                            ));
+                        }
                         Response::ok_text(
                             json!({
                                 "path": written,
                                 "bytes": shot.bytes.len(),
                                 "truncated": shot.truncated,
+                                "tiled": shot.tiled,
+                                "tile_count": shot.tile_count,
                             }),
                             text,
                         )
@@ -480,19 +676,32 @@ impl Daemon {
                     Err(e) => Response::error(format!("could not write {}: {e}", path.display())),
                 }
             }
-            Request::JobStart { intent, steps, headless } => {
-                self.job_start(intent, steps, headless).await
-            }
+            Request::JobStart {
+                intent,
+                steps,
+                headless,
+            } => self.job_start(intent, steps, headless).await,
             Request::JobList => {
                 let mut rows = Vec::new();
                 let mut text = String::new();
                 // Running first, then history, newest last.
+                let (finished, records) = {
+                    let store = self.jobs.lock().await;
+                    (
+                        store.finished.clone(),
+                        store
+                            .handles
+                            .values()
+                            .map(|handle| Arc::clone(&handle.record))
+                            .collect::<Vec<_>>(),
+                    )
+                };
                 let mut live: Vec<jobs::JobRecord> = Vec::new();
-                for handle in self.jobs.handles.values() {
-                    live.push(handle.record.lock().await.clone());
+                for record in records {
+                    live.push(record.lock().await.clone());
                 }
                 live.sort_by_key(|r| r.created_ms);
-                for r in self.jobs.finished.iter().cloned().chain(live) {
+                for r in finished.into_iter().chain(live) {
                     text.push_str(&format!(
                         "{}  {:<20} step {}/{}  {}\n",
                         r.id,
@@ -564,32 +773,19 @@ impl Daemon {
                 )
                 .await
             }
-            Request::JobStop { id } => {
-                let Some(handle) = self.jobs.handles.get(&id) else {
-                    return no_job(&id);
-                };
-                // Both paths, because a job is either parked (reading control) or
-                // mid-step (watching the stop signal), and we do not know which.
-                // `try_send` rather than `send`: awaiting a full channel here would
-                // block every other request, since dispatch holds the daemon lock.
-                let _ = handle.control.try_send(jobs::Control::Stop);
-                let _ = handle.stop.send(true);
-                {
-                    let mut r = handle.record.lock().await;
-                    if !r.state.is_terminal() {
-                        r.state = jobs::JobState::Stopped;
-                        jobs::persist(&r).await;
-                    }
-                }
-                self.reap_job(&id).await;
-                Response::ok_text(json!({ "stopped": id }), format!("stopped {id}"))
-            }
-            Request::Console { session, errors, limit } => {
-                let Some(s) = self.sessions.get(&session) else {
-                    return no_session(&session);
+            Request::JobStop { id } => self.job_stop(&id).await,
+            Request::Console {
+                session,
+                errors,
+                limit,
+            } => {
+                let s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 let rows = s.page.events.console(errors, limit.clamp(1, 5_000));
                 let (dropped, _) = s.page.events.dropped();
+                let event_stream_gaps = s.page.events.event_stream_gaps();
                 let mut text = rows
                     .iter()
                     .map(|r| r.render())
@@ -605,14 +801,33 @@ impl Daemon {
                 if dropped > 0 {
                     text.push_str(&format!("\n({dropped} older entries dropped)"));
                 }
-                Response::ok_text(json!({ "entries": rows, "dropped": dropped }), text)
+                if event_stream_gaps > 0 {
+                    text.push_str(&format!(
+                        "\n({event_stream_gaps} upstream CDP event(s) unavailable; results are incomplete)"
+                    ));
+                }
+                Response::ok_text(
+                    json!({
+                        "entries": rows,
+                        "dropped": dropped,
+                        "event_stream_gaps": event_stream_gaps,
+                        "complete": event_stream_gaps == 0,
+                    }),
+                    text,
+                )
             }
-            Request::Network { session, failed, limit } => {
-                let Some(s) = self.sessions.get(&session) else {
-                    return no_session(&session);
+            Request::Network {
+                session,
+                failed,
+                limit,
+            } => {
+                let s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 let rows = s.page.events.network(failed, limit.clamp(1, 5_000));
                 let (_, dropped) = s.page.events.dropped();
+                let event_stream_gaps = s.page.events.event_stream_gaps();
                 let mut text = rows
                     .iter()
                     .map(|r| r.render())
@@ -628,11 +843,25 @@ impl Daemon {
                 if dropped > 0 {
                     text.push_str(&format!("\n({dropped} older requests dropped)"));
                 }
-                Response::ok_text(json!({ "requests": rows, "dropped": dropped }), text)
+                if event_stream_gaps > 0 {
+                    text.push_str(&format!(
+                        "\n({event_stream_gaps} upstream CDP event(s) unavailable; results are incomplete)"
+                    ));
+                }
+                Response::ok_text(
+                    json!({
+                        "requests": rows,
+                        "dropped": dropped,
+                        "event_stream_gaps": event_stream_gaps,
+                        "complete": event_stream_gaps == 0,
+                    }),
+                    text,
+                )
             }
             Request::Tap { session, target } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return no_session(&session);
+                let mut s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 let target = point_target(target);
                 match s.page.tap(&target).await {
@@ -643,9 +872,19 @@ impl Daemon {
                     Err(e) => page_error(e),
                 }
             }
-            Request::LongPress { session, target, duration_ms } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return no_session(&session);
+            Request::LongPress {
+                session,
+                target,
+                duration_ms,
+            } => {
+                if duration_ms > MAX_GESTURE_DURATION_MS {
+                    return Response::error(format!(
+                        "gesture duration must be at most {MAX_GESTURE_DURATION_MS}ms"
+                    ));
+                }
+                let mut s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 let target = point_target(target);
                 match s
@@ -660,9 +899,23 @@ impl Daemon {
                     Err(e) => page_error(e),
                 }
             }
-            Request::Swipe { session, from, to, duration_ms, steps } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return no_session(&session);
+            Request::Swipe {
+                session,
+                from,
+                to,
+                duration_ms,
+                steps,
+            } => {
+                if duration_ms > MAX_GESTURE_DURATION_MS
+                    || !(2..=MAX_GESTURE_STEPS).contains(&steps)
+                {
+                    return Response::error(format!(
+                        "swipe requires duration <= {MAX_GESTURE_DURATION_MS}ms and 2..={MAX_GESTURE_STEPS} steps"
+                    ));
+                }
+                let mut s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 let (a, b) = (point_target(from), point_target(to));
                 match s
@@ -680,9 +933,15 @@ impl Daemon {
                     Err(e) => page_error(e),
                 }
             }
-            Request::Pinch { session, center, scale, speed } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return no_session(&session);
+            Request::Pinch {
+                session,
+                center,
+                scale,
+                speed,
+            } => {
+                let mut s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 let center = point_target(center);
                 match s.page.pinch(&center, scale, speed).await {
@@ -693,9 +952,23 @@ impl Daemon {
                     Err(e) => page_error(e),
                 }
             }
-            Request::Drag { session, from, to, duration_ms, steps } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return no_session(&session);
+            Request::Drag {
+                session,
+                from,
+                to,
+                duration_ms,
+                steps,
+            } => {
+                if duration_ms > MAX_GESTURE_DURATION_MS
+                    || !(2..=MAX_GESTURE_STEPS).contains(&steps)
+                {
+                    return Response::error(format!(
+                        "drag requires duration <= {MAX_GESTURE_DURATION_MS}ms and 2..={MAX_GESTURE_STEPS} steps"
+                    ));
+                }
+                let mut s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 let (a, b) = (point_target(from), point_target(to));
                 match s
@@ -710,9 +983,14 @@ impl Daemon {
                     Err(e) => page_error(e),
                 }
             }
-            Request::Eval { session, expression, mutate } => {
-                let Some(s) = self.sessions.get(&session) else {
-                    return no_session(&session);
+            Request::Eval {
+                session,
+                expression,
+                mutate,
+            } => {
+                let s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
                 };
                 match s.page.evaluate(&expression, !mutate).await {
                     Ok(v) => {
@@ -728,57 +1006,121 @@ impl Daemon {
         }
     }
 
-    async fn open(&mut self, session: &str, url: &str, headless: bool) -> Response {
-        if let Some(s) = self.sessions.get_mut(session) {
-            return match s.page.navigate(url).await {
-                Ok(()) => Response::ok_text(
-                    json!({"session": session, "url": url, "reused": true}),
-                    format!("{session}: {url}"),
-                ),
-                Err(e) => page_error(e),
-            };
+    async fn open(&self, session: &str, url: &str, headless: bool) -> Response {
+        if let Err(error) = paths::ensure_session_storage_compatible(session) {
+            return Response::error(format!("cannot open session {session:?}: {error}"));
         }
+        loop {
+            // Lock a fresh slot before publishing it. A concurrent request can
+            // discover the handle immediately, but it cannot observe the
+            // half-built browser inside it.
+            let candidate = Arc::new(SessionSlot::new());
+            let opening = Arc::clone(&candidate.state).lock_owned().await;
+            let (slot, opening) = {
+                let mut sessions = self.sessions.lock().await;
+                match sessions.entry(session.to_string()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        (Arc::clone(entry.get()), None)
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(Arc::clone(&candidate));
+                        (candidate, Some(opening))
+                    }
+                }
+            };
 
-        let profile = paths::profile(session);
-        let mut opts = LaunchOptions::new(profile.clone());
-        opts.headless = if headless { Headless::New } else { Headless::Off };
+            let Some(mut state) = opening else {
+                // An `open` that races with `close` is ordered after the close:
+                // wait for the old browser/profile to be fully gone, then retry
+                // against a fresh slot.
+                if slot.closing.load(Ordering::Acquire) {
+                    slot.wait_closed().await;
+                    continue;
+                }
+                let mut live = Arc::clone(&slot.state).lock_owned().await;
+                if slot.closing.load(Ordering::Acquire) {
+                    drop(live);
+                    slot.wait_closed().await;
+                    continue;
+                }
+                let Some(existing) = live.as_mut() else {
+                    drop(live);
+                    self.retire_session_slot(session, &slot).await;
+                    continue;
+                };
+                let response = match existing.page.navigate(url).await {
+                    Ok(()) => Response::ok_text(
+                        json!({"session": session, "url": url, "reused": true}),
+                        format!("{session}: {url}"),
+                    ),
+                    Err(e) => page_error(e),
+                };
+                slot.generation
+                    .store(existing.page.generation(), Ordering::Release);
+                return response;
+            };
 
-        let launched = match browser::launch(&opts).await {
-            Ok(l) => l,
-            Err(e) => {
-                return Response::error_hint(
-                    format!("could not start a browser: {e}"),
-                    "set BROW_CHROME to a Chromium binary if it is installed somewhere unusual",
-                )
-            }
-        };
+            let profile = paths::profile(session);
+            let mut opts = LaunchOptions::new(profile.clone());
+            opts.headless = if headless {
+                Headless::New
+            } else {
+                Headless::Off
+            };
 
-        let page = match Page::create(Arc::clone(&launched.client), url).await {
-            Ok(p) => p,
-            Err(e) => {
-                let mut launched = launched;
-                let _ = launched.child.kill();
-                let _ = launched.child.wait();
-                return page_error(e);
-            }
-        };
+            let launched = match browser::launch(&opts).await {
+                Ok(launched) => launched,
+                Err(error) => {
+                    drop(state);
+                    self.retire_session_slot(session, &slot).await;
+                    return Response::error_hint(
+                        format!("could not start a browser: {error}"),
+                        "set BROW_CHROME to a Chromium binary if it is installed somewhere unusual",
+                    );
+                }
+            };
 
-        let product = launched.product.clone();
-        self.sessions.insert(
-            session.to_string(),
-            Session {
+            let page = match Page::create(Arc::clone(&launched.client), url).await {
+                Ok(page) => page,
+                Err(error) => {
+                    let mut launched = launched;
+                    let _ = launched.child.kill();
+                    let _ = launched.child.wait();
+                    drop(state);
+                    self.retire_session_slot(session, &slot).await;
+                    return page_error(error);
+                }
+            };
+
+            let product = launched.product.clone();
+            let opened_at = SystemTime::now();
+            let created = Session {
                 launched,
                 page,
                 profile,
-                headless,
-                opened_at: SystemTime::now(),
-            },
-        );
+            };
 
-        Response::ok_text(
-            json!({"session": session, "url": url, "product": product, "reused": false}),
-            format!("{session}: {url}  ({product})"),
-        )
+            if slot.closing.load(Ordering::Acquire) {
+                close_browser(session, created).await;
+                drop(state);
+                self.retire_session_slot(session, &slot).await;
+                return Response::error(format!("session {session:?} was closed while opening"));
+            }
+
+            slot.generation
+                .store(created.page.generation(), Ordering::Release);
+            let _ = slot.summary.set(SessionSummary {
+                product: product.clone(),
+                headless,
+                opened_at,
+            });
+            *state = Some(created);
+
+            return Response::ok_text(
+                json!({"session": session, "url": url, "product": product, "reused": false}),
+                format!("{session}: {url}  ({product})"),
+            );
+        }
     }
 
     /// Starts a job in its own browser and returns without waiting for it.
@@ -788,7 +1130,7 @@ impl Daemon {
     /// under it by an interactive command. It also gets its own window, because
     /// only one page per browser window is `visible` and a background tab renders
     /// nothing.
-    async fn job_start(&mut self, intent: String, steps: Vec<String>, headless: bool) -> Response {
+    async fn job_start(&self, intent: String, steps: Vec<String>, headless: bool) -> Response {
         let parsed: Result<Vec<jobs::Step>, String> =
             steps.iter().map(|s| jobs::Step::parse(s)).collect();
         let steps = match parsed {
@@ -799,15 +1141,23 @@ impl Daemon {
             }
         };
 
-        self.jobs.seq += 1;
-        let id = jobs::new_job_id(self.jobs.seq);
+        let seq = {
+            let mut store = self.jobs.lock().await;
+            store.seq += 1;
+            store.seq
+        };
+        let id = jobs::new_job_id(seq);
         let artifacts = paths::job(&id);
         if let Err(e) = tokio::fs::create_dir_all(&artifacts).await {
             return Response::error(format!("could not create {}: {e}", artifacts.display()));
         }
 
         let mut opts = LaunchOptions::new(artifacts.join("profile"));
-        opts.headless = if headless { Headless::New } else { Headless::Off };
+        opts.headless = if headless {
+            Headless::New
+        } else {
+            Headless::Off
+        };
         let launched = match browser::launch(&opts).await {
             Ok(l) => l,
             Err(e) => return Response::error(format!("could not start a browser: {e}")),
@@ -838,11 +1188,14 @@ impl Daemon {
         // arriving for questions the job has already given up on.
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(1);
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let action_gate = Arc::new(tokio::sync::Mutex::new(()));
 
         let runner = jobs::Runner {
             record: Arc::clone(&record),
             control: control_rx,
             stop: stop_rx,
+            action_gate: Arc::clone(&action_gate),
+            next_pending_id: 0,
         };
         let mut page = page;
         let mut launched = launched;
@@ -853,12 +1206,13 @@ impl Daemon {
             let _ = launched.child.wait();
         });
 
-        self.jobs.handles.insert(
+        self.jobs.lock().await.handles.insert(
             id.clone(),
             jobs::JobHandle {
                 record,
                 control: control_tx,
                 stop: stop_tx,
+                action_gate,
             },
         );
 
@@ -869,12 +1223,23 @@ impl Daemon {
     }
 
     /// Current record for a job, live or historical.
-    async fn job_record(&mut self, id: &str) -> Option<jobs::JobRecord> {
-        let live = match self.jobs.handles.get(id) {
-            Some(handle) => Some(handle.record.lock().await.clone()),
-            None => None,
+    async fn job_record(&self, id: &str) -> Option<jobs::JobRecord> {
+        let (live, finished) = {
+            let store = self.jobs.lock().await;
+            (
+                store
+                    .handles
+                    .get(id)
+                    .map(|handle| Arc::clone(&handle.record)),
+                store
+                    .finished
+                    .iter()
+                    .find(|record| record.id == id)
+                    .cloned(),
+            )
         };
-        if let Some(record) = live {
+        if let Some(live) = live {
+            let record = live.lock().await.clone();
             // Reaping on read keeps the live table from accumulating handles for
             // jobs that finished while nobody was looking.
             if record.state.is_terminal() {
@@ -882,34 +1247,109 @@ impl Daemon {
             }
             return Some(record);
         }
-        self.jobs.finished.iter().find(|r| r.id == id).cloned()
+        finished
     }
 
     /// Moves a finished job out of the live table so its handle is released.
-    async fn reap_job(&mut self, id: &str) {
-        let Some(handle) = self.jobs.handles.get(id) else {
+    async fn reap_job(&self, id: &str) {
+        let record = {
+            let store = self.jobs.lock().await;
+            store
+                .handles
+                .get(id)
+                .map(|handle| Arc::clone(&handle.record))
+        };
+        let Some(record) = record else {
             return;
         };
-        let record = handle.record.lock().await.clone();
-        if record.state.is_terminal() {
-            self.jobs.handles.remove(id);
-            self.jobs.finished.push(record);
+        let finished = record.lock().await.clone();
+        if !finished.state.is_terminal() {
+            return;
         }
+
+        let mut store = self.jobs.lock().await;
+        let same_record = store
+            .handles
+            .get(id)
+            .map(|handle| Arc::ptr_eq(&handle.record, &record))
+            .unwrap_or(false);
+        if same_record {
+            store.handles.remove(id);
+            store.finished.push(finished);
+        }
+    }
+
+    async fn job_stop(&self, id: &str) -> Response {
+        let handle = {
+            let store = self.jobs.lock().await;
+            store.handles.get(id).map(|handle| {
+                (
+                    Arc::clone(&handle.record),
+                    handle.stop.clone(),
+                    Arc::clone(&handle.action_gate),
+                )
+            })
+        };
+        let Some((record, stop, action_gate)) = handle else {
+            return no_job(id);
+        };
+
+        // Both paths, because a job is either parked (reading control) or
+        // mid-step (watching the stop signal), and we do not know which.
+        let _ = stop.send(true);
+        let _action = action_gate.lock().await;
+        let mut current = record.lock().await;
+        if current.state.is_terminal() {
+            let state = current.state;
+            drop(current);
+            self.reap_job(id).await;
+            if state == jobs::JobState::Stopped {
+                return Response::ok_text(
+                    json!({ "stopped": id, "already_stopped": true }),
+                    format!("stopped {id}"),
+                );
+            }
+            return Response::error(format!("{id} is already {}", state.label()));
+        }
+        current.state = jobs::JobState::Stopped;
+        let persisted = jobs::persist_or_mark_failed(&mut current).await;
+        let persistence_error = (!persisted)
+            .then(|| current.error.clone())
+            .flatten()
+            .unwrap_or_else(|| "job manifest persistence failed".to_string());
+        drop(current);
+        self.reap_job(id).await;
+
+        if !persisted {
+            return Response::error_hint(
+                format!("could not durably stop {id}: {persistence_error}"),
+                "the in-memory job is failed and its browser is being closed; inspect the artifact directory before restarting the daemon",
+            );
+        }
+        Response::ok_text(json!({ "stopped": id }), format!("stopped {id}"))
     }
 
     /// Delivers a control message, refusing it if the job is not waiting for
     /// that particular kind of answer.
     async fn job_control(
-        &mut self,
+        &self,
         id: &str,
         control: jobs::Control,
         expected: jobs::JobState,
         complaint: &str,
     ) -> Response {
-        let Some(handle) = self.jobs.handles.get(id) else {
+        let handle = {
+            let store = self.jobs.lock().await;
+            store
+                .handles
+                .get(id)
+                .map(|handle| (Arc::clone(&handle.record), handle.control.clone()))
+        };
+        let Some((record, sender)) = handle else {
             return no_job(id);
         };
-        let state = handle.record.lock().await.state;
+        let current = record.lock().await;
+        let state = current.state;
         if state != expected {
             // Answering the wrong kind of park is the mistake worth catching: an
             // agent must not be able to satisfy a human approval gate.
@@ -924,28 +1364,159 @@ impl Daemon {
                 },
             );
         }
-        // `try_send` for the same reason as stop: dispatch holds the daemon lock,
-        // so it must never await on a job that is not reading.
-        match handle.control.try_send(control) {
-            Ok(()) => Response::ok_text(json!({ "id": id, "delivered": true }), format!("{id}: ok")),
+        let Some(pending_id) = current.pending.as_ref().map(|pending| pending.id) else {
+            return Response::error(format!(
+                "{id} is {state_label} but has no current pending request",
+                state_label = state.label()
+            ));
+        };
+        // Control is intentionally non-blocking: a full channel means the job is
+        // not ready for another answer yet.
+        let sent = sender.try_send(jobs::ControlMessage {
+            pending_id,
+            control,
+        });
+        drop(current);
+        match sent {
+            Ok(()) => {
+                Response::ok_text(json!({ "id": id, "delivered": true }), format!("{id}: ok"))
+            }
             Err(_) => Response::error(format!("{id} stopped listening before the answer arrived")),
         }
     }
 
-    async fn close_session(&mut self, name: &str) {
-        let Some(mut s) = self.sessions.remove(name) else {
-            return;
+    async fn lock_session(&self, name: &str) -> Result<SessionGuard, Response> {
+        let slot = self.sessions.lock().await.get(name).cloned();
+        let Some(slot) = slot else {
+            return Err(no_session(name));
         };
-        // Ask nicely first so the profile is flushed cleanly, then make sure.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            s.launched.client.call("Browser.close", json!({})),
-        )
-        .await;
-        let _ = s.launched.child.kill();
-        let _ = s.launched.child.wait();
-        tracing::info!(session = name, profile = %s.profile.display(), "session closed");
+        if slot.closing.load(Ordering::Acquire) {
+            return Err(no_session(name));
+        }
+
+        let state = Arc::clone(&slot.state).lock_owned().await;
+        if slot.closing.load(Ordering::Acquire) || state.is_none() {
+            return Err(no_session(name));
+        }
+        Ok(SessionGuard { state, slot })
     }
+
+    async fn close(&self, name: &str) -> Response {
+        let slot = {
+            let sessions = self.sessions.lock().await;
+            let Some(slot) = sessions.get(name) else {
+                return Response::error(format!("no session named {name:?}"));
+            };
+            if slot
+                .closing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Response::error(format!("no session named {name:?}"));
+            }
+            Arc::clone(slot)
+        };
+
+        finish_session_close(name, &slot).await;
+        self.retire_session_slot(name, &slot).await;
+        Response::ok_text(json!({"closed": name}), format!("closed {name}"))
+    }
+
+    async fn retire_session_slot(&self, name: &str, slot: &Arc<SessionSlot>) {
+        let mut sessions = self.sessions.lock().await;
+        let is_current = sessions
+            .get(name)
+            .map(|current| Arc::ptr_eq(current, slot))
+            .unwrap_or(false);
+        if is_current {
+            sessions.remove(name);
+        }
+        drop(sessions);
+        slot.closed.send_replace(true);
+    }
+
+    async fn close_all_sessions(&self) {
+        let slots: Vec<(String, Arc<SessionSlot>)> = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .drain()
+                .map(|(name, slot)| {
+                    slot.closing.store(true, Ordering::Release);
+                    (name, slot)
+                })
+                .collect()
+        };
+
+        let mut closes = tokio::task::JoinSet::new();
+        for (name, slot) in slots {
+            closes.spawn(async move {
+                finish_session_close(&name, &slot).await;
+                slot.closed.send_replace(true);
+            });
+        }
+        while closes.join_next().await.is_some() {}
+    }
+
+    async fn stop_all_jobs(&self) {
+        let jobs: Vec<_> = {
+            let store = self.jobs.lock().await;
+            store
+                .handles
+                .values()
+                .map(|handle| (handle.stop.clone(), Arc::clone(&handle.record)))
+                .collect()
+        };
+        if jobs.is_empty() {
+            return;
+        }
+        for (stop, _) in &jobs {
+            let _ = stop.send(true);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut all_terminal = true;
+            for (_, record) in &jobs {
+                if !record.lock().await.state.is_terminal() {
+                    all_terminal = false;
+                    break;
+                }
+            }
+            if all_terminal {
+                // The runner kills and waits for its owned Chromium immediately
+                // after setting terminal state; yield once so that cleanup tail
+                // can run before the runtime exits.
+                tokio::task::yield_now().await;
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::error!(
+                    count = jobs.len(),
+                    "timed out waiting for job browsers to stop during daemon shutdown"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+async fn finish_session_close(name: &str, slot: &SessionSlot) {
+    let mut state = Arc::clone(&slot.state).lock_owned().await;
+    if let Some(session) = state.take() {
+        close_browser(name, session).await;
+    }
+}
+
+async fn close_browser(name: &str, mut session: Session) {
+    // Ask nicely first so the profile is flushed cleanly, then make sure.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session.launched.client.call("Browser.close", json!({})),
+    )
+    .await;
+    let _ = session.launched.child.kill();
+    let _ = session.launched.child.wait();
+    tracing::info!(session = name, profile = %session.profile.display(), "session closed");
 }
 
 fn no_job(id: &str) -> Response {

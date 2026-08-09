@@ -52,7 +52,9 @@ async fn console_and_network_are_captured_and_redacted() {
     // asynchronously. Wait for the *terminal* state of each, not merely for rows
     // to appear, or the assertions race the protocol.
     let got = until(Duration::from_secs(10), || {
-        log.console(false, 100).len() >= 5
+        log.console(false, 100)
+            .iter()
+            .any(|e| e.level == "exception" || e.text.contains("TypeError"))
             && log
                 .network(false, 100)
                 .iter()
@@ -74,7 +76,10 @@ async fn console_and_network_are_captured_and_redacted() {
     // ---- console -----------------------------------------------------------
     let levels: Vec<&str> = console.iter().map(|e| e.level.as_str()).collect();
     assert!(levels.contains(&"log"), "levels seen: {levels:?}");
-    assert!(levels.contains(&"warning") || levels.contains(&"warn"), "{levels:?}");
+    assert!(
+        levels.contains(&"warning") || levels.contains(&"warn"),
+        "{levels:?}"
+    );
     assert!(levels.contains(&"error"), "{levels:?}");
 
     assert!(
@@ -137,8 +142,65 @@ async fn console_and_network_are_captured_and_redacted() {
     assert!(failures.iter().any(|r| r.url.contains("/missing-endpoint")));
 
     // One request stays one row through its whole lifecycle.
-    let doc_rows = network.iter().filter(|r| r.url.ends_with("/events")).count();
-    assert_eq!(doc_rows, 1, "the document request was recorded {doc_rows} times");
+    let doc_rows = network
+        .iter()
+        .filter(|r| r.url.ends_with("/events"))
+        .count();
+    assert_eq!(
+        doc_rows, 1,
+        "the document request was recorded {doc_rows} times"
+    );
+
+    shutdown(launched);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redirect_chain_is_recorded_as_complete_hops() {
+    if !common::chrome_available() {
+        return common::skip("redirect_chain_is_recorded_as_complete_hops");
+    }
+    let _slot = common::browser_slot();
+    let fixture = common::serve();
+    let (launched, page, _scratch) =
+        open_fixture("redirects", &fixture.url("/redirect-start")).await;
+    let log = Arc::clone(&page.events);
+
+    let complete = until(Duration::from_secs(10), || {
+        let rows = log.network(false, 100);
+        let hops: Vec<_> = rows
+            .iter()
+            .filter(|row| row.url.contains("/redirect-"))
+            .collect();
+        hops.len() == 3 && hops.iter().all(|row| row.finished)
+    })
+    .await;
+    let rows = log.network(false, 100);
+    let hops: Vec<_> = rows
+        .iter()
+        .filter(|row| row.url.contains("/redirect-"))
+        .collect();
+
+    assert!(complete, "redirect hops never completed: {hops:#?}");
+    assert_eq!(hops.len(), 3, "unexpected redirect rows: {hops:#?}");
+    assert_eq!(
+        hops.iter().map(|row| row.status).collect::<Vec<_>>(),
+        vec![Some(302), Some(307), Some(200)]
+    );
+    assert_eq!(
+        hops.iter()
+            .map(|row| row.url.rsplit('/').next().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["redirect-start", "redirect-middle", "redirect-final"]
+    );
+    assert!(
+        hops.windows(2)
+            .all(|pair| pair[0].request_id == pair[1].request_id),
+        "Chromium redirect hops should share one requestId: {hops:#?}"
+    );
+    assert!(
+        hops.iter().all(|row| !row.is_failure()),
+        "redirect responses are not failures: {hops:#?}"
+    );
 
     shutdown(launched);
 }

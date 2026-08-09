@@ -79,6 +79,8 @@ pub enum ActionError {
     Occluded { x: f64, y: f64 },
     #[error("node moved while we were aiming at it; the page is still animating")]
     Unstable,
+    #[error("node semantics changed after pointer movement; no button press was sent")]
+    TargetChanged,
 }
 
 /// Geometric centre of a node's first content quad, in viewport coordinates.
@@ -109,8 +111,12 @@ pub async fn content_center(
     if quad.len() < 8 {
         return Err(ActionError::NotRendered);
     }
-    let xs: Vec<f64> = (0..4).map(|i| quad[i * 2].as_f64().unwrap_or(0.0)).collect();
-    let ys: Vec<f64> = (0..4).map(|i| quad[i * 2 + 1].as_f64().unwrap_or(0.0)).collect();
+    let xs: Vec<f64> = (0..4)
+        .map(|i| quad[i * 2].as_f64().unwrap_or(0.0))
+        .collect();
+    let ys: Vec<f64> = (0..4)
+        .map(|i| quad[i * 2 + 1].as_f64().unwrap_or(0.0))
+        .collect();
     let area = polygon_area(&xs, &ys);
     if area <= 1.0 {
         return Err(ActionError::NotRendered);
@@ -204,29 +210,44 @@ pub async fn node_at_point(
 /// happens constantly for legitimate reasons: an `<svg>` icon inside a button, a
 /// `<span>` inside a link, a `<label>` wrapping an input.
 ///
-/// The geometry is computed **inside the target's own document**, from the
-/// element's own rect, so this is correct for a node in an iframe without any
-/// coordinate conversion. `world_context_id` must belong to that same frame; pass
-/// an isolated world so a page cannot patch `elementFromPoint` out from under us.
+/// Both nodes come from the compositor's exact-point hit test. Resolving them in
+/// one isolated execution context avoids a second, subtly different coordinate
+/// conversion for iframe-local documents.
 pub async fn covered_by_foreign_element(
     client: &CdpClient,
     session_id: &str,
-    backend_node_id: i64,
+    target_backend_node_id: i64,
+    hit_backend_node_id: i64,
     world_context_id: Option<i64>,
 ) -> Result<bool, ActionError> {
-    let mut params = json!({ "backendNodeId": backend_node_id });
-    if let Some(ctx) = world_context_id {
-        params["executionContextId"] = json!(ctx);
+    async fn resolve_in_world(
+        client: &CdpClient,
+        session_id: &str,
+        backend_node_id: i64,
+        world_context_id: Option<i64>,
+    ) -> Option<String> {
+        let mut params = json!({ "backendNodeId": backend_node_id });
+        if let Some(ctx) = world_context_id {
+            params["executionContextId"] = json!(ctx);
+        }
+        client
+            .call_on(session_id, "DOM.resolveNode", params)
+            .await
+            .ok()?
+            .get("object")?
+            .get("objectId")?
+            .as_str()
+            .map(str::to_owned)
     }
-    let Ok(resolved) = client.call_on(session_id, "DOM.resolveNode", params).await else {
-        // The node does not exist in that world, which means the point belongs to
-        // a different document than the target: genuinely covered.
+
+    let Some(target_object_id) =
+        resolve_in_world(client, session_id, target_backend_node_id, world_context_id).await
+    else {
+        // A node that cannot be resolved in this document is not a safe target.
         return Ok(true);
     };
-    let Some(object_id) = resolved
-        .get("object")
-        .and_then(|o| o.get("objectId"))
-        .and_then(Value::as_str)
+    let Some(hit_object_id) =
+        resolve_in_world(client, session_id, hit_backend_node_id, world_context_id).await
     else {
         return Ok(true);
     };
@@ -236,16 +257,14 @@ pub async fn covered_by_foreign_element(
             session_id,
             "Runtime.callFunctionOn",
             json!({
-                "objectId": object_id,
+                "objectId": target_object_id,
                 "returnByValue": true,
+                "arguments": [
+                    {"objectId": hit_object_id}
+                ],
                 // Accept a hit on the node itself, on a descendant, or on an
                 // ancestor — all three mean the click lands where it should.
-                "functionDeclaration": "function() {\
-                    const r = this.getBoundingClientRect();\
-                    if (!r.width || !r.height) return true;\
-                    const root = this.getRootNode();\
-                    const doc = root.elementFromPoint ? root : this.ownerDocument;\
-                    const hit = doc.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);\
+                "functionDeclaration": "function(hit) {\
                     if (!hit) return true;\
                     return !(hit === this || this.contains(hit) || hit.contains(this));\
                 }",
@@ -272,6 +291,16 @@ pub async fn click_at(
     click_count: i64,
     modifiers: i64,
 ) -> Result<(), CdpError> {
+    move_pointer(client, session_id, point, modifiers).await?;
+    click_at_without_move(client, session_id, point, button, click_count, modifiers).await
+}
+
+pub async fn move_pointer(
+    client: &CdpClient,
+    session_id: &str,
+    point: Point,
+    modifiers: i64,
+) -> Result<(), CdpError> {
     let base = json!({
         "x": point.x, "y": point.y,
         "modifiers": modifiers,
@@ -285,26 +314,60 @@ pub async fn click_at(
     client
         .call_on(session_id, "Input.dispatchMouseEvent", moved)
         .await?;
+    Ok(())
+}
 
+/// Presses/releases at a point after the caller has moved and revalidated the
+/// target. Keeping mouse movement separate closes the common `mouseover` overlay
+/// race without dispatching a second move between the final hit test and press.
+pub async fn click_at_without_move(
+    client: &CdpClient,
+    session_id: &str,
+    point: Point,
+    button: MouseButton,
+    click_count: i64,
+    modifiers: i64,
+) -> Result<(), CdpError> {
     for count in 1..=click_count {
-        let mut down = base.clone();
-        down["type"] = json!("mousePressed");
-        down["button"] = json!(button.cdp());
-        down["buttons"] = json!(button.mask());
-        down["clickCount"] = json!(count);
-        client
-            .call_on(session_id, "Input.dispatchMouseEvent", down)
-            .await?;
-
-        let mut up = base.clone();
-        up["type"] = json!("mouseReleased");
-        up["button"] = json!(button.cdp());
-        up["buttons"] = json!(0);
-        up["clickCount"] = json!(count);
-        client
-            .call_on(session_id, "Input.dispatchMouseEvent", up)
-            .await?;
+        click_once_at(client, session_id, point, button, count, modifiers).await?;
     }
+    Ok(())
+}
+
+/// One down/up pair with an explicit ordinal (`1` for click, `2` for the second
+/// half of a double-click). Page-level ref clicks call this one pair at a time so
+/// they can revalidate between clicks.
+pub async fn click_once_at(
+    client: &CdpClient,
+    session_id: &str,
+    point: Point,
+    button: MouseButton,
+    click_ordinal: i64,
+    modifiers: i64,
+) -> Result<(), CdpError> {
+    let base = json!({
+        "x": point.x, "y": point.y,
+        "modifiers": modifiers,
+        "pointerType": "mouse",
+    });
+
+    let mut down = base.clone();
+    down["type"] = json!("mousePressed");
+    down["button"] = json!(button.cdp());
+    down["buttons"] = json!(button.mask());
+    down["clickCount"] = json!(click_ordinal);
+    client
+        .call_on(session_id, "Input.dispatchMouseEvent", down)
+        .await?;
+
+    let mut up = base;
+    up["type"] = json!("mouseReleased");
+    up["button"] = json!(button.cdp());
+    up["buttons"] = json!(0);
+    up["clickCount"] = json!(click_ordinal);
+    client
+        .call_on(session_id, "Input.dispatchMouseEvent", up)
+        .await?;
     Ok(())
 }
 
@@ -362,11 +425,7 @@ pub async fn wheel_at(
 /// `keydown`/`keyup`, so anything driven by key handlers (autocomplete-on-keyup,
 /// character counters bound to keydown, key-based masks) needs `press_key` per
 /// character instead — `type_text_by_key` exists for exactly that.
-pub async fn insert_text(
-    client: &CdpClient,
-    session_id: &str,
-    text: &str,
-) -> Result<(), CdpError> {
+pub async fn insert_text(client: &CdpClient, session_id: &str, text: &str) -> Result<(), CdpError> {
     client
         .call_on(session_id, "Input.insertText", json!({ "text": text }))
         .await
@@ -510,7 +569,7 @@ pub async fn pinch(
 ///
 /// This is the pointer-based drag that libraries like dnd-kit listen for. HTML5
 /// native drag-and-drop is a *different* mechanism and is not covered here.
-pub async fn drag(
+pub async fn drag_after_move(
     client: &CdpClient,
     session_id: &str,
     from: Point,
@@ -522,7 +581,6 @@ pub async fn drag(
     let per_step = duration / steps;
     let button = MouseButton::Left;
 
-    hover_at(client, session_id, from, 0).await?;
     client
         .call_on(
             session_id,
@@ -631,20 +689,90 @@ struct KeySpec {
 /// Keys an agent actually names. Printable characters are handled generically.
 fn lookup_key(name: &str) -> Option<KeySpec> {
     let spec = match name {
-        "Enter" | "Return" => KeySpec { key: "Enter", code: "Enter", vk: 13, text: Some("\r") },
-        "Tab" => KeySpec { key: "Tab", code: "Tab", vk: 9, text: Some("\t") },
-        "Escape" | "Esc" => KeySpec { key: "Escape", code: "Escape", vk: 27, text: None },
-        "Backspace" => KeySpec { key: "Backspace", code: "Backspace", vk: 8, text: None },
-        "Delete" => KeySpec { key: "Delete", code: "Delete", vk: 46, text: None },
-        "ArrowUp" | "Up" => KeySpec { key: "ArrowUp", code: "ArrowUp", vk: 38, text: None },
-        "ArrowDown" | "Down" => KeySpec { key: "ArrowDown", code: "ArrowDown", vk: 40, text: None },
-        "ArrowLeft" | "Left" => KeySpec { key: "ArrowLeft", code: "ArrowLeft", vk: 37, text: None },
-        "ArrowRight" | "Right" => KeySpec { key: "ArrowRight", code: "ArrowRight", vk: 39, text: None },
-        "Home" => KeySpec { key: "Home", code: "Home", vk: 36, text: None },
-        "End" => KeySpec { key: "End", code: "End", vk: 35, text: None },
-        "PageUp" => KeySpec { key: "PageUp", code: "PageUp", vk: 33, text: None },
-        "PageDown" => KeySpec { key: "PageDown", code: "PageDown", vk: 34, text: None },
-        "Space" => KeySpec { key: " ", code: "Space", vk: 32, text: Some(" ") },
+        "Enter" | "Return" => KeySpec {
+            key: "Enter",
+            code: "Enter",
+            vk: 13,
+            text: Some("\r"),
+        },
+        "Tab" => KeySpec {
+            key: "Tab",
+            code: "Tab",
+            vk: 9,
+            text: Some("\t"),
+        },
+        "Escape" | "Esc" => KeySpec {
+            key: "Escape",
+            code: "Escape",
+            vk: 27,
+            text: None,
+        },
+        "Backspace" => KeySpec {
+            key: "Backspace",
+            code: "Backspace",
+            vk: 8,
+            text: None,
+        },
+        "Delete" => KeySpec {
+            key: "Delete",
+            code: "Delete",
+            vk: 46,
+            text: None,
+        },
+        "ArrowUp" | "Up" => KeySpec {
+            key: "ArrowUp",
+            code: "ArrowUp",
+            vk: 38,
+            text: None,
+        },
+        "ArrowDown" | "Down" => KeySpec {
+            key: "ArrowDown",
+            code: "ArrowDown",
+            vk: 40,
+            text: None,
+        },
+        "ArrowLeft" | "Left" => KeySpec {
+            key: "ArrowLeft",
+            code: "ArrowLeft",
+            vk: 37,
+            text: None,
+        },
+        "ArrowRight" | "Right" => KeySpec {
+            key: "ArrowRight",
+            code: "ArrowRight",
+            vk: 39,
+            text: None,
+        },
+        "Home" => KeySpec {
+            key: "Home",
+            code: "Home",
+            vk: 36,
+            text: None,
+        },
+        "End" => KeySpec {
+            key: "End",
+            code: "End",
+            vk: 35,
+            text: None,
+        },
+        "PageUp" => KeySpec {
+            key: "PageUp",
+            code: "PageUp",
+            vk: 33,
+            text: None,
+        },
+        "PageDown" => KeySpec {
+            key: "PageDown",
+            code: "PageDown",
+            vk: 34,
+            text: None,
+        },
+        "Space" => KeySpec {
+            key: " ",
+            code: "Space",
+            vk: 32,
+            text: Some(" "),
+        },
         _ => return None,
     };
     Some(spec)
@@ -682,11 +810,7 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 /// Presses and releases one key, honouring modifier chords.
-pub async fn press_key(
-    client: &CdpClient,
-    session_id: &str,
-    chord: &str,
-) -> Result<(), CdpError> {
+pub async fn press_key(client: &CdpClient, session_id: &str, chord: &str) -> Result<(), CdpError> {
     let (mods, name) = parse_chord(chord);
 
     let (key, code, vk, text) = match lookup_key(&name) {
@@ -788,7 +912,10 @@ mod tests {
 
     #[test]
     fn zero_area_quads_are_not_clickable() {
-        assert_eq!(polygon_area(&[5.0, 5.0, 5.0, 5.0], &[7.0, 7.0, 7.0, 7.0]), 0.0);
+        assert_eq!(
+            polygon_area(&[5.0, 5.0, 5.0, 5.0], &[7.0, 7.0, 7.0, 7.0]),
+            0.0
+        );
     }
 
     #[test]

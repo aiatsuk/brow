@@ -43,7 +43,10 @@ async fn run(cli: &Cli) -> anyhow::Result<std::process::ExitCode> {
     // `job logs --follow` is a loop of ordinary requests rather than a streaming
     // response: it keeps the protocol strictly request/response, and the polling
     // cost is trivial next to running a browser.
-    if let Command::Job { action: JobAction::Logs { id, follow } } = &cli.command {
+    if let Command::Job {
+        action: JobAction::Logs { id, follow },
+    } = &cli.command
+    {
         return follow_logs(id, *follow, cli.json).await;
     }
 
@@ -65,7 +68,13 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
             session,
             interactive: !all,
         },
-        Command::Click { target, button, double, count, force } => {
+        Command::Click {
+            target,
+            button,
+            double,
+            count,
+            force,
+        } => {
             let target = as_target(target);
             Request::Click {
                 session,
@@ -76,7 +85,10 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
                 force: *force,
             }
         }
-        Command::Hover { node_ref } => Request::Hover { session, node_ref: node_ref.clone() },
+        Command::Hover { node_ref } => Request::Hover {
+            session,
+            node_ref: node_ref.clone(),
+        },
         Command::Fill { node_ref, text } => Request::Fill {
             session,
             node_ref: node_ref.clone(),
@@ -87,7 +99,10 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
             text: text.clone(),
             by_key: *by_key,
         },
-        Command::Press { chord } => Request::Press { session, chord: chord.clone() },
+        Command::Press { chord } => Request::Press {
+            session,
+            chord: chord.clone(),
+        },
         Command::Scroll { direction, amount } => {
             let (dx, dy) = match direction.as_str() {
                 "up" => (0.0, -amount),
@@ -97,16 +112,30 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
             };
             Request::Scroll { session, dx, dy }
         }
-        Command::Screenshot { full_page, node, rect, out, format, quality } => {
+        Command::Screenshot {
+            full_page,
+            node,
+            rect,
+            out,
+            format,
+            quality,
+        } => {
             let target = if *full_page {
                 ShotTarget::FullPage
             } else if let Some(node_ref) = node {
-                ShotTarget::Node { node_ref: node_ref.clone() }
+                ShotTarget::Node {
+                    node_ref: node_ref.clone(),
+                }
             } else if let Some(rect) = rect {
                 let (x, y, width, height) = parse_rect(rect).ok_or_else(|| {
                     anyhow::anyhow!("--rect wants x,y,width,height (e.g. 100,200,600,400)")
                 })?;
-                ShotTarget::Rect { x, y, width, height }
+                ShotTarget::Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                }
             } else {
                 ShotTarget::Viewport
             };
@@ -137,25 +166,42 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
             session,
             target: as_target(target),
         },
-        Command::LongPress { target, duration_ms } => Request::LongPress {
+        Command::LongPress {
+            target,
+            duration_ms,
+        } => Request::LongPress {
             session,
             target: as_target(target),
             duration_ms: *duration_ms,
         },
-        Command::Swipe { from, to, duration_ms, steps } => Request::Swipe {
+        Command::Swipe {
+            from,
+            to,
+            duration_ms,
+            steps,
+        } => Request::Swipe {
             session,
             from: as_target(from),
             to: as_target(to),
             duration_ms: *duration_ms,
             steps: *steps,
         },
-        Command::Pinch { center, scale, speed } => Request::Pinch {
+        Command::Pinch {
+            center,
+            scale,
+            speed,
+        } => Request::Pinch {
             session,
             center: as_target(center),
             scale: *scale,
             speed: *speed,
         },
-        Command::Drag { from, to, duration_ms, steps } => Request::Drag {
+        Command::Drag {
+            from,
+            to,
+            duration_ms,
+            steps,
+        } => Request::Drag {
             session,
             from: as_target(from),
             to: as_target(to),
@@ -164,7 +210,11 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
         },
         Command::Close => Request::Close { session },
         Command::Job { action } => match action {
-            JobAction::Start { intent, steps, headed } => Request::JobStart {
+            JobAction::Start {
+                intent,
+                steps,
+                headed,
+            } => Request::JobStart {
                 intent: intent.clone(),
                 steps: steps.clone(),
                 headless: !headed,
@@ -195,7 +245,9 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
 fn as_target(raw: &str) -> Target {
     match parse_point(raw) {
         Some((x, y)) => Target::Point { x, y },
-        None => Target::Ref { node_ref: raw.to_string() },
+        None => Target::Ref {
+            node_ref: raw.to_string(),
+        },
     }
 }
 
@@ -219,7 +271,10 @@ fn render(response: Response, as_json: bool) -> std::process::ExitCode {
     match response {
         Response::Ok { data, text } => {
             if as_json {
-                println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
             } else if let Some(text) = text {
                 print!("{text}");
                 if !text.ends_with('\n') {
@@ -231,7 +286,10 @@ fn render(response: Response, as_json: bool) -> std::process::ExitCode {
         Response::Error { message, hint } => {
             if as_json {
                 let payload = json!({ "status": "error", "message": message, "hint": hint });
-                println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
             } else {
                 eprintln!("brow: {message}");
                 if let Some(hint) = hint {
@@ -284,7 +342,10 @@ async fn follow_logs(
         if !follow || terminal || parked {
             if !as_json && parked {
                 // The reason it stopped following is the actionable part.
-                if let Response::Ok { text: Some(text), .. } = &response {
+                if let Response::Ok {
+                    text: Some(text), ..
+                } = &response
+                {
                     print!("{text}");
                 }
             }
@@ -373,7 +434,10 @@ mod tests {
     #[test]
     fn bare_hosts_get_https() {
         assert_eq!(normalize_url("example.com"), "https://example.com");
-        assert_eq!(normalize_url("  example.com/a?b=1 "), "https://example.com/a?b=1");
+        assert_eq!(
+            normalize_url("  example.com/a?b=1 "),
+            "https://example.com/a?b=1"
+        );
     }
 
     #[test]
