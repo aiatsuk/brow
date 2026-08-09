@@ -2478,6 +2478,7 @@ mod tests {
             text: None,
             attrs: BTreeMap::new(),
             bounds: None,
+            pointer_eligible: true,
             visible: true,
             disabled: false,
             interactive: false,

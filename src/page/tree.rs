@@ -5,7 +5,8 @@
 //!     iframes (`DOM.getDocument{pierce:true}` — verified 2026-08-04 to expose
 //!     `mode:"closed"` roots, because CDP operates below the JS boundary),
 //!   * accessibility role and name (`Accessibility.getFullAXTree`),
-//!   * layout box and computed visibility (`DOMSnapshot.captureSnapshot`).
+//!   * layout box, computed visibility and pointer eligibility
+//!     (`DOMSnapshot.captureSnapshot`).
 //!
 //! References are `@node-G-N`, valid only for the *generation* and execution
 //! target they were minted in. Navigating or changing the attached target tree
@@ -52,6 +53,14 @@ pub struct Node {
     pub attrs: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<Bounds>,
+    /// Has a non-degenerate layout box and is eligible for CSS pointer hit
+    /// testing. Opacity is deliberately ignored: transparent native controls
+    /// commonly provide real input beneath a styled checkbox. Occlusion is
+    /// checked live immediately before an action.
+    #[serde(default)]
+    pub pointer_eligible: bool,
+    /// Whether the node is perceptually painted. This can be false while
+    /// `pointer_eligible` is true.
     pub visible: bool,
     pub disabled: bool,
     pub interactive: bool,
@@ -139,7 +148,9 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn interactive(&self) -> impl Iterator<Item = &Node> {
-        self.nodes.iter().filter(|n| n.interactive && n.visible)
+        self.nodes
+            .iter()
+            .filter(|n| n.interactive && n.pointer_eligible)
     }
 
     /// Compact text rendering — the default output, tuned for an LLM reader.
@@ -170,7 +181,10 @@ impl Snapshot {
         let nodes: Vec<&Node> = if interactive_only {
             self.interactive().collect()
         } else {
-            self.nodes.iter().filter(|n| n.visible).collect()
+            self.nodes
+                .iter()
+                .filter(|n| n.visible || (n.interactive && n.pointer_eligible))
+                .collect()
         };
 
         if nodes.is_empty() {
@@ -201,6 +215,9 @@ impl Snapshot {
             }
             if n.disabled {
                 out.push_str(" disabled");
+            }
+            if !n.visible && n.pointer_eligible {
+                out.push_str(" transparent");
             }
             if n.in_shadow {
                 out.push_str(" shadow");
@@ -576,6 +593,7 @@ pub(crate) async fn capture_target(
             root,
             context.depth_offset,
             false,
+            true,
             Some(context.root_frame_id),
             (0.0, 0.0),
             context,
@@ -710,9 +728,11 @@ async fn ax_index(
 struct LayoutInfo {
     bounds: Bounds,
     visible: bool,
+    pointer_eligible: bool,
+    opacity_nonzero: bool,
 }
 
-/// backendNodeId -> layout box and computed visibility.
+/// backendNodeId -> layout box, computed visibility and pointer eligibility.
 ///
 /// `DOMSnapshot.captureSnapshot` returns one flattened record for the entire page
 /// (all documents) in a single round trip. Nodes with `display:none` have no
@@ -797,21 +817,37 @@ async fn layout_index(
             };
 
             // `styles[i]` is one string-index per entry of STYLES, in order.
-            let mut visible = bounds.width > 0.0 && bounds.height > 0.0;
+            // Opacity affects painting but not pointer hit testing: TodoMVC-style
+            // checkboxes intentionally use an opacity-zero native input beneath
+            // their visible CSS decoration.
+            let has_box = bounds.width > 0.0 && bounds.height > 0.0;
+            let mut style_visible = true;
+            let mut opacity_nonzero = true;
+            let mut pointer_events = true;
             if let Some(row) = styles.and_then(|s| s.get(i)).and_then(Value::as_array) {
                 if let Some(v) = row.first().and_then(Value::as_i64) {
-                    if lookup(v) == "hidden" {
-                        visible = false;
-                    }
+                    style_visible = !matches!(lookup(v), "hidden" | "collapse");
                 }
                 if let Some(v) = row.get(1).and_then(Value::as_i64) {
-                    if lookup(v) == "0" {
-                        visible = false;
-                    }
+                    opacity_nonzero = lookup(v)
+                        .parse::<f64>()
+                        .map(|opacity| opacity > 0.0)
+                        .unwrap_or(true);
+                }
+                if let Some(v) = row.get(2).and_then(Value::as_i64) {
+                    pointer_events = lookup(v) != "none";
                 }
             }
 
-            out.insert(backend, LayoutInfo { bounds, visible });
+            out.insert(
+                backend,
+                LayoutInfo {
+                    bounds,
+                    visible: has_box && style_visible && opacity_nonzero,
+                    pointer_eligible: has_box && style_visible && pointer_events,
+                    opacity_nonzero,
+                },
+            );
         }
     }
 
@@ -832,6 +868,7 @@ fn walk(
     node: &Value,
     depth: usize,
     in_shadow: bool,
+    ancestor_opacity_nonzero: bool,
     inherited_frame: Option<&str>,
     offset: (f64, f64),
     context: &CaptureContext<'_>,
@@ -856,6 +893,11 @@ fn walk(
         .or(reported_frame)
         .unwrap_or(context.root_frame_id)
         .to_string();
+    let local_opacity_nonzero = layout
+        .get(&backend_node_id)
+        .map(|info| info.opacity_nonzero)
+        .unwrap_or(true);
+    let effective_opacity_nonzero = ancestor_opacity_nonzero && local_opacity_nonzero;
 
     // Element nodes only; text is folded into its parent below.
     if node_type == 1 && backend_node_id >= 0 {
@@ -915,7 +957,10 @@ fn walk(
                     ..l.bounds
                 })
             }),
-            visible: li.map(|l| l.visible).unwrap_or(false),
+            pointer_eligible: li.map(|l| l.pointer_eligible).unwrap_or(false),
+            visible: li
+                .map(|l| l.visible && ancestor_opacity_nonzero)
+                .unwrap_or(false),
             disabled,
             depth,
             in_shadow,
@@ -952,6 +997,7 @@ fn walk(
             child,
             next_depth,
             in_shadow,
+            effective_opacity_nonzero,
             Some(&execution_frame),
             offset,
             context,
@@ -974,6 +1020,7 @@ fn walk(
             root,
             next_depth,
             true,
+            effective_opacity_nonzero,
             Some(&execution_frame),
             offset,
             context,
@@ -1001,6 +1048,7 @@ fn walk(
             content,
             next_depth,
             in_shadow,
+            effective_opacity_nonzero,
             reported_frame.or(Some(&execution_frame)),
             child_offset,
             context,
@@ -1215,6 +1263,7 @@ mod tests {
             &doc,
             0,
             false,
+            true,
             Some("frame"),
             (0.0, 0.0),
             &context,
@@ -1265,6 +1314,7 @@ mod tests {
                     width: 220.0,
                     height: 48.0,
                 }),
+                pointer_eligible: true,
                 visible: true,
                 disabled: false,
                 interactive: true,
@@ -1281,6 +1331,48 @@ mod tests {
             line,
             "@node-1 button \"Create account\" id=go [420,610 220x48]"
         );
+    }
+
+    #[test]
+    fn transparent_pointer_target_stays_in_compact_snapshot() {
+        let snap = Snapshot {
+            generation: 4,
+            url: "http://x/".into(),
+            title: "T".into(),
+            nodes: vec![Node {
+                node_ref: "@node-2".into(),
+                backend_node_id: 3,
+                target_id: "target".into(),
+                session_id: "session".into(),
+                frame_id: None,
+                tag: "input".into(),
+                role: Some("checkbox".into()),
+                name: Some("Toggle Todo".into()),
+                text: None,
+                attrs: BTreeMap::new(),
+                bounds: Some(Bounds {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 40.0,
+                    height: 40.0,
+                }),
+                pointer_eligible: true,
+                visible: false,
+                disabled: false,
+                interactive: true,
+                depth: 2,
+                in_shadow: false,
+                shadow_root_type: None,
+            }],
+            coverage_gaps: Vec::new(),
+        };
+
+        assert_eq!(snap.interactive().count(), 1);
+        assert_eq!(
+            snap.render_text(true).lines().last().unwrap(),
+            "@node-2 input role=checkbox \"Toggle Todo\" transparent [10,20 40x40]"
+        );
+        assert!(snap.render_text(false).contains("@node-2"));
     }
 
     #[test]

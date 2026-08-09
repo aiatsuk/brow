@@ -36,7 +36,12 @@ generation 2
 @node-2-12 button "Create account" id=go [420,610 220x48]
 @node-2-14 input type=text placeholder="Email address" [420,540 220x40]
 @node-2-19 a "Pricing" href=/pricing [120,40 60x20]
+@node-2-23 input role=checkbox "Toggle Todo" transparent [360,250 40x40]
 ```
+
+`transparent` means the page intentionally made a real pointer target visually
+transparent, a common styled-checkbox pattern. Use its ref normally; brow still
+rechecks live geometry and compositor hit testing before delivering input.
 
 Act on refs, never on coordinates unless you have no alternative:
 
@@ -55,7 +60,7 @@ error, not a wrong click — that is deliberate, and the error tells you what to
 | Need | Command |
 |---|---|
 | Go to a page | `brow open <url>` |
-| See what is on it | `brow snapshot` (add `--all` for every visible node) |
+| See what is on it | `brow snapshot` (add `--all` for visible non-interactive nodes too) |
 | Click | `brow click @node-2-12` (`--button right`, `--double`, `--force`) |
 | Hover | `brow hover @node-2-12` |
 | Fill a field | `brow fill @node-2-14 'text'` |
@@ -111,8 +116,9 @@ Add `--json` to any command when you need to parse the result rather than read i
 `brow snapshot` gives interactive elements only. That is usually what you want and
 it is small. Reach further only when you need to:
 
-- `brow snapshot --all` — every visible node. Large; use on a small page or when
-  the thing you need has no interactive affordance.
+- `brow snapshot --all` — every visible node, plus any transparent actionable
+  pointer target already present in the default snapshot. Large; use on a small
+  page or when the thing you need has no interactive affordance.
 - `brow eval "..."` — read specific state directly. Cheapest way to check a
   result: `brow eval "document.querySelector('.toast').textContent"`.
 - `brow screenshot` — when layout or a visual bug is the actual question. Do not

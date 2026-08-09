@@ -315,6 +315,18 @@ pub const MAIN_PAGE: &str = r##"<!doctype html>
 
   <a id="spa" href="#/dashboard" style="position:absolute;left:100px;top:500px">Go to dashboard</a>
 
+  <!-- Styled-control pattern used by TodoMVC and many design systems: the
+       native input is transparent, but remains the real pointer target. -->
+  <input id="transparent-toggle" type="checkbox" aria-label="Transparent toggle"
+         style="position:absolute;left:400px;top:580px;width:40px;height:40px;opacity:0">
+
+  <!-- Painted and semantically interactive, but deliberately removed from
+       CSS pointer hit testing. It must not be offered as a clickable ref. -->
+  <button id="no-pointer" aria-label="No pointer action"
+          style="position:absolute;left:500px;top:580px;width:160px;height:40px;pointer-events:none">
+    No pointer action
+  </button>
+
   <div id="host"></div>
 
   <div style="height:3000px"></div>
@@ -333,6 +345,10 @@ pub const MAIN_PAGE: &str = r##"<!doctype html>
       e.preventDefault();
       history.pushState({}, '', '#/dashboard');
       document.getElementById('status').textContent = 'route:dashboard';
+    });
+    document.getElementById('transparent-toggle').addEventListener('change', function (e) {
+      document.getElementById('status').textContent =
+        'transparent:' + e.isTrusted + ':' + e.target.checked;
     });
     // A *closed* shadow root: invisible to page JS, but CDP sees below the JS
     // boundary, so brow must still find this button.

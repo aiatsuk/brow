@@ -90,6 +90,45 @@ async fn tree_input_and_evaluation() {
         "the interactive filter should be doing something"
     );
 
+    // Opacity-zero native controls are a common implementation detail beneath
+    // styled checkboxes. They are not perceptually visible, but they remain real
+    // pointer targets and therefore must stay in the default interactive tree.
+    let transparent = snap
+        .interactive()
+        .find(|n| n.name.as_deref() == Some("Transparent toggle"))
+        .expect("a transparent pointer target must remain actionable")
+        .clone();
+    assert!(!transparent.visible);
+    assert!(transparent.pointer_eligible);
+    let compact = snap.render_text(true);
+    assert!(
+        compact.contains("\"Transparent toggle\"") && compact.contains(" transparent"),
+        "compact output must disclose the transparent actionable control: {compact}"
+    );
+
+    // The inverse case matters too: a painted button with pointer-events:none
+    // must not be advertised as a click target.
+    let no_pointer = snap
+        .nodes
+        .iter()
+        .find(|n| n.name.as_deref() == Some("No pointer action"))
+        .expect("the DOM node itself should still be represented");
+    assert!(no_pointer.visible);
+    assert!(no_pointer.interactive);
+    assert!(!no_pointer.pointer_eligible);
+    assert!(!snap
+        .interactive()
+        .any(|n| n.name.as_deref() == Some("No pointer action")));
+
+    page.click(&transparent.node_ref, MouseButton::Left, 1, 0, false)
+        .await
+        .expect("click the transparent native control");
+    let status = page
+        .evaluate("document.querySelector('#status').textContent", true)
+        .await
+        .expect("read transparent-control status");
+    assert_eq!(status.as_str(), Some("transparent:true:true"));
+
     // ---- input is real -----------------------------------------------------
     page.click(&go.node_ref, MouseButton::Left, 1, 0, false)
         .await

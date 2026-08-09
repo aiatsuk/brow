@@ -4,7 +4,7 @@ Checked: 2026-08-09. This file is a merge aid, not a substitute for worker verif
 
 ## Current repository corrections
 
-- Baseline commit `2a63892` passed 95 tests. On the coordinator worktree dated 2026-08-09, `BROW_REQUIRE_CHROME=1 cargo test --all-targets` passed 137 tests: 109 unit-test-binary tests and 28 integration-test-binary tests. Re-measure after any worktree change.
+- Baseline commit `2a63892` passed 95 tests. On the coordinator worktree dated 2026-08-09, `BROW_REQUIRE_CHROME=1 cargo test --all-targets` passed 138 tests: 110 unit-test-binary tests and 28 integration-test-binary tests. Re-measure after any worktree change.
 - Older README counts (`49`, `95`, or `96`) are stale.
 - The coordinator worktree now contains recursive OOPIF routing, V8 evaluation timeout, collision-free session paths, exact-target approval revalidation, per-session concurrency, bounded CDP transport, tiled full-page PNG, atomic job manifests, and lifecycle cleanup. Treat the old gaps as historical and inspect current symbols/tests.
 - Still-open boundaries include daemon-restart survival/resume, authenticated human presence, strict egress, transformed inline-frame informational bounds, giant-capture peak memory, transactional multi-record storage, and the product features named in the master contract.

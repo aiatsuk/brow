@@ -45,7 +45,7 @@ pub enum Command {
 
     /// Capture the page tree and mint fresh @node-N refs.
     Snapshot {
-        /// Every visible node, not just the interactive ones. Large.
+        /// Visible nodes plus transparent pointer targets. Large.
         #[arg(long)]
         all: bool,
         /// Interactive elements only (the default).

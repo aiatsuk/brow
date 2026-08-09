@@ -129,6 +129,13 @@ action coordinates are transformed through every iframe owner to the top-level
 viewport. A target that cannot attach, initialize or capture becomes an explicit
 `coverage_gap`; it is never silently presented as a complete tree.
 
+Visual painting and CSS pointer eligibility are tracked separately. A native
+control hidden with `opacity: 0` beneath a styled checkbox remains in the default
+interactive snapshot and is marked `transparent`; a control with
+`pointer-events: none` does not. This is only candidate discovery: the live
+geometry and compositor hit test immediately before input still decide whether
+an action is safe to deliver.
+
 **Refs that expire.** Emitted refs include their generation, for example
 `@node-7-42`. Navigating, an SPA `pushState`, or a relevant target-tree change
 invalidates outstanding refs. Repeated snapshots in one stable generation reuse
@@ -219,7 +226,7 @@ regression suite 2026-08-09.
 ## Development
 
 ```bash
-cargo test          # 137 tests (109 unit + 28 integration in this worktree)
+cargo test          # 138 tests (110 unit + 28 integration in this worktree)
 BROW_REQUIRE_CHROME=1 cargo test # fail instead of skipping browser e2e
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
