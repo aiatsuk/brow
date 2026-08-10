@@ -5,7 +5,30 @@
 //! default, and errors that say what to do next. Anything that would dump
 //! hundreds of kilobytes has to be asked for explicitly.
 
-use clap::{Parser, Subcommand};
+use crate::ipc::WaitPolicy;
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Wait policies for commands that are themselves expected to navigate.
+/// `auto` is intentionally absent: its bounded discovery window is only
+/// meaningful for input actions where navigation is optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExpectedWaitPolicy {
+    None,
+    Commit,
+    Load,
+    Stable,
+}
+
+impl From<ExpectedWaitPolicy> for WaitPolicy {
+    fn from(value: ExpectedWaitPolicy) -> Self {
+        match value {
+            ExpectedWaitPolicy::None => Self::None,
+            ExpectedWaitPolicy::Commit => Self::Commit,
+            ExpectedWaitPolicy::Load => Self::Load,
+            ExpectedWaitPolicy::Stable => Self::Stable,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -68,6 +91,11 @@ pub enum Command {
         /// Click even if another element is on top.
         #[arg(long)]
         force: bool,
+        /// How far to wait after trusted input is dispatched.
+        #[arg(long, value_enum, default_value_t = WaitPolicy::Auto)]
+        wait: WaitPolicy,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
     },
 
     /// Move the pointer onto an element so hover states engage.
@@ -85,7 +113,13 @@ pub enum Command {
     },
 
     /// Press a key or chord, e.g. Enter, Tab, Ctrl+A, Cmd+Shift+K.
-    Press { chord: String },
+    Press {
+        chord: String,
+        #[arg(long, value_enum, default_value_t = WaitPolicy::Auto)]
+        wait: WaitPolicy,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+    },
 
     /// Scroll the page.
     Scroll {
@@ -151,6 +185,10 @@ pub enum Command {
     Tap {
         /// A ref like @node-42, or a point like 512,340.
         target: String,
+        #[arg(long, value_enum, default_value_t = WaitPolicy::Auto)]
+        wait: WaitPolicy,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
     },
 
     /// Press and hold.
@@ -199,6 +237,72 @@ pub enum Command {
         steps: u32,
     },
 
+    /// Wait for typed browser conditions. Conditions are combined with AND.
+    Wait {
+        #[arg(long, value_name = "GLOB")]
+        url: Option<String>,
+        #[arg(long)]
+        generation_after: Option<u64>,
+        #[arg(long)]
+        load: bool,
+        #[arg(long)]
+        stable: bool,
+        #[arg(long, default_value_t = 300)]
+        quiet_ms: u64,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+    },
+
+    /// Traverse to the adjacent previous history entry.
+    Back {
+        #[arg(long, value_enum)]
+        wait: Option<ExpectedWaitPolicy>,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+    },
+
+    /// Traverse to the adjacent next history entry.
+    Forward {
+        #[arg(long, value_enum)]
+        wait: Option<ExpectedWaitPolicy>,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+    },
+
+    /// Reload the current document through Chromium history machinery.
+    Reload {
+        #[arg(long)]
+        ignore_cache: bool,
+        #[arg(long, value_enum)]
+        wait: Option<ExpectedWaitPolicy>,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+    },
+
+    /// Explicit pointer operations.
+    Pointer {
+        #[command(subcommand)]
+        action: PointerAction,
+    },
+
+    /// Atomically capture settled page, visual, console, and network evidence.
+    Checkpoint {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        full_page: bool,
+        #[arg(long, value_enum)]
+        wait: Option<ExpectedWaitPolicy>,
+        #[arg(long, default_value_t = 300)]
+        quiet_ms: u64,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+        #[arg(long)]
+        park_pointer: bool,
+        #[arg(long, short = 'o')]
+        output_root: Option<String>,
+    },
+
     /// Close a session and its browser.
     Close,
 
@@ -236,12 +340,17 @@ pub enum JobAction {
         /// One step. Repeat for each.
         ///
         /// open <url> · click <text> · fill <field>=<value> · press <chord> ·
-        /// wait <ms> · screenshot · check-errors
+        /// wait <ms>|url <glob>|generation-after <n>|load|stable [quiet-ms] ·
+        /// back · forward · reload [ignore-cache] · pointer park · checkpoint [name] ·
+        /// screenshot · check-errors
         #[arg(long = "step", value_name = "STEP", required = true)]
         steps: Vec<String>,
         /// Show the browser window.
         #[arg(long)]
         headed: bool,
+        /// Capture a checkpoint after every successful step.
+        #[arg(long)]
+        checkpoint_each_step: bool,
     },
     /// List jobs, including ones from previous daemon lifetimes.
     List,
@@ -265,6 +374,12 @@ pub enum JobAction {
     },
     /// Stop a running job.
     Stop { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PointerAction {
+    /// Move the trusted pointer off page hit targets.
+    Park,
 }
 
 #[derive(Subcommand, Debug)]
@@ -349,5 +464,23 @@ mod tests {
             Cli::try_parse_from(["brow", "screenshot", "--full-page", "--node", "@node-1"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn expected_navigation_commands_do_not_advertise_or_accept_auto() {
+        for args in [
+            vec!["brow", "back", "--wait", "auto"],
+            vec!["brow", "forward", "--wait", "auto"],
+            vec!["brow", "reload", "--wait", "auto"],
+            vec!["brow", "checkpoint", "--name", "x", "--wait", "auto"],
+        ] {
+            let error = Cli::try_parse_from(args).expect_err("auto must be rejected by clap");
+            let rendered = error.to_string();
+            assert!(!rendered.contains("possible values: auto"), "{rendered}");
+            assert!(rendered.contains("none"), "{rendered}");
+            assert!(rendered.contains("commit"), "{rendered}");
+            assert!(rendered.contains("load"), "{rendered}");
+            assert!(rendered.contains("stable"), "{rendered}");
+        }
     }
 }

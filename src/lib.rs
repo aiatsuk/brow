@@ -17,6 +17,7 @@
 
 pub mod browser;
 pub mod cdp;
+pub mod checkpoint;
 pub mod cli;
 pub mod client;
 pub mod daemon;

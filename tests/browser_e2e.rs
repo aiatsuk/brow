@@ -396,6 +396,71 @@ async fn screenshots_cover_viewport_document_and_node() {
     shutdown(launched);
 }
 
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread")]
+async fn node_clip_retries_when_scroll_changes_between_quad_and_viewport_samples() {
+    if !common::chrome_available() {
+        return common::skip(
+            "node_clip_retries_when_scroll_changes_between_quad_and_viewport_samples",
+        );
+    }
+    let _slot = common::browser_slot();
+    let fixture = common::serve();
+    let (launched, mut page, _scratch) = open_fixture("clip-scroll-race", &fixture.url("/")).await;
+    let snapshot = page.snapshot().await.expect("snapshot");
+    let spa = snapshot
+        .interactive()
+        .find(|node| node.name.as_deref() == Some("Go to dashboard"))
+        .expect("SPA link")
+        .node_ref
+        .clone();
+    let root_session = page.session_id.clone();
+    let hold = brow::page::test_support::hold_next_node_clip_after_quads(root_session.clone());
+
+    let capture = tokio::spawn(async move {
+        page.screenshot(ScreenshotTarget::Node(spa), ImageFormat::Png, None)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), hold.wait_until_entered())
+        .await
+        .expect("node clip reached the post-quad barrier");
+
+    let scrolled = launched
+        .client
+        .call_on(
+            &root_session,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": "(() => { window.scrollTo(0, 600); return window.scrollY; })()",
+                "returnByValue": true,
+            }),
+        )
+        .await
+        .expect("force scroll between coordinate samples");
+    assert!(
+        scrolled
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|scroll_y| scroll_y >= 590.0),
+        "fixture did not scroll: {scrolled}"
+    );
+    hold.release();
+
+    let shot = capture
+        .await
+        .expect("node clip task")
+        .expect("node clip retries after viewport epoch changes");
+    let clip = shot.clip.expect("node capture clip");
+    assert!(
+        (clip.y - 500.0).abs() < 4.0,
+        "mixed viewport epochs produced document y={} instead of ~500",
+        clip.y
+    );
+
+    shutdown(launched);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn spa_route_changes_also_invalidate_refs() {
     if !common::chrome_available() {

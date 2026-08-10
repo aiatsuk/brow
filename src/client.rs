@@ -3,15 +3,15 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
-use crate::ipc::{Hello, Request, Response, PROTOCOL_VERSION};
+use crate::ipc::{encode_frame, Hello, IpcFrameReader, Request, Response, PROTOCOL_VERSION};
 use crate::paths;
 
 pub struct Client {
-    reader: tokio::io::Lines<BufReader<OwnedReadHalf>>,
+    reader: IpcFrameReader<BufReader<OwnedReadHalf>>,
     writer: OwnedWriteHalf,
     pub hello: Hello,
 }
@@ -22,75 +22,108 @@ impl Client {
     /// Auto-start is what makes the daemon invisible in normal use: an agent runs
     /// `brow open ...` and never has to know a background process exists.
     pub async fn connect_or_start() -> anyhow::Result<Self> {
-        if let Ok(client) = Self::connect().await {
-            return Ok(client);
+        match Self::connect_if_running().await? {
+            Some(client) => return Ok(client),
+            None => spawn_daemon()?,
         }
-        spawn_daemon()?;
 
         // The daemon has to create its socket, launch nothing, and bind. That is
         // fast, but not instant, and polling beats a fixed sleep.
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut backoff = Duration::from_millis(25);
-        let mut last: Option<anyhow::Error> = None;
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_millis(400));
-            match Self::connect().await {
-                Ok(client) => return Ok(client),
-                Err(e) => last = Some(e),
+            match Self::connect_if_running().await? {
+                Some(client) => return Ok(client),
+                None => continue,
             }
         }
         anyhow::bail!(
-            "started browd but it never accepted a connection on {}{}\nCheck {}",
+            "started browd but it never accepted a connection on {}\nCheck {}",
             paths::socket().display(),
-            last.map(|e| format!(" ({e})")).unwrap_or_default(),
             paths::daemon_log().display()
         )
     }
 
     /// Connects to an already-running daemon, or fails.
     pub async fn connect() -> anyhow::Result<Self> {
-        let stream = UnixStream::connect(paths::socket()).await?;
-        let (read_half, writer) = stream.into_split();
-        let mut reader = BufReader::new(read_half).lines();
+        Self::connect_if_running().await?.ok_or_else(|| {
+            anyhow::anyhow!("no browd is listening on {}", paths::socket().display())
+        })
+    }
 
-        let line = reader
-            .next_line()
+    /// Connects when a compatible daemon is listening.
+    ///
+    /// Only a missing socket and a refused connection mean "not running". Once
+    /// the socket accepts us, every greeting or protocol failure belongs to that
+    /// live endpoint and must reach the caller instead of triggering auto-start.
+    pub async fn connect_if_running() -> anyhow::Result<Option<Self>> {
+        let stream = match UnixStream::connect(paths::socket()).await {
+            Ok(stream) => stream,
+            Err(error) if connection_means_absent(&error) => return Ok(None),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "cannot connect to browd on {}: {error}",
+                    paths::socket().display()
+                ));
+            }
+        };
+        let (read_half, writer) = stream.into_split();
+        let mut reader = IpcFrameReader::new(BufReader::new(read_half));
+
+        let frame = reader
+            .read_frame()
             .await?
             .ok_or_else(|| anyhow::anyhow!("browd closed the connection before saying hello"))?;
-        let hello: Hello = serde_json::from_str(&line)
+        let hello: Hello = serde_json::from_slice(&frame)
             .map_err(|e| anyhow::anyhow!("browd sent an unreadable greeting: {e}"))?;
 
-        anyhow::ensure!(
-            hello.protocol == PROTOCOL_VERSION,
-            "version mismatch: this CLI speaks protocol {PROTOCOL_VERSION}, the running \
-             browd (v{}, pid {}) speaks {}. Run `brow daemon restart`.",
-            hello.brow,
-            hello.pid,
-            hello.protocol
-        );
+        ensure_protocol(&hello)?;
 
-        Ok(Self {
+        Ok(Some(Self {
             reader,
             writer,
             hello,
-        })
+        }))
     }
 
     /// Sends one request and reads its response.
     pub async fn request(&mut self, req: Request) -> anyhow::Result<Response> {
-        let line = serde_json::to_string(&req)?;
-        self.writer.write_all(line.as_bytes()).await?;
-        self.writer.write_all(b"\n").await?;
+        let frame = encode_frame(&req)?;
+        self.writer.write_all(&frame).await?;
         self.writer.flush().await?;
 
-        let line = self
+        let frame = self
             .reader
-            .next_line()
+            .read_frame()
             .await?
             .ok_or_else(|| anyhow::anyhow!("browd closed the connection without answering"))?;
-        Ok(serde_json::from_str(&line)?)
+        Ok(serde_json::from_slice(&frame)?)
     }
+}
+
+fn connection_means_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT) | Some(libc::ECONNREFUSED)
+    )
+}
+
+fn ensure_protocol(hello: &Hello) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        hello.protocol == PROTOCOL_VERSION,
+        "version mismatch: this CLI speaks protocol {PROTOCOL_VERSION}, the running \
+         browd (v{}, pid {}) speaks {}. Stop that daemon with the matching brow v{} \
+         CLI, or first verify PID {} belongs to that browd and terminate it manually. \
+         Then run `brow daemon start` with this CLI.",
+        hello.brow,
+        hello.pid,
+        hello.protocol,
+        hello.brow,
+        hello.pid
+    );
+    Ok(())
 }
 
 /// Launches `browd` fully detached so it outlives this CLI process.
@@ -134,7 +167,38 @@ fn spawn_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Best-effort check for a live daemon without starting one.
+/// Best-effort check for a live daemon endpoint without starting one.
+///
+/// `false` is reserved for the two socket errors that mean absence. A greeting,
+/// protocol, permission, or other connection failure must not be mistaken for a
+/// stopped daemon by callers that only need a conservative liveness signal.
 pub async fn is_running() -> bool {
-    Client::connect().await.is_ok()
+    !matches!(Client::connect_if_running().await, Ok(None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_protocol_versions_fail_at_hello_with_recovery_guidance() {
+        let old = Hello {
+            brow: "0.0.9".into(),
+            protocol: 1,
+            pid: 42,
+        };
+        let error = ensure_protocol(&old).expect_err("v1 daemon must not accept v2 requests");
+        let message = error.to_string();
+        assert!(message.contains("version mismatch"));
+        assert!(message.contains("matching brow v0.0.9 CLI"));
+        assert!(message.contains("verify PID 42"));
+        assert!(message.contains("daemon start"));
+        assert!(!message.contains("daemon restart"));
+
+        let current = Hello {
+            protocol: PROTOCOL_VERSION,
+            ..old
+        };
+        ensure_protocol(&current).expect("matching protocol");
+    }
 }

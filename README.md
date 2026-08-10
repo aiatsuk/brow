@@ -15,7 +15,7 @@ an agent drives them with.
 
 ## Status
 
-**Iteration 3.** The core browser flows below are covered by real-Chromium E2E;
+**Iteration 4.** The core browser flows below are covered by real-Chromium E2E;
 supporting branches also have unit/integration coverage. Video recording, the
 site graph and framework adapters are not built yet.
 
@@ -36,9 +36,14 @@ locations, then `PATH`.
 ```bash
 brow open example.com               # starts the daemon and a browser if needed
 brow snapshot                       # interactive elements, with @node-G-N refs
-brow click @node-2-12
+brow click @node-2-12              # auto-settles navigation, returns a receipt
 brow fill @node-2-14 'someone@example.com'
 brow press Enter
+brow wait --url 'https://example.com/issues/*' --stable
+brow back
+brow reload --ignore-cache
+brow pointer park                  # explicit trusted pointer movement
+brow checkpoint --name after-submit --full-page
 brow screenshot --full-page -o page.png
 brow eval "document.querySelector('#status').textContent"
 brow console --errors               # console output and uncaught exceptions
@@ -69,12 +74,51 @@ brow daemon status
 brow daemon stop
 ```
 
+### Deterministic flow control
+
+`click`, coordinate-click, `tap`, and `press` subscribe to browser lifecycle
+events before dispatching trusted input. Their default `--wait auto` watches for
+navigation for 250 ms: without a signal it reports `no_navigation`; after a
+signal it returns only after commit and target-tree settlement. Use
+`--wait none` for deliberately dispatch-only input, or request `commit`, `load`,
+or `stable` explicitly. Every receipt exposes `dispatch_state` as `prevented`,
+`sent`, or `uncertain`; the compatibility `dispatched` field is respectively
+`false`, `true`, or `null`. After `sent`, inspect the receipt and application
+state before deciding whether another action would be safe.
+
+`open` waits for a causal commit and load of the root document, then returns the
+actual settled URL after redirects. A child iframe's load event cannot satisfy
+that contract, and an event-stream gap or deadline expires as an error rather
+than silent success.
+
+Typed waits combine conditions with AND and one deadline:
+
+```bash
+brow wait --url 'https://host/issues/*' --generation-after 20 --load
+brow wait --stable --quiet-ms 300 --timeout-ms 30000
+```
+
+`stable` means the root document is loaded, the related target tree and
+URL/generation are quiet, finite Document/CSS/Script/Image/Font/XHR/Fetch traffic
+is quiet, and two more animation-frame intervals have passed. WebSocket,
+EventSource, and WebTransport are reported but excluded. This is browser
+stability, not proof that a payment, save, or other business operation succeeded.
+
+`brow checkpoint --name <slug>` explicitly creates an atomic directory with
+`manifest.json`, `snapshot.json`, `screenshot.png`, `console-errors.json`, and
+`network-failures.json`. The manifest binds one generation, SHA-256 and byte
+lengths, image/tile metadata, coverage and event completeness, and at most 200
+console errors plus 200 failed requests. It is stable by default. DOM and image
+content can contain arbitrary private data beyond best-effort secret-shape
+redaction, so checkpoint creation is never implicit.
+
 ## Background jobs
 
 A job runs a plan in its own browser and keeps going after the command returns.
 
 ```bash
 brow job start --intent "check the signup flow still works" \
+  --checkpoint-each-step \
   --step "open staging.example.com/signup" \
   --step 'fill "Email" = qa@example.com' \
   --step 'click "Create account"' \
@@ -84,6 +128,13 @@ brow job start --intent "check the signup flow still works" \
 brow job logs job_0199c… --follow
 brow job list
 ```
+
+In addition to fixed `wait <ms>`, job plans accept `back`, `forward`,
+`reload [ignore-cache]`, `wait url <glob>`, `wait generation-after <n>`,
+`wait load`, `wait stable [quiet-ms]`, `pointer park`, and
+`checkpoint [name]`. Click and press steps use the same action settlement and
+receipts as direct commands. `--checkpoint-each-step` persists one atomic
+checkpoint path after every successful step and is off by default.
 
 **The daemon never calls a language model.** A job is executed by heuristics,
 treated as the lower bound on competence rather than as judgement. When the
@@ -142,6 +193,15 @@ invalidates outstanding refs. Repeated snapshots in one stable generation reuse
 a ref only for the same browser-side node identity and never recycle a removed
 node's number onto a different node.
 
+**Navigation receipts instead of sleeps.** Navigation-capable trusted input,
+typed waits, history traversal, and reload share one settlement implementation.
+Receipts distinguish not dispatched, no navigation, committed, loaded, stable,
+conditions matched, timed out, incomplete evidence, and dialog-blocked outcomes.
+Root and OOPIF subframe navigation are identified separately. `navigation_trigger` records
+input/history/reload independently from the final document transition, while
+`redirect_count` preserves completed HTTP redirect hops. Back/forward uses
+Chromium's adjacent history entry rather than renderer keyboard shortcuts.
+
 **Read-only evaluation that is actually enforced.** `brow eval` runs with V8's
 `throwOnSideEffect`, which aborts an expression the moment it tries to mutate
 anything. This is a real guarantee, not a convention — see the caveat below.
@@ -163,10 +223,16 @@ surface, and it has no variant that carries a CDP method name. "The agent cannot
 issue arbitrary protocol commands" is a property of the type, not a filter
 somebody has to remember to update.
 
+**Bounded stop-and-wait IPC.** Client and daemon accept one newline-delimited
+JSON frame at a time, with an 8 MiB payload limit in both directions. If the CLI
+disconnects during an observation-only typed `wait`, the daemon cancels that wait
+and releases its session immediately. Other accepted operations are not aborted
+mid-browser/input/persistence sequence merely because their caller disappeared.
+
 ## Known limits
 
 Verified on Chrome, macOS; original browser-limit probes 2026-08-04, current
-regression suite 2026-08-09.
+regression suite 2026-08-10.
 
 - **`throwOnSideEffect` is sound but conservative.** Nothing that mutates gets
   through, but some harmless reads are refused too:
@@ -194,6 +260,15 @@ regression suite 2026-08-09.
   separately; console/network responses mark themselves incomplete after a gap.
 - **Event timestamps are receive time**, not browser event time. CDP mixes several
   clocks and reconciling them is not done yet.
+- **The 250 ms auto window is not an application contract.** Navigation started
+  by a later timer is intentionally outside the action receipt; use an explicit
+  typed wait when the application promises delayed navigation. `stable` can
+  legitimately time out on an unfinished ordinary Fetch/XHR and still does not
+  certify application-level success.
+- **A popup is not the root page.** `window.open()` is reported as a committed
+  popup navigation, but the originating session cannot prove that popup's
+  `load`. An explicit `--wait load` therefore fails or times out instead of
+  relabelling a popup event as a root-document load.
 - **Transformed inline-frame bounds are approximate.** Trusted actions and node
   screenshots use live DOM quads and are checked across iframe compositors, but
   the informational `bounds` emitted for a same-process iframe nested under CSS
@@ -226,7 +301,7 @@ regression suite 2026-08-09.
 ## Development
 
 ```bash
-cargo test          # 138 tests (110 unit + 28 integration in this worktree)
+cargo test          # 241 tests (173 unit + 68 integration)
 BROW_REQUIRE_CHROME=1 cargo test # fail instead of skipping browser e2e
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings

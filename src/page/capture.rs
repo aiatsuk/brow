@@ -7,13 +7,12 @@
 //! exactly one place here, using the visual viewport's page offset.
 
 use std::ffi::OsString;
-use std::io::Cursor;
+use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 
 use crate::cdp::{CdpClient, CdpError};
@@ -111,40 +110,48 @@ pub struct Capture {
 
 impl Capture {
     pub async fn write_to(&self, path: &Path) -> std::io::Result<PathBuf> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+        let parent = publication_parent(path);
+        crate::paths::create_dir_all_durable(parent)?;
         let sequence = CAPTURE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let mut temp_name = OsString::from(path.file_name().unwrap_or_default());
         temp_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
         let temp = path.with_file_name(temp_name);
-        let result = async {
-            let mut file = tokio::fs::OpenOptions::new()
+        // Deliberately contains no await point. Job cancellation uses `select!`;
+        // splitting write/fsync/rename across cancellable Tokio filesystem
+        // futures can publish an orphan PNG after `job stop` has already replied.
+        // Once this future is polled, publication completes (or fails) before
+        // cancellation can be observed.
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&temp)
-                .await?;
-            file.write_all(&self.bytes).await?;
-            file.flush().await?;
-            file.sync_all().await?;
+                .open(&temp)?;
+            file.write_all(&self.bytes)?;
+            file.flush()?;
+            file.sync_all()?;
             drop(file);
-            tokio::fs::rename(&temp, path).await?;
+            std::fs::rename(&temp, path)?;
             #[cfg(unix)]
-            if let Some(parent) = path.parent() {
+            {
                 // The manifest may be fsynced immediately after this returns. Sync
                 // the directory too, so it can never durably point at evidence
                 // whose rename existed only in the kernel cache.
-                tokio::fs::File::open(parent).await?.sync_all().await?;
+                crate::paths::sync_directory(parent)?;
             }
             Ok::<(), std::io::Error>(())
-        }
-        .await;
+        })();
         if result.is_err() {
-            let _ = tokio::fs::remove_file(&temp).await;
+            let _ = std::fs::remove_file(&temp);
         }
         result?;
         Ok(path.to_path_buf())
     }
+}
+
+fn publication_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 /// A clip clamped to what Chromium can actually render, plus a note when it had
@@ -677,6 +684,44 @@ pub async fn node_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn screenshot_publication_has_no_cancellable_await_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("evidence.png");
+        let capture = Capture {
+            bytes: b"atomic screenshot bytes".to_vec(),
+            format: ImageFormat::Png,
+            clip: None,
+            truncated: None,
+            tiled: false,
+            tile_count: 1,
+        };
+
+        let written = tokio::time::timeout(std::time::Duration::ZERO, capture.write_to(&path))
+            .await
+            .expect("the complete fsync/rename transaction must finish in one poll")
+            .expect("publish screenshot");
+        assert_eq!(written, path);
+        assert_eq!(std::fs::read(&written).unwrap(), capture.bytes);
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "no temporary publication name remains"
+        );
+    }
+
+    #[test]
+    fn relative_screenshot_output_syncs_the_current_directory() {
+        assert_eq!(
+            publication_parent(Path::new("evidence.png")),
+            Path::new(".")
+        );
+        assert_eq!(
+            publication_parent(Path::new("artifacts/evidence.png")),
+            Path::new("artifacts")
+        );
+    }
 
     #[test]
     fn oversized_tile_dimensions_are_rejected_before_pixel_allocation() {

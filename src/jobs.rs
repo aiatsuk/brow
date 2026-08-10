@@ -26,16 +26,18 @@
 //! log intact, and are not resumable. Making them resumable needs a supervisor
 //! process per browser, which is deliberately not built.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result as AnyResult};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 
+use crate::checkpoint::{self, CheckpointOptions};
+use crate::ipc::{WaitConditions, WaitPolicy};
 use crate::page::{ImageFormat, MouseButton, NodeFingerprint, Page, ScreenshotTarget};
 
 /// How long a parked job waits before giving up.
@@ -45,6 +47,8 @@ use crate::page::{ImageFormat, MouseButton, NodeFingerprint, Page, ScreenshotTar
 /// moved on.
 pub const DECISION_TTL: Duration = Duration::from_secs(30 * 60);
 pub const APPROVAL_TTL: Duration = Duration::from_secs(15 * 60);
+const JOB_WAIT_TIMEOUT_MS: u64 = 30_000;
+const TERMINAL_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type JobId = String;
 
@@ -113,6 +117,28 @@ pub enum Step {
     Wait {
         ms: u64,
     },
+    WaitUrl {
+        glob: String,
+    },
+    WaitGenerationAfter {
+        generation: u64,
+    },
+    WaitLoad,
+    WaitStable {
+        #[serde(default = "default_job_quiet_ms")]
+        quiet_ms: u64,
+    },
+    Back,
+    Forward,
+    Reload {
+        #[serde(default)]
+        ignore_cache: bool,
+    },
+    PointerPark,
+    Checkpoint {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     Screenshot,
     /// Fails the job if the page has logged errors or a request has failed.
     CheckErrors,
@@ -165,21 +191,76 @@ impl Step {
             }
             "wait" => {
                 need("<milliseconds>")?;
-                let ms = rest
-                    .trim_end_matches("ms")
-                    .trim()
-                    .parse::<u64>()
-                    .map_err(|_| format!("step `wait` wants milliseconds, got `{rest}`"))?;
-                Step::Wait {
-                    ms: ms.min(120_000),
+                let (kind, value) = rest
+                    .split_once(char::is_whitespace)
+                    .map(|(kind, value)| (kind, value.trim()))
+                    .unwrap_or((rest, ""));
+                match kind {
+                    "url" => {
+                        if value.is_empty() {
+                            return Err("step `wait url` needs a glob".into());
+                        }
+                        Step::WaitUrl {
+                            glob: unquote(value),
+                        }
+                    }
+                    "generation-after" => Step::WaitGenerationAfter {
+                        generation: value.parse::<u64>().map_err(|_| {
+                            format!("step `wait generation-after` wants an integer, got `{value}`")
+                        })?,
+                    },
+                    "load" if value.is_empty() => Step::WaitLoad,
+                    "stable" => {
+                        let value = value.strip_prefix("quiet-ms=").unwrap_or(value);
+                        let quiet_ms = if value.is_empty() {
+                            default_job_quiet_ms()
+                        } else {
+                            value.parse::<u64>().map_err(|_| {
+                                format!("step `wait stable` wants optional quiet milliseconds, got `{value}`")
+                            })?
+                        };
+                        if quiet_ms > JOB_WAIT_TIMEOUT_MS {
+                            return Err(format!(
+                                "step `wait stable` quiet time must be <= {JOB_WAIT_TIMEOUT_MS}ms"
+                            ));
+                        }
+                        Step::WaitStable { quiet_ms }
+                    }
+                    _ => {
+                        let ms = rest
+                            .trim_end_matches("ms")
+                            .trim()
+                            .parse::<u64>()
+                            .map_err(|_| {
+                                format!(
+                                    "step `wait` wants milliseconds or a typed condition, got `{rest}`"
+                                )
+                            })?;
+                        Step::Wait {
+                            ms: ms.min(120_000),
+                        }
+                    }
                 }
             }
+            "back" if rest.is_empty() => Step::Back,
+            "forward" if rest.is_empty() => Step::Forward,
+            "reload" => match rest {
+                "" => Step::Reload {
+                    ignore_cache: false,
+                },
+                "ignore-cache" | "--ignore-cache" => Step::Reload { ignore_cache: true },
+                _ => return Err("step `reload` accepts only optional `ignore-cache`".into()),
+            },
+            "pointer" if rest == "park" => Step::PointerPark,
+            "checkpoint" => Step::Checkpoint {
+                name: (!rest.is_empty()).then(|| unquote(rest)),
+            },
             "screenshot" => Step::Screenshot,
             "check-errors" | "check_errors" => Step::CheckErrors,
             other => {
                 return Err(format!(
-                    "unknown step `{other}`. Known steps: open, click, fill, press, wait, \
-                     screenshot, check-errors"
+                    "unknown step `{other}`. Known steps: open, click, fill, press, wait, back, \
+                     forward, reload, pointer park, checkpoint, screenshot, check-errors"
                 ))
             }
         })
@@ -187,15 +268,43 @@ impl Step {
 
     pub fn describe(&self) -> String {
         match self {
-            Step::Open { url } => format!("open {url}"),
+            Step::Open { url } => format!("open {}", crate::redact::url(url)),
             Step::Click { text } => format!("click {text:?}"),
-            Step::Fill { field, value } => format!("fill {field:?} with {value:?}"),
+            Step::Fill { field, .. } => format!("fill {field:?} with [redacted input]"),
             Step::Press { chord } => format!("press {chord}"),
-            Step::Wait { ms } => format!("wait {ms}ms"),
+            Step::Wait { ms } => format!("fixed delay {ms}ms (not readiness)"),
+            Step::WaitUrl { glob } => {
+                format!("wait for URL {:?}", crate::redact::url_glob(glob))
+            }
+            Step::WaitGenerationAfter { generation } => {
+                format!("wait for generation after {generation}")
+            }
+            Step::WaitLoad => "wait for document load".into(),
+            Step::WaitStable { quiet_ms } => {
+                format!("wait for browser stability ({quiet_ms}ms quiet)")
+            }
+            Step::Back => "back".into(),
+            Step::Forward => "forward".into(),
+            Step::Reload { ignore_cache } => {
+                if *ignore_cache {
+                    "reload ignoring cache".into()
+                } else {
+                    "reload".into()
+                }
+            }
+            Step::PointerPark => "pointer park".into(),
+            Step::Checkpoint { name } => match name {
+                Some(name) => format!("checkpoint {name:?}"),
+                None => "checkpoint".into(),
+            },
             Step::Screenshot => "screenshot".into(),
             Step::CheckErrors => "check for errors".into(),
         }
     }
+}
+
+fn default_job_quiet_ms() -> u64 {
+    300
 }
 
 fn unquote(s: &str) -> String {
@@ -326,13 +435,21 @@ pub struct JobRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub created_ms: u128,
+    #[serde(default)]
+    pub checkpoint_each_step: bool,
+    #[serde(default)]
+    pub checkpoints: Vec<PathBuf>,
 }
 
 impl JobRecord {
     fn log(&mut self, text: impl Into<String>) {
+        // Log lines are evidence, never executable input. Redact once at ingest
+        // so both the in-memory/status view and tracing's durable browd.log are
+        // safe; manifest sanitization remains defense in depth for legacy rows.
+        let text = crate::redact::storage_text(&text.into());
         let line = LogLine {
             t_ms: now_ms(),
-            text: text.into(),
+            text,
         };
         tracing::info!(job = %self.id, "{}", line.text);
         self.log.push(line);
@@ -382,6 +499,48 @@ impl JobRecord {
         }
         s
     }
+
+    /// Builds the non-resumable, privacy-safe view written to `job.json`.
+    /// The live Runner retains the original plan in memory; recovered jobs are
+    /// always interrupted, so persisted form values never need to be replayed.
+    fn sanitized_for_storage(&self) -> Self {
+        let mut durable = self.clone();
+        durable.intent = crate::redact::storage_text(&durable.intent);
+        for step in &mut durable.steps {
+            match step {
+                Step::Open { url } => *url = crate::redact::url(url),
+                Step::WaitUrl { glob } => *glob = crate::redact::url_glob(glob),
+                Step::Fill { field, value } => {
+                    *field = crate::redact::storage_text(field);
+                    *value = crate::redact::MASK.into();
+                }
+                Step::Click { text } => *text = crate::redact::storage_text(text),
+                Step::Checkpoint { name: Some(name) } => *name = crate::redact::storage_text(name),
+                _ => {}
+            }
+        }
+        for line in &mut durable.log {
+            line.text = crate::redact::storage_text(&line.text);
+        }
+        if let Some(error) = &mut durable.error {
+            *error = crate::redact::storage_text(error);
+        }
+        if let Some(pending) = &mut durable.pending {
+            match &mut pending.kind {
+                PendingKind::Decision { question, options } => {
+                    *question = crate::redact::storage_text(question);
+                    for option in options {
+                        *option = crate::redact::storage_text(option);
+                    }
+                }
+                PendingKind::Approval { action, reason, .. } => {
+                    *action = crate::redact::storage_text(action);
+                    *reason = crate::redact::storage_text(reason);
+                }
+            }
+        }
+        durable
+    }
 }
 
 /// Sent from the control socket into a running job.
@@ -414,6 +573,11 @@ pub struct JobHandle {
     /// Stop raises the watch flag first, then takes this gate; a mutation that
     /// acquires it afterwards observes the flag and cannot be dispatched.
     pub action_gate: Arc<Mutex<()>>,
+    /// Becomes true only after the Runner has finished terminal evidence,
+    /// durably committed terminal state, released its final action gate, and
+    /// the daemon has killed and reaped the job-owned browser.
+    /// `job stop` waits for this acknowledgement before returning.
+    pub terminalized: tokio::sync::watch::Receiver<bool>,
 }
 
 pub fn now_ms() -> u128 {
@@ -430,6 +594,125 @@ pub fn new_job_id(seq: u64) -> JobId {
 
 const MANIFEST_NAME: &str = "job.json";
 const MANIFEST_TEMP_NAME: &str = "job.json.tmp";
+
+/// Deterministic barrier for the crash window between checkpoint publication
+/// and committing that path to the job manifest. It exists only in unit-test
+/// builds; production has no branch, environment switch, or pause point.
+#[cfg(test)]
+mod checkpoint_publication_test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::Notify;
+
+    struct Barrier {
+        job_id: String,
+        path: Mutex<Option<PathBuf>>,
+        entered: AtomicBool,
+        released: AtomicBool,
+        entered_notify: Notify,
+        released_notify: Notify,
+    }
+
+    impl Barrier {
+        fn new(job_id: String) -> Self {
+            Self {
+                job_id,
+                path: Mutex::new(None),
+                entered: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                entered_notify: Notify::new(),
+                released_notify: Notify::new(),
+            }
+        }
+
+        async fn wait_for(flag: &AtomicBool, notify: &Notify) {
+            while !flag.load(Ordering::Acquire) {
+                let notified = notify.notified();
+                if flag.load(Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
+            }
+        }
+
+        fn enter(&self, path: &Path) {
+            *self.path.lock().expect("checkpoint publication test path") = Some(path.into());
+            self.entered.store(true, Ordering::Release);
+            self.entered_notify.notify_waiters();
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+            self.released_notify.notify_waiters();
+        }
+    }
+
+    fn slot() -> &'static Mutex<Option<Arc<Barrier>>> {
+        static SLOT: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) struct PublicationHold {
+        barrier: Arc<Barrier>,
+    }
+
+    impl PublicationHold {
+        pub(super) async fn wait_until_entered(&self) -> PathBuf {
+            Barrier::wait_for(&self.barrier.entered, &self.barrier.entered_notify).await;
+            self.barrier
+                .path
+                .lock()
+                .expect("checkpoint publication test path")
+                .clone()
+                .expect("publication path is recorded before the barrier is entered")
+        }
+    }
+
+    impl Drop for PublicationHold {
+        fn drop(&mut self) {
+            let mut slot = slot().lock().expect("checkpoint publication test barrier");
+            if slot
+                .as_ref()
+                .is_some_and(|pending| Arc::ptr_eq(pending, &self.barrier))
+            {
+                *slot = None;
+            }
+            self.barrier.release();
+        }
+    }
+
+    pub(super) fn hold_next(job_id: impl Into<String>) -> PublicationHold {
+        let barrier = Arc::new(Barrier::new(job_id.into()));
+        let mut slot = slot().lock().expect("checkpoint publication test barrier");
+        assert!(
+            slot.is_none(),
+            "a checkpoint publication test barrier is already installed"
+        );
+        *slot = Some(Arc::clone(&barrier));
+        PublicationHold { barrier }
+    }
+
+    pub(super) async fn hold_if_requested(job_id: &str, path: &Path) {
+        let barrier = {
+            let mut slot = slot().lock().expect("checkpoint publication test barrier");
+            if slot
+                .as_ref()
+                .is_some_and(|pending| pending.job_id == job_id)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some(barrier) = barrier else {
+            return;
+        };
+        barrier.enter(path);
+        Barrier::wait_for(&barrier.released, &barrier.released_notify).await;
+    }
+}
 
 /// Writes the manifest so a later `brow job status` can still explain what
 /// happened, even after the daemon that ran it is gone.
@@ -453,36 +736,44 @@ pub async fn persist(record: &JobRecord) {
 pub async fn try_persist(record: &JobRecord) -> AnyResult<()> {
     let path = record.artifacts.join(MANIFEST_NAME);
     let temp = record.artifacts.join(MANIFEST_TEMP_NAME);
-    let mut bytes = serde_json::to_vec_pretty(record)
+    let durable = record.sanitized_for_storage();
+    let mut bytes = serde_json::to_vec_pretty(&durable)
         .with_context(|| format!("serialize job {}", record.id))?;
     bytes.push(b'\n');
 
-    tokio::fs::create_dir_all(&record.artifacts)
-        .await
+    // The transaction below has no await points, so cancellation cannot split
+    // it. This process-wide gate additionally prevents two explicit persistence
+    // callers from racing through the shared per-job temporary name.
+    static PERSISTENCE_GATE: OnceLock<StdMutex<()>> = OnceLock::new();
+    let _persistence = PERSISTENCE_GATE
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    crate::paths::create_dir_all_durable(&record.artifacts)
         .with_context(|| format!("create {}", record.artifacts.display()))?;
 
-    let mut file = tokio::fs::OpenOptions::new()
+    // Keep the complete write/fsync/rename transaction in one poll. Tokio fs
+    // delegates individual calls to blocking workers; cancelling between those
+    // awaits can otherwise let an old rename race a terminal stop persist.
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .open(&temp)
-        .await
         .with_context(|| format!("open temporary manifest {}", temp.display()))?;
     file.write_all(&bytes)
-        .await
         .with_context(|| format!("write temporary manifest {}", temp.display()))?;
     file.flush()
-        .await
         .with_context(|| format!("flush temporary manifest {}", temp.display()))?;
     file.sync_all()
-        .await
         .with_context(|| format!("sync temporary manifest {}", temp.display()))?;
     drop(file);
 
-    tokio::fs::rename(&temp, &path)
-        .await
+    std::fs::rename(&temp, &path)
         .with_context(|| format!("rename {} to {}", temp.display(), path.display()))?;
-    sync_directory(&record.artifacts).await
+    crate::paths::sync_directory(&record.artifacts)
+        .with_context(|| format!("sync directory {}", record.artifacts.display()))
 }
 
 async fn sync_directory(path: &Path) -> AnyResult<()> {
@@ -576,6 +867,146 @@ async fn quarantine_corrupt_manifest(manifest: &Path) -> AnyResult<PathBuf> {
     Ok(quarantined)
 }
 
+/// Reconciles the durable record with atomically published checkpoint
+/// directories. This closes the unavoidable crash window after a checkpoint's
+/// final rename but before its path can be committed into `job.json`.
+/// Dot-prefixed partial directories are never promoted or listed.
+async fn reconcile_committed_checkpoints(record: &mut JobRecord) -> bool {
+    let root = record.artifacts.join("checkpoints");
+    let mut recovery_log_changed = false;
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if record.checkpoints.is_empty() {
+                return false;
+            }
+            let removed = record.checkpoints.len();
+            record.checkpoints.clear();
+            record.log(format!(
+                "checkpoint recovery removed {removed} path(s) without committed evidence"
+            ));
+            return true;
+        }
+        Err(error) => {
+            record.log(format!(
+                "checkpoint recovery could not inspect {}: {error}",
+                root.display()
+            ));
+            return true;
+        }
+    };
+
+    let mut committed = Vec::new();
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                record.log(format!(
+                    "checkpoint recovery could not continue scanning {}: {error}",
+                    root.display()
+                ));
+                recovery_log_changed = true;
+                break;
+            }
+        };
+        let file_name = entry.file_name();
+        if file_name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        match entry.file_type().await {
+            Ok(kind) if kind.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                record.log(format!(
+                    "checkpoint recovery could not inspect {}: {error}",
+                    entry.path().display()
+                ));
+                recovery_log_changed = true;
+                continue;
+            }
+        }
+
+        let manifest_path = entry.path().join("manifest.json");
+        let manifest = match tokio::fs::read(&manifest_path).await {
+            Ok(bytes) => match serde_json::from_slice::<checkpoint::CheckpointManifest>(&bytes) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    record.log(format!(
+                        "checkpoint recovery ignored invalid final {}: {error}",
+                        entry.path().display()
+                    ));
+                    recovery_log_changed = true;
+                    continue;
+                }
+            },
+            Err(error) => {
+                record.log(format!(
+                    "checkpoint recovery ignored final {} without readable manifest: {error}",
+                    entry.path().display()
+                ));
+                recovery_log_changed = true;
+                continue;
+            }
+        };
+        let required = [
+            "snapshot.json",
+            "screenshot.png",
+            "console-errors.json",
+            "network-failures.json",
+        ];
+        if required
+            .iter()
+            .any(|name| !entry.path().join(name).is_file())
+        {
+            record.log(format!(
+                "checkpoint recovery ignored incomplete final {}",
+                entry.path().display()
+            ));
+            recovery_log_changed = true;
+            continue;
+        }
+        committed.push((manifest.created_ms, entry.path()));
+    }
+    committed.sort_by(|(left_time, left_path), (right_time, right_path)| {
+        left_time
+            .cmp(right_time)
+            .then_with(|| left_path.cmp(right_path))
+    });
+
+    let committed_set: HashSet<PathBuf> = committed.iter().map(|(_, path)| path.clone()).collect();
+    let old = record.checkpoints.clone();
+    let mut seen_existing = HashSet::new();
+    record
+        .checkpoints
+        .retain(|path| committed_set.contains(path) && seen_existing.insert(path.clone()));
+    let mut listed: HashSet<PathBuf> = record.checkpoints.iter().cloned().collect();
+    for (_, path) in committed {
+        if listed.insert(path.clone()) {
+            record.log(format!(
+                "checkpoint recovery found committed evidence {}",
+                path.display()
+            ));
+            record.checkpoints.push(path);
+            recovery_log_changed = true;
+        }
+    }
+    if old != record.checkpoints {
+        let removed = old
+            .iter()
+            .filter(|path| !record.checkpoints.contains(path))
+            .count();
+        if removed > 0 {
+            record.log(format!(
+                "checkpoint recovery removed {removed} uncommitted checkpoint path(s)"
+            ));
+        }
+        true
+    } else {
+        recovery_log_changed
+    }
+}
+
 fn damaged_manifest_record(artifacts: PathBuf, error: &anyhow::Error) -> JobRecord {
     let id = artifacts
         .file_name()
@@ -601,6 +1032,8 @@ fn damaged_manifest_record(artifacts: PathBuf, error: &anyhow::Error) -> JobReco
         pending: None,
         error: Some(message),
         created_ms: now_ms(),
+        checkpoint_each_step: false,
+        checkpoints: Vec::new(),
     }
 }
 
@@ -708,7 +1141,9 @@ pub async fn load_previous(root: &std::path::Path) -> Vec<JobRecord> {
             );
             record.artifacts = artifacts;
         }
-        if !record.state.is_terminal() {
+        let checkpoint_inventory_changed = reconcile_committed_checkpoints(&mut record).await;
+        let was_interrupted = !record.state.is_terminal();
+        if was_interrupted {
             record.state = JobState::Interrupted;
             record.pending = None;
             record.error = Some(
@@ -716,6 +1151,8 @@ pub async fn load_previous(root: &std::path::Path) -> Vec<JobRecord> {
                  so it cannot be resumed"
                     .into(),
             );
+        }
+        if was_interrupted || checkpoint_inventory_changed {
             persist_or_mark_failed(&mut record).await;
         }
         out.push(record);
@@ -746,10 +1183,17 @@ pub struct Runner {
 impl Runner {
     pub async fn run(mut self, page: &mut Page) {
         {
-            let mut r = self.record.lock().await;
-            if r.state.is_terminal() || *self.stop.borrow() {
+            let r = self.record.lock().await;
+            if r.state.is_terminal() {
                 return;
             }
+        }
+        if *self.stop.borrow() {
+            self.terminalize_stopped(page).await;
+            return;
+        }
+        {
+            let mut r = self.record.lock().await;
             r.state = JobState::Running;
             let intent = r.intent.clone();
             r.log(format!("started: {intent}"));
@@ -779,7 +1223,7 @@ impl Runner {
                 tokio::select! {
                     biased;
                     _ = stop.changed() => Err(StepOutcome::Stopped),
-                    result = self.execute(page, &step) => result,
+                    result = self.execute_with_checkpoint(page, &step) => result,
                 }
             };
 
@@ -798,20 +1242,33 @@ impl Runner {
                     }
                 }
                 Err(StepOutcome::Stopped) => {
-                    let mut r = self.record.lock().await;
-                    // `job_stop` may already have made the authoritative state
-                    // terminal, including Failed when its durable stop write did
-                    // not commit. Never overwrite that outcome with Stopped.
-                    if r.state.is_terminal() {
-                        break;
-                    }
-                    r.state = JobState::Stopped;
-                    r.log("stopped on request");
-                    persist_or_mark_failed(&mut r).await;
+                    self.terminalize_stopped(page).await;
                     break;
                 }
                 Err(StepOutcome::Failed(why)) => {
+                    let checkpoint_failure =
+                        if self.record.lock().await.checkpoint_each_step && !*self.stop.borrow() {
+                            match self.begin_browser_action().await {
+                                Ok(_action) => self
+                                    .capture_job_checkpoint_with_policy(
+                                        page,
+                                        "terminal-failed".into(),
+                                        WaitPolicy::Load,
+                                    )
+                                    .await
+                                    .err(),
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        };
                     let mut r = self.record.lock().await;
+                    if r.state.is_terminal() {
+                        break;
+                    }
+                    if let Some(error) = checkpoint_failure {
+                        r.log(format!("terminal checkpoint unavailable: {error:?}"));
+                    }
                     r.state = JobState::Failed;
                     r.log(format!("failed: {why}"));
                     r.error = Some(why);
@@ -834,6 +1291,73 @@ impl Runner {
         }
     }
 
+    async fn terminalize_stopped(&self, page: &mut Page) {
+        // Runner owns cancellation terminalization. The daemon only raises
+        // `stop` and waits for `terminalized`, so this is the final safe browser
+        // boundary and no artifact can appear after the stop response.
+        let terminal_action = Arc::clone(&self.action_gate).lock_owned().await;
+        {
+            let mut r = self.record.lock().await;
+            // A cancelled capture may have crossed its atomic rename and then
+            // been dropped while waiting to append the path. Account for that
+            // committed evidence before publishing terminal evidence/state.
+            reconcile_committed_checkpoints(&mut r).await;
+        }
+        let (checkpoint_enabled, checkpoint_safe) = {
+            let r = self.record.lock().await;
+            (
+                r.checkpoint_each_step,
+                !r.state.is_parked() && r.pending.is_none() && !r.state.is_terminal(),
+            )
+        };
+        let checkpoint_failure = if checkpoint_enabled && checkpoint_safe {
+            match tokio::time::timeout(
+                TERMINAL_CHECKPOINT_TIMEOUT,
+                self.capture_job_checkpoint_with_policy_and_timeout(
+                    page,
+                    "terminal-stopped".into(),
+                    WaitPolicy::Load,
+                    TERMINAL_CHECKPOINT_TIMEOUT,
+                ),
+            )
+            .await
+            {
+                Ok(result) => result.err(),
+                Err(_) => Some(StepOutcome::Failed(format!(
+                    "terminal checkpoint exceeded its {}ms total deadline",
+                    TERMINAL_CHECKPOINT_TIMEOUT.as_millis()
+                ))),
+            }
+        } else {
+            None
+        };
+
+        let mut r = self.record.lock().await;
+        // A timed-out capture may have crossed its atomic publication point
+        // before its future was cancelled. Reconcile once more before the
+        // terminal manifest is committed.
+        reconcile_committed_checkpoints(&mut r).await;
+        if r.state.is_terminal() {
+            drop(r);
+            drop(terminal_action);
+            return;
+        }
+        r.pending = None;
+        if checkpoint_enabled && !checkpoint_safe {
+            r.log(
+                "terminal checkpoint skipped: cancellation occurred while waiting for human input",
+            );
+        }
+        if let Some(error) = checkpoint_failure {
+            r.log(format!("terminal checkpoint unavailable: {error:?}"));
+        }
+        r.state = JobState::Stopped;
+        r.log("stopped on request");
+        persist_or_mark_failed(&mut r).await;
+        drop(r);
+        drop(terminal_action);
+    }
+
     async fn execute(&mut self, page: &mut Page, step: &Step) -> Result<(), StepOutcome> {
         {
             let mut r = self.record.lock().await;
@@ -853,11 +1377,127 @@ impl Runner {
                 tokio::time::sleep(Duration::from_millis(*ms)).await;
                 Ok(())
             }
+            Step::WaitUrl { glob } => {
+                let _action = self.begin_browser_action().await?;
+                let receipt = page
+                    .wait_for_conditions(
+                        &WaitConditions {
+                            url: Some(glob.clone()),
+                            ..WaitConditions::default()
+                        },
+                        Duration::from_secs(30),
+                        Duration::from_millis(300),
+                    )
+                    .await
+                    .map_err(|e| StepOutcome::Failed(e.to_string()))?;
+                self.log_receipt(&receipt).await;
+                Ok(())
+            }
+            Step::WaitGenerationAfter { generation } => {
+                let _action = self.begin_browser_action().await?;
+                let receipt = page
+                    .wait_for_conditions(
+                        &WaitConditions {
+                            generation_after: Some(*generation),
+                            ..WaitConditions::default()
+                        },
+                        Duration::from_secs(30),
+                        Duration::from_millis(300),
+                    )
+                    .await
+                    .map_err(|e| StepOutcome::Failed(e.to_string()))?;
+                self.log_receipt(&receipt).await;
+                Ok(())
+            }
+            Step::WaitLoad => {
+                let _action = self.begin_browser_action().await?;
+                let receipt = page
+                    .wait_for_conditions(
+                        &WaitConditions {
+                            load: true,
+                            ..WaitConditions::default()
+                        },
+                        Duration::from_secs(30),
+                        Duration::from_millis(300),
+                    )
+                    .await
+                    .map_err(|e| StepOutcome::Failed(e.to_string()))?;
+                self.log_receipt(&receipt).await;
+                Ok(())
+            }
+            Step::WaitStable { quiet_ms } => {
+                let _action = self.begin_browser_action().await?;
+                let receipt = page
+                    .wait_for_conditions(
+                        &WaitConditions {
+                            stable: true,
+                            ..WaitConditions::default()
+                        },
+                        Duration::from_secs(30),
+                        Duration::from_millis(*quiet_ms),
+                    )
+                    .await
+                    .map_err(|e| StepOutcome::Failed(e.to_string()))?;
+                self.log_receipt(&receipt).await;
+                Ok(())
+            }
+            Step::Back => {
+                let _action = self.begin_browser_action().await?;
+                let receipt = page
+                    .traverse_history(-1, None, Duration::from_secs(30))
+                    .await
+                    .map_err(|e| StepOutcome::Failed(e.to_string()))?;
+                self.log_receipt(&receipt).await;
+                Ok(())
+            }
+            Step::Forward => {
+                let _action = self.begin_browser_action().await?;
+                let receipt = page
+                    .traverse_history(1, None, Duration::from_secs(30))
+                    .await
+                    .map_err(|e| StepOutcome::Failed(e.to_string()))?;
+                self.log_receipt(&receipt).await;
+                Ok(())
+            }
+            Step::Reload { ignore_cache } => {
+                let _action = self.begin_browser_action().await?;
+                let receipt = page
+                    .reload_with_wait(*ignore_cache, None, Duration::from_secs(30))
+                    .await
+                    .map_err(|e| StepOutcome::Failed(e.to_string()))?;
+                self.log_receipt(&receipt).await;
+                Ok(())
+            }
+            Step::PointerPark => {
+                let _action = self.begin_browser_action().await?;
+                let receipt = page
+                    .park_pointer()
+                    .await
+                    .map_err(|e| StepOutcome::Failed(e.to_string()))?;
+                self.log_structured("receipt", &receipt).await;
+                self.record.lock().await.log(format!(
+                    "pointer parked at {},{}; {}",
+                    receipt.x, receipt.y, receipt.warning
+                ));
+                Ok(())
+            }
+            Step::Checkpoint { name } => {
+                let _action = self.begin_browser_action().await?;
+                let fallback = {
+                    let r = self.record.lock().await;
+                    format!("step-{:03}", r.cursor + 1)
+                };
+                self.capture_job_checkpoint(page, name.clone().unwrap_or(fallback))
+                    .await
+            }
             Step::Press { chord } => {
                 let _action = self.begin_browser_action().await?;
-                page.press(chord)
+                let receipt = page
+                    .press_with_wait(chord, WaitPolicy::Auto, Duration::from_secs(30))
                     .await
-                    .map_err(|e| StepOutcome::Failed(e.to_string()))
+                    .map_err(|e| StepOutcome::Failed(e.to_string()))?;
+                self.log_receipt(&receipt).await;
+                Ok(())
             }
             Step::Screenshot => {
                 let shot = page
@@ -916,6 +1556,113 @@ impl Runner {
             Step::Click { text } => self.click_by_text(page, text).await,
             Step::Fill { field, value } => self.fill_by_text(page, field, value).await,
         }
+    }
+
+    async fn execute_with_checkpoint(
+        &mut self,
+        page: &mut Page,
+        step: &Step,
+    ) -> Result<(), StepOutcome> {
+        self.execute(page, step).await?;
+        let (enabled, name) = {
+            let r = self.record.lock().await;
+            (
+                r.checkpoint_each_step,
+                format!("after-step-{:03}", r.cursor + 1),
+            )
+        };
+        if automatic_checkpoint_required(enabled, step) {
+            let _action = self.begin_browser_action().await?;
+            self.capture_job_checkpoint(page, name).await?;
+        }
+        Ok(())
+    }
+
+    async fn capture_job_checkpoint(
+        &self,
+        page: &mut Page,
+        name: String,
+    ) -> Result<(), StepOutcome> {
+        self.capture_job_checkpoint_with_policy(page, name, WaitPolicy::Stable)
+            .await
+    }
+
+    async fn capture_job_checkpoint_with_policy(
+        &self,
+        page: &mut Page,
+        name: String,
+        wait: WaitPolicy,
+    ) -> Result<(), StepOutcome> {
+        self.capture_job_checkpoint_with_policy_and_timeout(
+            page,
+            name,
+            wait,
+            Duration::from_secs(30),
+        )
+        .await
+    }
+
+    async fn capture_job_checkpoint_with_policy_and_timeout(
+        &self,
+        page: &mut Page,
+        name: String,
+        wait: WaitPolicy,
+        timeout: Duration,
+    ) -> Result<(), StepOutcome> {
+        let (id, output_root) = {
+            let r = self.record.lock().await;
+            (r.id.clone(), r.artifacts.join("checkpoints"))
+        };
+        let result = checkpoint::create(
+            page,
+            CheckpointOptions {
+                session: id.clone(),
+                name,
+                full_page: false,
+                wait,
+                timeout,
+                quiet: Duration::from_millis(300),
+                park_pointer: false,
+                output_root: Some(output_root),
+            },
+        )
+        .await
+        .map_err(|e| StepOutcome::Failed(e.to_string()))?;
+        #[cfg(test)]
+        checkpoint_publication_test_support::hold_if_requested(&id, &result.path).await;
+        let durability_warning = match &result.durability {
+            checkpoint::CheckpointDurability::Durable => None,
+            checkpoint::CheckpointDurability::PublishedSyncUnknown { error } => Some(format!(
+                "checkpoint {} was published, but parent-directory sync failed; host-crash durability is unknown: {error}",
+                result.path.display()
+            )),
+        };
+        let structured = serde_json::to_string(&result)
+            .unwrap_or_else(|error| format!(r#"{{"serialization_error":{error:?}}}"#));
+        let mut r = self.record.lock().await;
+        if !r.checkpoints.contains(&result.path) {
+            r.checkpoints.push(result.path.clone());
+        }
+        r.log(format!("checkpoint {}", result.path.display()));
+        r.log(format!("checkpoint_result {structured}"));
+        if let Some(warning) = durability_warning {
+            r.log(warning);
+        }
+        if persist_or_mark_failed(&mut r).await {
+            Ok(())
+        } else {
+            Err(StepOutcome::PersistenceFailed)
+        }
+    }
+
+    async fn log_receipt(&self, receipt: &crate::page::ActionReceipt) {
+        self.log_structured("receipt", receipt).await;
+    }
+
+    async fn log_structured(&self, label: &str, value: &impl Serialize) {
+        let text = serde_json::to_string(value)
+            .unwrap_or_else(|error| format!(r#"{{"serialization_error":{error:?}}}"#));
+        self.record.lock().await.log(format!("{label} {text}"));
     }
 
     /// Resolves visible text to exactly one element, or parks.
@@ -1034,10 +1781,20 @@ impl Runner {
             debug_assert_eq!(current_target, approved_target);
         }
 
-        page.click_if_unchanged(&node_ref, MouseButton::Left, 1, 0, &reviewed_target)
+        let (_, receipt) = page
+            .click_if_unchanged_with_wait(
+                &node_ref,
+                MouseButton::Left,
+                1,
+                0,
+                &reviewed_target,
+                WaitPolicy::Auto,
+                Duration::from_secs(30),
+            )
             .await
-            .map(|_| ())
-            .map_err(|e| StepOutcome::Failed(e.to_string()))
+            .map_err(|e| StepOutcome::Failed(e.to_string()))?;
+        self.log_receipt(&receipt).await;
+        Ok(())
     }
 
     async fn fill_by_text(
@@ -1227,11 +1984,7 @@ impl Runner {
     }
 
     async fn begin_browser_action(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, StepOutcome> {
-        let guard = Arc::clone(&self.action_gate).lock_owned().await;
-        if *self.stop.borrow() || self.record.lock().await.state.is_terminal() {
-            return Err(StepOutcome::Stopped);
-        }
-        Ok(guard)
+        acquire_browser_action(&self.action_gate, &self.stop, &self.record).await
     }
 
     /// Parks the job and waits for the control socket, a stop, or the deadline.
@@ -1311,6 +2064,13 @@ impl Runner {
             resolution
         };
 
+        if matches!(resolution, Resolution::Stopped) {
+            // Preserve the parked state and pending kind until terminalization.
+            // That causal evidence is what forbids a new checkpoint while an
+            // approval/decision screenshot is the authoritative pre-answer view.
+            return resolution;
+        }
+
         let mut r = self.record.lock().await;
         r.pending = None;
         if !r.state.is_terminal() {
@@ -1323,10 +2083,27 @@ impl Runner {
     }
 }
 
+fn automatic_checkpoint_required(enabled: bool, step: &Step) -> bool {
+    enabled && !matches!(step, Step::Checkpoint { .. })
+}
+
+#[derive(Debug)]
 enum StepOutcome {
     Failed(String),
     Stopped,
     PersistenceFailed,
+}
+
+async fn acquire_browser_action(
+    action_gate: &Arc<Mutex<()>>,
+    stop: &tokio::sync::watch::Receiver<bool>,
+    record: &Arc<Mutex<JobRecord>>,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, StepOutcome> {
+    let guard = Arc::clone(action_gate).lock_owned().await;
+    if *stop.borrow() || record.lock().await.state.is_terminal() {
+        return Err(StepOutcome::Stopped);
+    }
+    Ok(guard)
 }
 
 /// Everything the daemon keeps about jobs.
@@ -1354,7 +2131,142 @@ mod tests {
             pending: None,
             error: None,
             created_ms: 7,
+            checkpoint_each_step: false,
+            checkpoints: Vec::new(),
         }
+    }
+
+    async fn write_committed_checkpoint(path: &Path, name: &str, created_ms: u128) {
+        tokio::fs::create_dir_all(path).await.unwrap();
+        for file in [
+            "snapshot.json",
+            "screenshot.png",
+            "console-errors.json",
+            "network-failures.json",
+        ] {
+            tokio::fs::write(path.join(file), file.as_bytes())
+                .await
+                .unwrap();
+        }
+        let manifest = checkpoint::CheckpointManifest {
+            schema_version: 1,
+            name: name.into(),
+            created_ms,
+            url: "https://example.test/".into(),
+            title: "fixture".into(),
+            generation: 1,
+            complete: true,
+            pointer_parked: false,
+            wait: crate::page::ActionReceipt {
+                operation: "checkpoint".into(),
+                dispatched: Some(false),
+                dispatch_state: crate::page::DispatchState::Prevented,
+                navigation_trigger: crate::page::NavigationTrigger::Checkpoint,
+                requested_wait: WaitPolicy::Load,
+                effective_wait: WaitPolicy::Load,
+                outcome: crate::page::WaitOutcome::Loaded,
+                navigation: crate::page::NavigationKind::None,
+                navigation_scope: crate::page::NavigationScope::None,
+                redirect_count: 0,
+                before_url: "https://example.test/".into(),
+                final_url: "https://example.test/".into(),
+                final_url_observed: true,
+                before_generation: 1,
+                final_generation: 1,
+                elapsed_ms: 0,
+                discovery_ms: 0,
+                timeout_ms: 5_000,
+                quiet_ms: 0,
+                active_finite_requests: 0,
+                excluded_long_lived_requests: 0,
+                root_loading: false,
+                target_settled: true,
+                event_complete: true,
+                event_gap_delta: 0,
+                history_entry_id: None,
+                history_from_index: None,
+                history_to_index: None,
+                reload_loader_id: None,
+                dialog_type: None,
+                dialog_message: None,
+                stability_note: None,
+                guidance: Vec::new(),
+                blockers: Vec::new(),
+                observed_conditions: std::collections::BTreeMap::new(),
+            },
+            screenshot: checkpoint::ScreenshotEvidence {
+                format: "png".into(),
+                width: 1,
+                height: 1,
+                tile_count: 1,
+                tiled: false,
+                truncated: None,
+            },
+            diagnostics: checkpoint::DiagnosticEvidence {
+                console_observed: 0,
+                console_retained: 0,
+                console_limit: 200,
+                console_ring_dropped: 0,
+                network_observed: 0,
+                network_retained: 0,
+                network_limit: 200,
+                network_ring_dropped: 0,
+                event_stream_gaps: 0,
+            },
+            coverage_gaps: Vec::new(),
+            files: std::collections::BTreeMap::new(),
+            brow_version: "test".into(),
+            browser_version: "test".into(),
+            privacy_warning: "fixture".into(),
+        };
+        tokio::fs::write(
+            path.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_wins_the_pre_dispatch_gate_race_in_one_hundred_iterations() {
+        for iteration in 0..100 {
+            let gate = Arc::new(Mutex::new(()));
+            let held = Arc::clone(&gate).lock_owned().await;
+            let record = Arc::new(Mutex::new(record_in(
+                PathBuf::from(format!("/unused/race-{iteration}")),
+                "race",
+                JobState::Running,
+            )));
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+
+            let waiting_gate = Arc::clone(&gate);
+            let waiting_record = Arc::clone(&record);
+            let task = tokio::spawn(async move {
+                acquire_browser_action(&waiting_gate, &stop_rx, &waiting_record).await
+            });
+            tokio::task::yield_now().await;
+            stop_tx.send(true).expect("raise stop");
+            drop(held);
+
+            assert!(matches!(task.await.unwrap(), Err(StepOutcome::Stopped)));
+        }
+    }
+
+    #[test]
+    fn explicit_checkpoint_step_is_not_automatically_duplicated() {
+        assert!(automatic_checkpoint_required(
+            true,
+            &Step::Open {
+                url: "https://example.test".into()
+            }
+        ));
+        assert!(!automatic_checkpoint_required(
+            true,
+            &Step::Checkpoint {
+                name: Some("manual".into())
+            }
+        ));
+        assert!(!automatic_checkpoint_required(false, &Step::Wait { ms: 1 }));
     }
 
     #[test]
@@ -1369,6 +2281,34 @@ mod tests {
             Step::parse("click \"Create account\"").unwrap(),
             Step::Click {
                 text: "Create account".into()
+            }
+        );
+        assert_eq!(
+            Step::parse("wait url 'https://host/issues/*'").unwrap(),
+            Step::WaitUrl {
+                glob: "https://host/issues/*".into()
+            }
+        );
+        assert_eq!(
+            Step::parse("wait generation-after 42").unwrap(),
+            Step::WaitGenerationAfter { generation: 42 }
+        );
+        assert_eq!(Step::parse("wait load").unwrap(), Step::WaitLoad);
+        assert_eq!(
+            Step::parse("wait stable quiet-ms=450").unwrap(),
+            Step::WaitStable { quiet_ms: 450 }
+        );
+        assert_eq!(Step::parse("back").unwrap(), Step::Back);
+        assert_eq!(Step::parse("forward").unwrap(), Step::Forward);
+        assert_eq!(
+            Step::parse("reload ignore-cache").unwrap(),
+            Step::Reload { ignore_cache: true }
+        );
+        assert_eq!(Step::parse("pointer park").unwrap(), Step::PointerPark);
+        assert_eq!(
+            Step::parse("checkpoint 'after search'").unwrap(),
+            Step::Checkpoint {
+                name: Some("after search".into())
             }
         );
         assert_eq!(
@@ -1407,6 +2347,9 @@ mod tests {
             Step::parse("wait 99999999").unwrap(),
             Step::Wait { ms: 120_000 }
         );
+        let error = Step::parse("wait stable quiet-ms=30001")
+            .expect_err("quiet time cannot exceed the typed wait deadline");
+        assert!(error.contains("<= 30000ms"), "{error}");
     }
 
     #[test]
@@ -1505,6 +2448,8 @@ mod tests {
             }),
             error: None,
             created_ms: 0,
+            checkpoint_each_step: false,
+            checkpoints: Vec::new(),
         };
         let text = r.render_status();
         assert!(text.contains("waiting_for_approval"));
@@ -1598,6 +2543,7 @@ mod tests {
             .unwrap();
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         stop_tx.send(true).unwrap();
+        let observed_record = Arc::clone(&record);
         let mut runner = Runner {
             record,
             control: control_rx,
@@ -1618,6 +2564,18 @@ mod tests {
             )
             .await;
         assert!(matches!(resolution, Resolution::Stopped));
+        let record = observed_record.lock().await;
+        assert_eq!(record.state, JobState::WaitingForApproval);
+        assert!(
+            matches!(
+                record.pending,
+                Some(Pending {
+                    kind: PendingKind::Approval { .. },
+                    ..
+                })
+            ),
+            "stop must preserve the approval park until terminalization"
+        );
     }
 
     #[tokio::test]
@@ -1637,6 +2595,129 @@ mod tests {
         assert_eq!(stored.id, "job_atomic");
         assert_eq!(stored.state, JobState::Queued);
         assert!(!artifacts.join(MANIFEST_TEMP_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn manifest_transaction_has_no_cancellable_await_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let record = record_in(
+            root.path().join("job_non_cancellable"),
+            "job_non_cancellable",
+            JobState::Stopped,
+        );
+        tokio::time::timeout(Duration::ZERO, try_persist(&record))
+            .await
+            .expect("the atomic manifest transaction must complete in one poll")
+            .expect("persist manifest");
+        let stored: JobRecord =
+            serde_json::from_slice(&std::fs::read(record.artifacts.join(MANIFEST_NAME)).unwrap())
+                .unwrap();
+        assert_eq!(stored.state, JobState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn durable_manifest_redacts_plan_and_prose_without_mutating_live_job() {
+        let root = tempfile::tempdir().unwrap();
+        let mut record = record_in(
+            root.path().join("job_private"),
+            "job_private",
+            JobState::Failed,
+        );
+        record.intent =
+            "inspect https://intent-user:intent-pass@app.test/?token=intent-query".into();
+        record.steps = vec![
+            Step::Open {
+                url: "https://open-user:open-pass@app.test/?access_token=open-query".into(),
+            },
+            Step::WaitUrl {
+                glob: "*#refresh_token=wait-fragment*".into(),
+            },
+            Step::Fill {
+                field: "Password".into(),
+                value: "typed-form-secret".into(),
+            },
+        ];
+        record.log.push(LogLine {
+            t_ms: 8,
+            text: "failed https://log-user:log-pass@app.test/#token=log-fragment".into(),
+        });
+        record.error = Some(
+            "request https://error-user:error-pass@app.test/?api_key=error-query failed".into(),
+        );
+        let live_steps = record.steps.clone();
+        let live_intent = record.intent.clone();
+
+        try_persist(&record)
+            .await
+            .expect("persist privacy-safe manifest");
+
+        assert_eq!(record.steps, live_steps, "Runner keeps the executable plan");
+        assert_eq!(record.intent, live_intent, "live status remains unchanged");
+        let encoded = std::fs::read_to_string(record.artifacts.join(MANIFEST_NAME)).unwrap();
+        for secret in [
+            "intent-user",
+            "intent-pass",
+            "intent-query",
+            "open-user",
+            "open-pass",
+            "open-query",
+            "wait-fragment",
+            "typed-form-secret",
+            "log-user",
+            "log-pass",
+            "log-fragment",
+            "error-user",
+            "error-pass",
+            "error-query",
+        ] {
+            assert!(
+                !encoded.contains(secret),
+                "job.json leaked {secret}: {encoded}"
+            );
+        }
+        assert!(encoded.contains(crate::redact::MASK));
+        assert!(
+            Step::Open {
+                url: "https://describe-user:describe-pass@app.test/?token=describe-secret".into()
+            }
+            .describe()
+            .contains(crate::redact::MASK),
+            "the live progress log must redact Open URLs at source"
+        );
+    }
+
+    #[test]
+    fn job_log_redacts_before_in_memory_and_tracing_ingest() {
+        let mut record = record_in(PathBuf::from("/unused"), "job_log", JobState::Running);
+        record.log(
+            "open https://trace-user:trace-pass@app.test/?token=trace-query with Bearer abcdefgh",
+        );
+        let stored = &record.log[0].text;
+        for secret in ["trace-user", "trace-pass", "trace-query", "abcdefgh"] {
+            assert!(
+                !stored.contains(secret),
+                "log line leaked {secret}: {stored}"
+            );
+        }
+        assert!(stored.contains(crate::redact::MASK));
+    }
+
+    #[test]
+    fn pre_feature_manifest_defaults_checkpoint_fields() {
+        let old = serde_json::json!({
+            "id": "job_old",
+            "intent": "old manifest",
+            "state": "succeeded",
+            "steps": [{"verb": "wait", "ms": 1}],
+            "cursor": 1,
+            "log": [],
+            "artifacts": "/tmp/job_old",
+            "created_ms": 7
+        });
+        let record: JobRecord = serde_json::from_value(old).expect("load old manifest");
+        assert!(!record.checkpoint_each_step);
+        assert!(record.checkpoints.is_empty());
+        assert_eq!(record.steps, vec![Step::Wait { ms: 1 }]);
     }
 
     #[tokio::test]
@@ -1708,6 +2789,241 @@ mod tests {
             })
             .expect("the corrupt original must be quarantined");
         assert_eq!(std::fs::read(preserved.path()).unwrap(), b"{not json");
+    }
+
+    #[tokio::test]
+    async fn restart_reconciles_a_published_checkpoint_from_the_manifest_crash_window() {
+        let root = tempfile::tempdir().unwrap();
+        let artifacts = root.path().join("job_checkpoint_crash");
+        let checkpoints = artifacts.join("checkpoints");
+        let final_path = checkpoints.join("after-step-001");
+        let partial_path = checkpoints.join(".after-step-002.partial-123-0");
+
+        let mut record = record_in(artifacts.clone(), "job_checkpoint_crash", JobState::Running);
+        record.checkpoint_each_step = true;
+        record.checkpoints.push(partial_path.clone()); // stale/torn legacy claim
+        try_persist(&record).await.unwrap();
+        write_committed_checkpoint(&final_path, "after-step-001", 10).await;
+        tokio::fs::create_dir_all(&partial_path).await.unwrap();
+        tokio::fs::write(partial_path.join("manifest.json"), b"{partial")
+            .await
+            .unwrap();
+
+        let loaded = load_previous(root.path()).await;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].state, JobState::Interrupted);
+        assert_eq!(loaded[0].cursor, 0, "a crash must not invent step success");
+        assert_eq!(loaded[0].checkpoints, vec![final_path.clone()]);
+        assert!(
+            partial_path.is_dir(),
+            "partial evidence was promoted or removed"
+        );
+        assert!(loaded[0].log.iter().any(|line| line
+            .text
+            .contains("checkpoint recovery found committed evidence")));
+
+        let durable: JobRecord = serde_json::from_slice(
+            &tokio::fs::read(artifacts.join(MANIFEST_NAME))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(durable.state, JobState::Interrupted);
+        assert_eq!(durable.checkpoints, vec![final_path]);
+
+        // Recovery is idempotent: a second daemon lifetime neither duplicates
+        // the path nor promotes the partial.
+        let reloaded = load_previous(root.path()).await;
+        assert_eq!(reloaded[0].checkpoints.len(), 1);
+        assert!(partial_path.is_dir());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_checkpoint_crash_boundary_is_reconciled_without_promoting_partials() {
+        if crate::browser::find().is_err() {
+            eprintln!(
+                "SKIP real_checkpoint_crash_boundary_is_reconciled_without_promoting_partials"
+            );
+            return;
+        }
+
+        let _slot = crate::browser::test_browser_slot();
+        let repetitions = std::env::var("BROW_JOB_CRASH_REPETITIONS")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("BROW_JOB_CRASH_REPETITIONS must be an integer")
+                    .clamp(1, 100)
+            })
+            .unwrap_or(3);
+        let jobs_root = tempfile::tempdir().unwrap();
+        let profile = tempfile::tempdir().unwrap();
+        let mut options = crate::browser::LaunchOptions::new(profile.path().join("profile"));
+        options.headless = crate::browser::Headless::New;
+        options.window_size = (320, 240);
+        let mut launched = crate::browser::launch(&options)
+            .await
+            .expect("launch Chromium");
+        let mut page = Page::create(Arc::clone(&launched.client), "about:blank")
+            .await
+            .expect("create job checkpoint page");
+        let fixture_installed = page
+            .evaluate(
+                "(() => { document.documentElement.innerHTML = \
+                 '<head><title>crash-window</title></head><body><main>crash-window evidence</main></body>'; \
+                 return document.body?.textContent === 'crash-window evidence'; })()",
+                false,
+            )
+            .await
+            .expect("install checkpoint fixture");
+        assert_eq!(
+            fixture_installed,
+            serde_json::Value::Bool(true),
+            "checkpoint fixture did not install into a real document"
+        );
+
+        let mut expected = Vec::new();
+        for iteration in 0..repetitions {
+            let id = format!("job_real_checkpoint_crash_{iteration}");
+            let artifacts = jobs_root.path().join(&id);
+            let mut record = record_in(artifacts.clone(), &id, JobState::Running);
+            record.checkpoint_each_step = true;
+            try_persist(&record)
+                .await
+                .expect("persist pre-checkpoint running state");
+            let record = Arc::new(Mutex::new(record));
+            let (_control_tx, control) = mpsc::channel(1);
+            let (_stop_tx, stop) = tokio::sync::watch::channel(false);
+            let runner = Runner {
+                record: Arc::clone(&record),
+                control,
+                stop,
+                action_gate: Arc::new(Mutex::new(())),
+                next_pending_id: 0,
+            };
+            let hold = checkpoint_publication_test_support::hold_next(&id);
+            let checkpoint_name = format!("crash-window-{iteration:03}");
+
+            // Dropping this future while the production path is paused models
+            // process death at the exact boundary: checkpoint::create already
+            // atomically renamed the final directory, but this Runner has not
+            // appended the path or attempted job.json persistence yet.
+            let published_path = {
+                let capture = runner.capture_job_checkpoint_with_policy_and_timeout(
+                    &mut page,
+                    checkpoint_name,
+                    WaitPolicy::Load,
+                    Duration::from_secs(5),
+                );
+                tokio::pin!(capture);
+                tokio::select! {
+                    path = tokio::time::timeout(
+                        Duration::from_secs(20),
+                        hold.wait_until_entered(),
+                    ) => path.expect("checkpoint did not reach the publication crash boundary"),
+                    result = &mut capture => {
+                        panic!("checkpoint escaped the crash barrier: {result:?}")
+                    }
+                }
+            };
+            drop(hold);
+
+            assert!(published_path.join("manifest.json").is_file());
+            assert!(
+                record.lock().await.checkpoints.is_empty(),
+                "the in-memory record advanced past the crash boundary"
+            );
+            let before_restart: JobRecord = serde_json::from_slice(
+                &tokio::fs::read(artifacts.join(MANIFEST_NAME))
+                    .await
+                    .expect("pre-crash job manifest"),
+            )
+            .expect("valid pre-crash job manifest");
+            assert_eq!(before_restart.state, JobState::Running);
+            assert!(
+                before_restart.checkpoints.is_empty(),
+                "job.json was persisted after the held publication"
+            );
+
+            // A complete-looking hidden partial is deliberately left beside the
+            // real final bundle. Recovery must never infer commitment from a
+            // dot-prefixed staging name or promote it into the inventory.
+            let partial_path = artifacts
+                .join("checkpoints")
+                .join(format!(".unpublished-{iteration:03}.partial-test"));
+            tokio::fs::create_dir(&partial_path)
+                .await
+                .expect("create interrupted partial directory");
+            for name in [
+                "snapshot.json",
+                "screenshot.png",
+                "console-errors.json",
+                "network-failures.json",
+                "manifest.json",
+            ] {
+                tokio::fs::copy(published_path.join(name), partial_path.join(name))
+                    .await
+                    .expect("copy committed evidence into partial fixture");
+            }
+            expected.push((id, published_path, partial_path));
+        }
+
+        let recovered = load_previous(jobs_root.path()).await;
+        assert_eq!(recovered.len(), repetitions);
+        for (id, final_path, partial_path) in &expected {
+            let record = recovered
+                .iter()
+                .find(|record| record.id == *id)
+                .expect("recover every interrupted job");
+            assert_eq!(record.state, JobState::Interrupted);
+            assert_eq!(
+                record
+                    .checkpoints
+                    .iter()
+                    .filter(|path| *path == final_path)
+                    .count(),
+                1,
+                "the real final checkpoint was omitted or duplicated"
+            );
+            assert_eq!(record.checkpoints, vec![final_path.clone()]);
+            assert!(
+                record.log.iter().any(|line| line
+                    .text
+                    .contains("checkpoint recovery found committed evidence")),
+                "the crash-window checkpoint was not explicitly reconciled"
+            );
+            assert!(
+                partial_path.is_dir(),
+                "recovery promoted or removed a partial"
+            );
+            assert!(!record.checkpoints.contains(partial_path));
+
+            let durable: JobRecord = serde_json::from_slice(
+                &tokio::fs::read(record.artifacts.join(MANIFEST_NAME))
+                    .await
+                    .expect("recovered job manifest"),
+            )
+            .expect("valid recovered job manifest");
+            assert_eq!(durable.state, JobState::Interrupted);
+            assert_eq!(durable.checkpoints, vec![final_path.clone()]);
+        }
+
+        // A second restart proves reconciliation is idempotent and still does
+        // not treat any staged path as committed evidence.
+        let reloaded = load_previous(jobs_root.path()).await;
+        for (id, final_path, partial_path) in &expected {
+            let record = reloaded
+                .iter()
+                .find(|record| record.id == *id)
+                .expect("reload every interrupted job");
+            assert_eq!(record.checkpoints, vec![final_path.clone()]);
+            assert!(partial_path.is_dir());
+            assert!(!record.checkpoints.contains(partial_path));
+        }
+
+        let _ = launched.child.kill();
+        let _ = launched.child.wait();
     }
 
     #[tokio::test]

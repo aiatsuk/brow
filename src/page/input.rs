@@ -59,7 +59,7 @@ impl MouseButton {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Point {
     pub x: f64,
     pub y: f64,
@@ -81,6 +81,99 @@ pub enum ActionError {
     Unstable,
     #[error("node semantics changed after pointer movement; no button press was sent")]
     TargetChanged,
+    #[error("{0}")]
+    InvalidChord(String),
+}
+
+/// What the Page layer can prove about the operation's trusted-input phase.
+///
+/// `Sent` requires an acknowledged action input (mousePressed, touchStart,
+/// keyDown, or the pointer-park move). A timeout/closed transport after enqueue
+/// is `Uncertain`; queue/shape rejection before enqueue is `Prevented`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchState {
+    Prevented,
+    Sent,
+    Uncertain,
+}
+
+impl DispatchState {
+    pub fn receipt_value(self) -> Option<bool> {
+        match self {
+            DispatchState::Prevented => Some(false),
+            DispatchState::Sent => Some(true),
+            DispatchState::Uncertain => None,
+        }
+    }
+
+    pub(crate) fn from_cdp_error(error: &CdpError) -> Self {
+        match error {
+            // Chromium acknowledged the command only to reject it. No trusted
+            // input side effect was accepted.
+            CdpError::Protocol { .. }
+            | CdpError::Overloaded { .. }
+            | CdpError::FrameTooLarge { .. }
+            | CdpError::OverloadedBytes { .. } => DispatchState::Prevented,
+            // The request may have left our process, but there is no browser
+            // acknowledgement from which delivery can be proved.
+            CdpError::Timeout { .. } | CdpError::Closed | CdpError::Decode { .. } => {
+                DispatchState::Uncertain
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DispatchTracker {
+    state: DispatchState,
+    event_floor: Option<u64>,
+}
+
+impl Default for DispatchTracker {
+    fn default() -> Self {
+        Self {
+            state: DispatchState::Prevented,
+            event_floor: None,
+        }
+    }
+}
+
+impl DispatchTracker {
+    pub(crate) fn state(self) -> DispatchState {
+        self.state
+    }
+
+    pub(crate) fn note_event_floor(&mut self, event_sequence: u64) {
+        self.event_floor.get_or_insert(event_sequence);
+    }
+
+    pub(crate) fn event_floor(self) -> Option<u64> {
+        self.event_floor
+    }
+
+    fn acknowledged(&mut self) {
+        self.state = DispatchState::Sent;
+    }
+
+    fn action_error(&mut self, error: &CdpError) {
+        if self.state == DispatchState::Sent {
+            return;
+        }
+        self.state = DispatchState::from_cdp_error(error);
+    }
+
+    /// Preparatory pointer movement is not the click itself. A browser rejection
+    /// still proves no click was sent; transport loss after enqueue cannot prove
+    /// whether even the preparatory trusted event ran.
+    pub(crate) fn preparatory_error(&mut self, error: &CdpError) {
+        if matches!(
+            error,
+            CdpError::Timeout { .. } | CdpError::Closed | CdpError::Decode { .. }
+        ) {
+            self.state = DispatchState::Uncertain;
+        }
+    }
 }
 
 /// Geometric centre of a node's first content quad, in viewport coordinates.
@@ -301,6 +394,17 @@ pub async fn move_pointer(
     point: Point,
     modifiers: i64,
 ) -> Result<(), CdpError> {
+    let mut dispatch = DispatchTracker::default();
+    move_pointer_tracked(client, session_id, point, modifiers, &mut dispatch).await
+}
+
+pub(crate) async fn move_pointer_tracked(
+    client: &CdpClient,
+    session_id: &str,
+    point: Point,
+    modifiers: i64,
+    dispatch: &mut DispatchTracker,
+) -> Result<(), CdpError> {
     let base = json!({
         "x": point.x, "y": point.y,
         "modifiers": modifiers,
@@ -311,10 +415,47 @@ pub async fn move_pointer(
     moved["type"] = json!("mouseMoved");
     moved["button"] = json!("none");
     moved["buttons"] = json!(0);
-    client
-        .call_on(session_id, "Input.dispatchMouseEvent", moved)
-        .await?;
+    track_action_call(
+        dispatch,
+        client
+            .call_on(session_id, "Input.dispatchMouseEvent", moved)
+            .await,
+    )?;
     Ok(())
+}
+
+/// Preparatory movement for a click. A successful hover is not proof that the
+/// requested click was dispatched, but ambiguous transport delivery must still
+/// be retained because page hover handlers may have run.
+pub(crate) async fn move_pointer_preparatory(
+    client: &CdpClient,
+    session_id: &str,
+    point: Point,
+    modifiers: i64,
+    dispatch: &mut DispatchTracker,
+) -> Result<(), CdpError> {
+    let result = client
+        .call_on(
+            session_id,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseMoved",
+                "x": point.x,
+                "y": point.y,
+                "button": "none",
+                "buttons": 0,
+                "modifiers": modifiers,
+                "pointerType": "mouse",
+            }),
+        )
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            dispatch.preparatory_error(&error);
+            Err(error)
+        }
+    }
 }
 
 /// Presses/releases at a point after the caller has moved and revalidated the
@@ -345,6 +486,29 @@ pub async fn click_once_at(
     click_ordinal: i64,
     modifiers: i64,
 ) -> Result<(), CdpError> {
+    let mut dispatch = DispatchTracker::default();
+    click_once_at_tracked(
+        client,
+        session_id,
+        point,
+        button,
+        click_ordinal,
+        modifiers,
+        &mut dispatch,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn click_once_at_tracked(
+    client: &CdpClient,
+    session_id: &str,
+    point: Point,
+    button: MouseButton,
+    click_ordinal: i64,
+    modifiers: i64,
+    dispatch: &mut DispatchTracker,
+) -> Result<(), CdpError> {
     let base = json!({
         "x": point.x, "y": point.y,
         "modifiers": modifiers,
@@ -356,19 +520,41 @@ pub async fn click_once_at(
     down["button"] = json!(button.cdp());
     down["buttons"] = json!(button.mask());
     down["clickCount"] = json!(click_ordinal);
-    client
-        .call_on(session_id, "Input.dispatchMouseEvent", down)
-        .await?;
+    track_action_call(
+        dispatch,
+        client
+            .call_on(session_id, "Input.dispatchMouseEvent", down)
+            .await,
+    )?;
 
     let mut up = base;
     up["type"] = json!("mouseReleased");
     up["button"] = json!(button.cdp());
     up["buttons"] = json!(0);
     up["clickCount"] = json!(click_ordinal);
-    client
-        .call_on(session_id, "Input.dispatchMouseEvent", up)
-        .await?;
+    track_action_call(
+        dispatch,
+        client
+            .call_on(session_id, "Input.dispatchMouseEvent", up)
+            .await,
+    )?;
     Ok(())
+}
+
+pub(crate) fn track_action_call(
+    dispatch: &mut DispatchTracker,
+    result: Result<Value, CdpError>,
+) -> Result<Value, CdpError> {
+    match result {
+        Ok(value) => {
+            dispatch.acknowledged();
+            Ok(value)
+        }
+        Err(error) => {
+            dispatch.action_error(&error);
+            Err(error)
+        }
+    }
 }
 
 /// Moves the pointer without pressing, so hover styles and menus engage.
@@ -488,10 +674,39 @@ async fn touch(
 
 /// A finger down and up in the same place.
 pub async fn tap(client: &CdpClient, session_id: &str, point: Point) -> Result<(), CdpError> {
-    touch(client, session_id, "touchStart", vec![touch_point(point)]).await?;
+    let mut dispatch = DispatchTracker::default();
+    tap_tracked(client, session_id, point, &mut dispatch).await
+}
+
+pub(crate) async fn tap_tracked(
+    client: &CdpClient,
+    session_id: &str,
+    point: Point,
+    dispatch: &mut DispatchTracker,
+) -> Result<(), CdpError> {
+    track_action_call(
+        dispatch,
+        client
+            .call_on(
+                session_id,
+                "Input.dispatchTouchEvent",
+                json!({"type": "touchStart", "touchPoints": [touch_point(point)]}),
+            )
+            .await,
+    )?;
     // `touchEnd` carries the points that are *still* down, so a single-finger tap
     // ends with an empty list.
-    touch(client, session_id, "touchEnd", vec![]).await
+    track_action_call(
+        dispatch,
+        client
+            .call_on(
+                session_id,
+                "Input.dispatchTouchEvent",
+                json!({"type": "touchEnd", "touchPoints": []}),
+            )
+            .await,
+    )?;
+    Ok(())
 }
 
 /// Holds a finger down long enough to trigger a long-press handler.
@@ -809,10 +1024,16 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-/// Presses and releases one key, honouring modifier chords.
-pub async fn press_key(client: &CdpClient, session_id: &str, chord: &str) -> Result<(), CdpError> {
-    let (mods, name) = parse_chord(chord);
+struct ResolvedChord {
+    modifiers: i64,
+    key: String,
+    code: String,
+    vk: i64,
+    text: Option<String>,
+}
 
+fn resolve_chord(chord: &str) -> Result<ResolvedChord, ActionError> {
+    let (mods, name) = parse_chord(chord);
     let (key, code, vk, text) = match lookup_key(&name) {
         Some(spec) => (
             spec.key.to_string(),
@@ -823,15 +1044,10 @@ pub async fn press_key(client: &CdpClient, session_id: &str, chord: &str) -> Res
         None => {
             let mut chars = name.chars();
             let (Some(ch), None) = (chars.next(), chars.next()) else {
-                return Err(CdpError::Protocol {
-                    method: "Input.dispatchKeyEvent".into(),
-                    code: 0,
-                    message: format!(
-                        "unknown key {name:?}: use a single character or one of \
-                         Enter/Tab/Escape/Backspace/Delete/Arrow*/Home/End/PageUp/PageDown/Space"
-                    ),
-                    data: None,
-                });
+                return Err(ActionError::InvalidChord(format!(
+                    "unknown key {name:?}: use a single character or one of \
+                     Enter/Tab/Escape/Backspace/Delete/Arrow*/Home/End/PageUp/PageDown/Space"
+                )));
             };
             let upper = ch.to_ascii_uppercase();
             let code = if ch.is_ascii_alphabetic() {
@@ -846,6 +1062,38 @@ pub async fn press_key(client: &CdpClient, session_id: &str, chord: &str) -> Res
             (ch.to_string(), code, upper as i64, text)
         }
     };
+    Ok(ResolvedChord {
+        modifiers: mods,
+        key,
+        code,
+        vk,
+        text,
+    })
+}
+
+/// Presses and releases one key, honouring modifier chords.
+pub async fn press_key(
+    client: &CdpClient,
+    session_id: &str,
+    chord: &str,
+) -> Result<(), ActionError> {
+    let mut dispatch = DispatchTracker::default();
+    press_key_tracked(client, session_id, chord, &mut dispatch).await
+}
+
+pub(crate) async fn press_key_tracked(
+    client: &CdpClient,
+    session_id: &str,
+    chord: &str,
+    dispatch: &mut DispatchTracker,
+) -> Result<(), ActionError> {
+    let ResolvedChord {
+        modifiers: mods,
+        key,
+        code,
+        vk,
+        text,
+    } = resolve_chord(chord)?;
 
     let mut down = json!({
         "type": if text.is_some() { "keyDown" } else { "rawKeyDown" },
@@ -859,24 +1107,32 @@ pub async fn press_key(client: &CdpClient, session_id: &str, chord: &str) -> Res
         down["text"] = json!(text);
         down["unmodifiedText"] = json!(text);
     }
-    client
-        .call_on(session_id, "Input.dispatchKeyEvent", down)
-        .await?;
+    track_action_call(
+        dispatch,
+        client
+            .call_on(session_id, "Input.dispatchKeyEvent", down)
+            .await,
+    )
+    .map_err(ActionError::Cdp)?;
 
-    client
-        .call_on(
-            session_id,
-            "Input.dispatchKeyEvent",
-            json!({
-                "type": "keyUp",
-                "key": key,
-                "code": code,
-                "windowsVirtualKeyCode": vk,
-                "nativeVirtualKeyCode": vk,
-                "modifiers": mods,
-            }),
-        )
-        .await?;
+    track_action_call(
+        dispatch,
+        client
+            .call_on(
+                session_id,
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyUp",
+                    "key": key,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "nativeVirtualKeyCode": vk,
+                    "modifiers": mods,
+                }),
+            )
+            .await,
+    )
+    .map_err(ActionError::Cdp)?;
     Ok(())
 }
 
@@ -886,7 +1142,7 @@ pub async fn type_text_by_key(
     session_id: &str,
     text: &str,
     delay: Duration,
-) -> Result<(), CdpError> {
+) -> Result<(), ActionError> {
     for ch in text.chars() {
         press_key(client, session_id, &ch.to_string()).await?;
         if !delay.is_zero() {
@@ -946,5 +1202,41 @@ mod tests {
         assert_eq!(lookup_key("Esc").unwrap().key, "Escape");
         assert_eq!(lookup_key("Up").unwrap().key, "ArrowUp");
         assert!(lookup_key("F13").is_none());
+    }
+
+    #[test]
+    fn invalid_chord_is_rejected_before_any_input_dispatch() {
+        assert!(matches!(
+            resolve_chord("DefinitelyNotAKey"),
+            Err(ActionError::InvalidChord(_))
+        ));
+        assert!(resolve_chord("Ctrl+K").is_ok());
+    }
+
+    #[test]
+    fn dispatch_tracker_distinguishes_rejection_ambiguity_and_prior_ack() {
+        let protocol = CdpError::Protocol {
+            method: "Input.dispatchKeyEvent".into(),
+            code: -32602,
+            message: "invalid parameters".into(),
+            data: None,
+        };
+        let timeout = CdpError::Timeout {
+            method: "Input.dispatchKeyEvent".into(),
+            timeout: Duration::from_millis(10),
+        };
+
+        let mut rejected = DispatchTracker::default();
+        rejected.action_error(&protocol);
+        assert_eq!(rejected.state(), DispatchState::Prevented);
+
+        let mut ambiguous = DispatchTracker::default();
+        ambiguous.action_error(&timeout);
+        assert_eq!(ambiguous.state(), DispatchState::Uncertain);
+
+        let mut partial = DispatchTracker::default();
+        partial.acknowledged();
+        partial.action_error(&timeout);
+        assert_eq!(partial.state(), DispatchState::Sent);
     }
 }

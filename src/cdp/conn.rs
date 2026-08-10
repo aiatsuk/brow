@@ -154,6 +154,8 @@ impl Drop for EventBytePermit {
 /// permit is released only after the ring and every consumer drop the event.
 #[derive(Debug)]
 pub struct CdpEventHandle {
+    /// Monotonic within one CDP connection, including synthetic gap markers.
+    sequence: u64,
     event: CdpEvent,
     // Synthetic overflow markers are tiny and intentionally do not consume the
     // retained-event budget. Real browser events always carry a permit.
@@ -168,7 +170,24 @@ impl Deref for CdpEventHandle {
     }
 }
 
+impl CdpEventHandle {
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
 pub type CdpEventReceiver = broadcast::Receiver<Arc<CdpEventHandle>>;
+
+fn subscribe_at_event_boundary(
+    events: &broadcast::Sender<Arc<CdpEventHandle>>,
+    latest_published_event_sequence: &AtomicU64,
+    event_publish_gate: &Mutex<()>,
+) -> (CdpEventReceiver, u64) {
+    let _publish = event_publish_gate.lock().expect("CDP event publish gate");
+    let receiver = events.subscribe();
+    let watermark = latest_published_event_sequence.load(Ordering::Acquire);
+    (receiver, watermark)
+}
 
 type Waiter = oneshot::Sender<Result<Value, CdpError>>;
 
@@ -185,11 +204,22 @@ fn publish_event(
     event: CdpEvent,
     frame_size: usize,
     dropped_events: &mut u64,
+    next_event_sequence: &mut u64,
+    latest_published_event_sequence: &AtomicU64,
 ) -> bool {
+    let sequence = *next_event_sequence;
+    *next_event_sequence = next_event_sequence
+        .checked_add(1)
+        .expect("CDP event sequence exhausted");
+    // Publish the cursor before the broadcast send. A subscriber that starts
+    // between these operations either receives the event or includes its
+    // sequence in the subscription watermark, so no event can fall in a gap.
+    latest_published_event_sequence.store(sequence, Ordering::Release);
     if let Some(permit) = event_budget.try_acquire(frame_size) {
         // Err just means nobody is subscribed right now. The returned Arc is
         // dropped immediately and releases its permit.
         let _ = events.send(Arc::new(CdpEventHandle {
+            sequence,
             event,
             _permit: Some(permit),
         }));
@@ -215,6 +245,7 @@ fn publish_event(
     // to every subscriber, repeated markers advance the broadcast ring and evict
     // old retained events so their permits can be released.
     let _ = events.send(Arc::new(CdpEventHandle {
+        sequence,
         event: gap,
         _permit: None,
     }));
@@ -335,6 +366,10 @@ pub struct CdpClient {
     next_id: AtomicU64,
     state: SharedState,
     events: broadcast::Sender<Arc<CdpEventHandle>>,
+    latest_published_event_sequence: Arc<AtomicU64>,
+    /// Serializes the tiny publish/subscribe boundary so a watermark never
+    /// claims an event that the newly-created receiver can still observe.
+    event_publish_gate: Arc<Mutex<()>>,
 }
 
 impl CdpClient {
@@ -345,6 +380,8 @@ impl CdpClient {
         // mutations. Slow subscribers lag rather than block the router.
         let (events, _) = broadcast::channel(4096);
         let event_budget = EventBudget::new(EVENT_RETAINED_BYTE_CAPACITY);
+        let latest_published_event_sequence = Arc::new(AtomicU64::new(0));
+        let event_publish_gate = Arc::new(Mutex::new(()));
         let client = Arc::new(Self {
             tx,
             next_id: AtomicU64::new(1),
@@ -353,11 +390,14 @@ impl CdpClient {
                 pending: HashMap::new(),
             })),
             events: events.clone(),
+            latest_published_event_sequence: Arc::clone(&latest_published_event_sequence),
+            event_publish_gate: Arc::clone(&event_publish_gate),
         });
 
         let state = Arc::clone(&client.state);
         tokio::spawn(async move {
             let mut dropped_events = 0u64;
+            let mut next_event_sequence = 1u64;
             while let Some(frame) = rx.recv().await {
                 let frame_size = frame.len();
                 let mut msg: Value = match serde_json::from_slice(&frame) {
@@ -415,12 +455,15 @@ impl CdpClient {
                             .and_then(Value::as_str)
                             .map(str::to_string),
                     };
+                    let _publish = event_publish_gate.lock().expect("CDP event publish gate");
                     let retained = publish_event(
                         &events,
                         &event_budget,
                         event,
                         frame_size,
                         &mut dropped_events,
+                        &mut next_event_sequence,
+                        latest_published_event_sequence.as_ref(),
                     );
                     if retained {
                         continue;
@@ -525,6 +568,20 @@ impl CdpClient {
     /// Subscribes to the event stream from this moment on.
     pub fn subscribe(&self) -> CdpEventReceiver {
         self.events.subscribe()
+    }
+
+    /// Subscribes without a publish gap and returns the last event sequence that
+    /// must already be reflected by stateful consumers before evidence is used.
+    pub fn subscribe_with_watermark(&self) -> (CdpEventReceiver, u64) {
+        subscribe_at_event_boundary(
+            &self.events,
+            self.latest_published_event_sequence.as_ref(),
+            self.event_publish_gate.as_ref(),
+        )
+    }
+
+    pub fn latest_published_event_sequence(&self) -> u64 {
+        self.latest_published_event_sequence.load(Ordering::Acquire)
     }
 
     /// Waits for the first event matching `pred`.
@@ -736,6 +793,7 @@ mod tests {
     fn retained_event_budget_follows_all_arc_clones() {
         let budget = EventBudget::new(8);
         let retained = Arc::new(CdpEventHandle {
+            sequence: 1,
             event: CdpEvent {
                 method: "Test.event".into(),
                 params: json!({"value": 1}),
@@ -765,6 +823,8 @@ mod tests {
         let (events, _) = broadcast::channel(2);
         let mut receiver = events.subscribe();
         let mut dropped = 0;
+        let mut next_sequence = 1;
+        let latest_sequence = AtomicU64::new(0);
         let event = |method: &str| CdpEvent {
             method: method.into(),
             params: json!({}),
@@ -777,6 +837,8 @@ mod tests {
             event("Test.first"),
             6,
             &mut dropped,
+            &mut next_sequence,
+            &latest_sequence,
         ));
         assert!(!publish_event(
             &events,
@@ -784,6 +846,8 @@ mod tests {
             event("Test.droppedOne"),
             3,
             &mut dropped,
+            &mut next_sequence,
+            &latest_sequence,
         ));
         // The second marker overwrites the retained first event in the two-slot
         // ring. That eviction must release its byte permit even though this
@@ -794,6 +858,8 @@ mod tests {
             event("Test.droppedTwo"),
             3,
             &mut dropped,
+            &mut next_sequence,
+            &latest_sequence,
         ));
         assert_eq!(budget.available(), 8);
         assert!(publish_event(
@@ -802,7 +868,11 @@ mod tests {
             event("Test.recovered"),
             3,
             &mut dropped,
+            &mut next_sequence,
+            &latest_sequence,
         ));
+        assert_eq!(next_sequence, 5);
+        assert_eq!(latest_sequence.load(Ordering::Acquire), 4);
 
         assert!(matches!(
             receiver.recv().await,
@@ -812,9 +882,71 @@ mod tests {
         let mut seen_recovery = false;
         while let Ok(received) = receiver.try_recv() {
             seen_gap |= received.method == EVENT_STREAM_GAP_METHOD;
-            seen_recovery |= received.method == "Test.recovered";
+            if received.method == "Test.recovered" {
+                assert_eq!(received.sequence(), 4);
+                seen_recovery = true;
+            }
         }
         assert!(seen_gap, "overflow must be represented in the event stream");
         assert!(seen_recovery, "real events must resume after ring eviction");
+    }
+
+    #[test]
+    fn subscription_watermark_atomically_partitions_published_and_queued_events() {
+        let budget = EventBudget::new(1024);
+        let (events, _) = broadcast::channel(8);
+        let latest_sequence = AtomicU64::new(0);
+        let publish_gate = Mutex::new(());
+        let mut dropped = 0;
+        let mut next_sequence = 1;
+        let event = |method: &str| CdpEvent {
+            method: method.into(),
+            params: json!({}),
+            session_id: Some("session-1".into()),
+        };
+
+        // Publish-first: the watermark includes sequence 1 and the later
+        // subscriber cannot receive it.
+        {
+            let _publish = publish_gate.lock().unwrap();
+            assert!(publish_event(
+                &events,
+                &budget,
+                event("Test.beforeSubscription"),
+                32,
+                &mut dropped,
+                &mut next_sequence,
+                &latest_sequence,
+            ));
+        }
+        let (mut after_first, first_watermark) =
+            subscribe_at_event_boundary(&events, &latest_sequence, &publish_gate);
+        assert_eq!(first_watermark, 1);
+        assert!(matches!(
+            after_first.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        // Subscribe-first: the watermark excludes sequence 2 and the receiver
+        // must observe it strictly above its floor. The shared gate makes these
+        // the only two possible orders even under a real concurrent interleave.
+        let (mut before_second, second_watermark) =
+            subscribe_at_event_boundary(&events, &latest_sequence, &publish_gate);
+        assert_eq!(second_watermark, 1);
+        {
+            let _publish = publish_gate.lock().unwrap();
+            assert!(publish_event(
+                &events,
+                &budget,
+                event("Test.afterSubscription"),
+                32,
+                &mut dropped,
+                &mut next_sequence,
+                &latest_sequence,
+            ));
+        }
+        let received = before_second.try_recv().expect("queued event");
+        assert_eq!(received.sequence(), 2);
+        assert!(received.sequence() > second_watermark);
     }
 }

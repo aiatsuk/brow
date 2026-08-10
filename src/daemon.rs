@@ -13,21 +13,23 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::browser::{self, launch::Headless, LaunchOptions, Launched};
-use crate::ipc::{Hello, Request, Response, ShotTarget, Target, PROTOCOL_VERSION};
+use crate::checkpoint::{self, CheckpointOptions};
+use crate::ipc::{
+    encode_frame, ClickButton, Hello, IpcFrameEncodeError, IpcFrameReadError, IpcFrameReader,
+    Request, Response, ShotTarget, Target, WaitPolicy, MAX_IPC_FRAME_BYTES, PROTOCOL_VERSION,
+};
 use crate::jobs;
 use crate::page::{
-    capture, ImageFormat, MouseButton, Page, PageError, Point, PointTarget, ScreenshotTarget,
+    capture, DispatchState, ImageFormat, MouseButton, Page, PageError, Point, PointTarget,
+    ScreenshotTarget,
 };
 use crate::paths;
-
-const MAX_CLICK_COUNT: i64 = 10;
-const MAX_GESTURE_DURATION_MS: u64 = 120_000;
-const MAX_GESTURE_STEPS: u32 = 1_000;
 
 struct Session {
     launched: Launched,
@@ -322,37 +324,129 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Daemon>) -> anyhow::Result<
     }
 
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let mut frames = IpcFrameReader::new(BufReader::new(read_half));
 
     let hello = Hello {
         brow: env!("CARGO_PKG_VERSION").to_string(),
         protocol: PROTOCOL_VERSION,
         pid: std::process::id(),
     };
-    write_half
-        .write_all(format!("{}\n", serde_json::to_string(&hello)?).as_bytes())
-        .await?;
+    write_half.write_all(&encode_frame(&hello)?).await?;
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
+    loop {
+        let frame = match frames.read_frame().await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return Ok(()),
+            Err(IpcFrameReadError::TooLarge { .. }) => {
+                write_response(&mut write_half, &oversized_request_response()).await?;
+                return Ok(());
+            }
+            Err(IpcFrameReadError::Unterminated) => {
+                write_response(
+                    &mut write_half,
+                    &protocol_error_response(
+                        "ipc_unterminated_frame",
+                        "IPC request ended before its terminating newline",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(IpcFrameReadError::Io(error)) => return Err(error.into()),
+        };
+        if frame.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let response = match serde_json::from_str::<Request>(&line) {
+        let response = match serde_json::from_slice::<Request>(&frame) {
+            Ok(req) if req.cancel_on_disconnect() => {
+                let completed = {
+                    let dispatch = daemon.dispatch(req);
+                    tokio::pin!(dispatch);
+                    tokio::select! {
+                        // Buffered protocol activity wins deterministically over
+                        // a wait completing in the same scheduler turn.
+                        biased;
+                        activity = frames.wait_for_activity() => {
+                            match activity {
+                                Ok(false) => return Ok(()),
+                                Ok(true) => None,
+                                Err(error) => return Err(error.into()),
+                            }
+                        }
+                        response = &mut dispatch => Some(response),
+                    }
+                };
+                let Some(response) = completed else {
+                    // `dispatch` is out of scope here, so its SessionGuard and
+                    // any CDP PendingRequest have been released before I/O.
+                    write_response(
+                        &mut write_half,
+                        &protocol_error_response(
+                            "ipc_pipelining_not_supported",
+                            "sent another IPC frame while a typed wait was still executing",
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                response
+            }
             Ok(req) => daemon.dispatch(req).await,
             Err(e) => Response::error_hint(
                 format!("unparseable request: {e}"),
                 "this is a bug in the brow CLI, or a version mismatch — try `brow daemon restart`",
             ),
         };
-        write_half
-            .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-            .await?;
+        write_response(&mut write_half, &response).await?;
     }
+}
+
+fn protocol_error_response(code: &str, message: &str) -> Response {
+    Response::error_data(
+        message,
+        "send one newline-terminated request at a time using a matching brow CLI",
+        json!({
+            "code": code,
+            "max_frame_bytes": MAX_IPC_FRAME_BYTES,
+            "dispatched": false,
+        }),
+    )
+}
+
+fn oversized_request_response() -> Response {
+    protocol_error_response(
+        "ipc_frame_too_large",
+        &format!("IPC request frame exceeds the maximum of {MAX_IPC_FRAME_BYTES} bytes"),
+    )
+}
+
+async fn write_response(writer: &mut OwnedWriteHalf, response: &Response) -> anyhow::Result<()> {
+    let frame = match encode_frame(response) {
+        Ok(frame) => frame,
+        Err(IpcFrameEncodeError::TooLarge { size, max }) => {
+            let fallback = Response::error_data(
+                format!("daemon response is {size} bytes; IPC maximum is {max} bytes"),
+                "narrow the request; large artifacts must be written to files, not returned inline",
+                json!({
+                    "code": "ipc_response_too_large",
+                    "response_bytes": size,
+                    "max_frame_bytes": max,
+                }),
+            );
+            encode_frame(&fallback).expect("fixed IPC oversize response fits the wire limit")
+        }
+        Err(IpcFrameEncodeError::Json(error)) => return Err(error.into()),
+    };
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
     Ok(())
 }
 
 impl Daemon {
     async fn dispatch(&self, req: Request) -> Response {
+        if let Err(error) = req.validate() {
+            return self.invalid_request_response(&req, error.to_string()).await;
+        }
         if matches!(&req, Request::Shutdown) {
             let _exclusive = self.lifecycle.write().await;
             let already = self.shutting_down.swap(true, Ordering::AcqRel);
@@ -494,27 +588,46 @@ impl Daemon {
                 count,
                 modifiers,
                 force,
+                wait,
+                timeout_ms,
             } => {
-                if !(1..=MAX_CLICK_COUNT).contains(&count) {
-                    return Response::error(format!(
-                        "click count must be between 1 and {MAX_CLICK_COUNT}, got {count}"
-                    ));
-                }
                 let mut s = match self.lock_session(&session).await {
                     Ok(s) => s,
                     Err(response) => return response,
                 };
-                let button = parse_button(&button);
+                let button = match parse_button(&button) {
+                    Ok(button) => button,
+                    Err(error) => {
+                        return Response::error_data(
+                            format!("invalid request: {error}"),
+                            "fix the request parameters; the daemon rejected it before browser dispatch",
+                            json!({"code": "invalid_request", "dispatched": false}),
+                        )
+                    }
+                };
                 match target {
                     Target::Ref { node_ref } => {
                         match s
                             .page
-                            .click(&node_ref, button, count, modifiers, force)
+                            .click_with_wait(
+                                &node_ref,
+                                button,
+                                count,
+                                modifiers,
+                                force,
+                                wait,
+                                Duration::from_millis(timeout_ms),
+                            )
                             .await
                         {
-                            Ok(p) => Response::ok_text(
-                                json!({"clicked": node_ref, "x": p.x, "y": p.y}),
-                                format!("clicked {node_ref} at {:.0},{:.0}", p.x, p.y),
+                            Ok((p, receipt)) => Response::ok_text(
+                                json!({"clicked": node_ref, "x": p.x, "y": p.y, "receipt": receipt}),
+                                format!(
+                                    "clicked {node_ref} at {:.0},{:.0} · {}",
+                                    p.x,
+                                    p.y,
+                                    receipt.outcome.label()
+                                ),
                             ),
                             Err(e) => page_error(e),
                         }
@@ -522,12 +635,19 @@ impl Daemon {
                     Target::Point { x, y } => {
                         match s
                             .page
-                            .click_at(Point { x, y }, button, count, modifiers)
+                            .click_at_with_wait(
+                                Point { x, y },
+                                button,
+                                count,
+                                modifiers,
+                                wait,
+                                Duration::from_millis(timeout_ms),
+                            )
                             .await
                         {
-                            Ok(()) => Response::ok_text(
-                                json!({"x": x, "y": y}),
-                                format!("clicked {x:.0},{y:.0}"),
+                            Ok(receipt) => Response::ok_text(
+                                json!({"x": x, "y": y, "receipt": receipt}),
+                                format!("clicked {x:.0},{y:.0} · {}", receipt.outcome.label()),
                             ),
                             Err(e) => page_error(e),
                         }
@@ -563,15 +683,25 @@ impl Daemon {
                     Err(e) => page_error(e),
                 }
             }
-            Request::Press { session, chord } => {
+            Request::Press {
+                session,
+                chord,
+                wait,
+                timeout_ms,
+            } => {
                 let s = match self.lock_session(&session).await {
                     Ok(s) => s,
                     Err(response) => return response,
                 };
-                match s.page.press(&chord).await {
-                    Ok(()) => {
-                        Response::ok_text(json!({"pressed": chord}), format!("pressed {chord}"))
-                    }
+                match s
+                    .page
+                    .press_with_wait(&chord, wait, Duration::from_millis(timeout_ms))
+                    .await
+                {
+                    Ok(receipt) => Response::ok_text(
+                        json!({"pressed": chord, "receipt": receipt}),
+                        format!("pressed {chord} · {}", receipt.outcome.label()),
+                    ),
                     Err(e) => page_error(e),
                 }
             }
@@ -680,7 +810,11 @@ impl Daemon {
                 intent,
                 steps,
                 headless,
-            } => self.job_start(intent, steps, headless).await,
+                checkpoint_each_step,
+            } => {
+                self.job_start(intent, steps, headless, checkpoint_each_step)
+                    .await
+            }
             Request::JobList => {
                 let mut rows = Vec::new();
                 let mut text = String::new();
@@ -742,6 +876,7 @@ impl Daemon {
                             "pending": r.pending,
                             "error": r.error,
                             "artifacts": r.artifacts,
+                            "checkpoints": r.checkpoints,
                             "log": tail,
                             "log_total": r.log.len(),
                         }),
@@ -858,16 +993,25 @@ impl Daemon {
                     text,
                 )
             }
-            Request::Tap { session, target } => {
+            Request::Tap {
+                session,
+                target,
+                wait,
+                timeout_ms,
+            } => {
                 let mut s = match self.lock_session(&session).await {
                     Ok(s) => s,
                     Err(response) => return response,
                 };
                 let target = point_target(target);
-                match s.page.tap(&target).await {
-                    Ok(p) => Response::ok_text(
-                        json!({"x": p.x, "y": p.y}),
-                        format!("tapped {:.0},{:.0}", p.x, p.y),
+                match s
+                    .page
+                    .tap_with_wait(&target, wait, Duration::from_millis(timeout_ms))
+                    .await
+                {
+                    Ok((p, receipt)) => Response::ok_text(
+                        json!({"x": p.x, "y": p.y, "receipt": receipt}),
+                        format!("tapped {:.0},{:.0} · {}", p.x, p.y, receipt.outcome.label()),
                     ),
                     Err(e) => page_error(e),
                 }
@@ -877,11 +1021,6 @@ impl Daemon {
                 target,
                 duration_ms,
             } => {
-                if duration_ms > MAX_GESTURE_DURATION_MS {
-                    return Response::error(format!(
-                        "gesture duration must be at most {MAX_GESTURE_DURATION_MS}ms"
-                    ));
-                }
                 let mut s = match self.lock_session(&session).await {
                     Ok(s) => s,
                     Err(response) => return response,
@@ -906,13 +1045,6 @@ impl Daemon {
                 duration_ms,
                 steps,
             } => {
-                if duration_ms > MAX_GESTURE_DURATION_MS
-                    || !(2..=MAX_GESTURE_STEPS).contains(&steps)
-                {
-                    return Response::error(format!(
-                        "swipe requires duration <= {MAX_GESTURE_DURATION_MS}ms and 2..={MAX_GESTURE_STEPS} steps"
-                    ));
-                }
                 let mut s = match self.lock_session(&session).await {
                     Ok(s) => s,
                     Err(response) => return response,
@@ -959,13 +1091,6 @@ impl Daemon {
                 duration_ms,
                 steps,
             } => {
-                if duration_ms > MAX_GESTURE_DURATION_MS
-                    || !(2..=MAX_GESTURE_STEPS).contains(&steps)
-                {
-                    return Response::error(format!(
-                        "drag requires duration <= {MAX_GESTURE_DURATION_MS}ms and 2..={MAX_GESTURE_STEPS} steps"
-                    ));
-                }
                 let mut s = match self.lock_session(&session).await {
                     Ok(s) => s,
                     Err(response) => return response,
@@ -981,6 +1106,170 @@ impl Daemon {
                         format!("dragged {:.0},{:.0} → {:.0},{:.0}", a.x, a.y, b.x, b.y),
                     ),
                     Err(e) => page_error(e),
+                }
+            }
+            Request::Wait {
+                session,
+                conditions,
+                timeout_ms,
+                quiet_ms,
+            } => {
+                let s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
+                };
+                tracing::debug!(session, "typed wait acquired session");
+                match s
+                    .page
+                    .wait_for_conditions(
+                        &conditions,
+                        Duration::from_millis(timeout_ms),
+                        Duration::from_millis(quiet_ms),
+                    )
+                    .await
+                {
+                    Ok(receipt) => Response::ok_text(
+                        json!({"receipt": receipt}),
+                        format!("wait satisfied · {}", receipt.outcome.label()),
+                    ),
+                    Err(e) => page_error(e),
+                }
+            }
+            Request::Back {
+                session,
+                wait,
+                timeout_ms,
+            } => {
+                let s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
+                };
+                match s
+                    .page
+                    .traverse_history(-1, wait, Duration::from_millis(timeout_ms))
+                    .await
+                {
+                    Ok(receipt) => Response::ok_text(
+                        json!({"receipt": receipt}),
+                        format!("back → {} · {}", receipt.final_url, receipt.outcome.label()),
+                    ),
+                    Err(e) => page_error(e),
+                }
+            }
+            Request::Forward {
+                session,
+                wait,
+                timeout_ms,
+            } => {
+                let s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
+                };
+                match s
+                    .page
+                    .traverse_history(1, wait, Duration::from_millis(timeout_ms))
+                    .await
+                {
+                    Ok(receipt) => Response::ok_text(
+                        json!({"receipt": receipt}),
+                        format!(
+                            "forward → {} · {}",
+                            receipt.final_url,
+                            receipt.outcome.label()
+                        ),
+                    ),
+                    Err(e) => page_error(e),
+                }
+            }
+            Request::Reload {
+                session,
+                ignore_cache,
+                wait,
+                timeout_ms,
+            } => {
+                let s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
+                };
+                match s
+                    .page
+                    .reload_with_wait(ignore_cache, wait, Duration::from_millis(timeout_ms))
+                    .await
+                {
+                    Ok(receipt) => Response::ok_text(
+                        json!({"receipt": receipt}),
+                        format!(
+                            "reloaded {} · {}",
+                            receipt.final_url,
+                            receipt.outcome.label()
+                        ),
+                    ),
+                    Err(e) => page_error(e),
+                }
+            }
+            Request::PointerPark { session } => {
+                let s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
+                };
+                match s.page.park_pointer().await {
+                    Ok(receipt) => Response::ok_text(json!({"receipt": receipt}), "pointer parked"),
+                    Err(e) => page_error(e),
+                }
+            }
+            Request::Checkpoint {
+                session,
+                name,
+                full_page,
+                wait,
+                timeout_ms,
+                quiet_ms,
+                park_pointer,
+                output_root,
+            } => {
+                let mut s = match self.lock_session(&session).await {
+                    Ok(s) => s,
+                    Err(response) => return response,
+                };
+                let options = CheckpointOptions {
+                    session,
+                    name,
+                    full_page,
+                    wait: wait.unwrap_or(crate::ipc::WaitPolicy::Stable),
+                    timeout: Duration::from_millis(timeout_ms),
+                    quiet: Duration::from_millis(quiet_ms),
+                    park_pointer,
+                    output_root: output_root.map(PathBuf::from),
+                };
+                match checkpoint::create(&mut s.page, options).await {
+                    Ok(result) => {
+                        let complete = result.manifest.complete;
+                        let path = result.path.clone();
+                        let mut text = format!("checkpoint {}", path.display());
+                        if !complete {
+                            text.push_str("\nwarning: event/frame coverage is incomplete; absence of additional errors was not proven");
+                        }
+                        if let checkpoint::CheckpointDurability::PublishedSyncUnknown { error } =
+                            &result.durability
+                        {
+                            text.push_str(&format!(
+                                "\nwarning: checkpoint was published successfully, but parent-directory sync is unknown ({error}); do not retry this create"
+                            ));
+                        }
+                        Response::ok_text(
+                            json!({
+                                "path": path,
+                                "complete": complete,
+                                "durability": result.durability,
+                                "manifest": result.manifest,
+                            }),
+                            text,
+                        )
+                    }
+                    Err(error) => Response::error_hint(
+                        error.to_string(),
+                        "checkpoint capture never retries trusted input; inspect any reported partial path and retry the checkpoint only",
+                    ),
                 }
             }
             Request::Eval {
@@ -1048,11 +1337,23 @@ impl Daemon {
                     self.retire_session_slot(session, &slot).await;
                     continue;
                 };
-                let response = match existing.page.navigate(url).await {
-                    Ok(()) => Response::ok_text(
-                        json!({"session": session, "url": url, "reused": true}),
-                        format!("{session}: {url}"),
-                    ),
+                let response = match existing
+                    .page
+                    .navigate_and_observe(url, Duration::from_secs(30))
+                    .await
+                {
+                    Ok(final_url) => {
+                        let requested_url = crate::redact::url(url);
+                        Response::ok_text(
+                            json!({
+                                "session": session,
+                                "url": final_url,
+                                "requested_url": requested_url,
+                                "reused": true,
+                            }),
+                            format!("{session}: {final_url}"),
+                        )
+                    }
                     Err(e) => page_error(e),
                 };
                 slot.generation
@@ -1080,7 +1381,7 @@ impl Daemon {
                 }
             };
 
-            let page = match Page::create(Arc::clone(&launched.client), url).await {
+            let mut page = match Page::create(Arc::clone(&launched.client), "about:blank").await {
                 Ok(page) => page,
                 Err(error) => {
                     let mut launched = launched;
@@ -1091,6 +1392,21 @@ impl Daemon {
                     return page_error(error);
                 }
             };
+            let final_url = match page
+                .navigate_and_observe(url, Duration::from_secs(30))
+                .await
+            {
+                Ok(final_url) => final_url,
+                Err(error) => {
+                    let mut launched = launched;
+                    let _ = launched.child.kill();
+                    let _ = launched.child.wait();
+                    drop(state);
+                    self.retire_session_slot(session, &slot).await;
+                    return page_error(error);
+                }
+            };
+            let requested_url = crate::redact::url(url);
 
             let product = launched.product.clone();
             let opened_at = SystemTime::now();
@@ -1117,8 +1433,14 @@ impl Daemon {
             *state = Some(created);
 
             return Response::ok_text(
-                json!({"session": session, "url": url, "product": product, "reused": false}),
-                format!("{session}: {url}  ({product})"),
+                json!({
+                    "session": session,
+                    "url": final_url,
+                    "requested_url": requested_url,
+                    "product": product,
+                    "reused": false,
+                }),
+                format!("{session}: {final_url}  ({product})"),
             );
         }
     }
@@ -1130,7 +1452,13 @@ impl Daemon {
     /// under it by an interactive command. It also gets its own window, because
     /// only one page per browser window is `visible` and a background tab renders
     /// nothing.
-    async fn job_start(&self, intent: String, steps: Vec<String>, headless: bool) -> Response {
+    async fn job_start(
+        &self,
+        intent: String,
+        steps: Vec<String>,
+        headless: bool,
+        checkpoint_each_step: bool,
+    ) -> Response {
         let parsed: Result<Vec<jobs::Step>, String> =
             steps.iter().map(|s| jobs::Step::parse(s)).collect();
         let steps = match parsed {
@@ -1148,7 +1476,7 @@ impl Daemon {
         };
         let id = jobs::new_job_id(seq);
         let artifacts = paths::job(&id);
-        if let Err(e) = tokio::fs::create_dir_all(&artifacts).await {
+        if let Err(e) = paths::create_dir_all_durable(&artifacts) {
             return Response::error(format!("could not create {}: {e}", artifacts.display()));
         }
 
@@ -1172,7 +1500,7 @@ impl Daemon {
             }
         };
 
-        let record = Arc::new(Mutex::new(jobs::JobRecord {
+        let record = jobs::JobRecord {
             id: id.clone(),
             intent: intent.clone(),
             state: jobs::JobState::Queued,
@@ -1183,11 +1511,28 @@ impl Daemon {
             pending: None,
             error: None,
             created_ms: jobs::now_ms(),
-        }));
+            checkpoint_each_step,
+            checkpoints: Vec::new(),
+        };
+        // Admission is durable before the request is acknowledged or the
+        // Runner is spawned. Otherwise a daemon crash between `job start` and
+        // the Runner's first poll can lose an accepted job without even an
+        // Interrupted record to explain it after restart.
+        if let Err(error) = jobs::try_persist(&record).await {
+            let mut launched = launched;
+            let _ = launched.child.kill();
+            let _ = launched.child.wait();
+            return Response::error(format!(
+                "could not durably admit job {id} in {}: {error}",
+                artifacts.display()
+            ));
+        }
+        let record = Arc::new(Mutex::new(record));
         // Depth 1: control messages are rare, and a backlog would mean answers
         // arriving for questions the job has already given up on.
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(1);
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (terminalized_tx, terminalized_rx) = tokio::sync::watch::channel(false);
         let action_gate = Arc::new(tokio::sync::Mutex::new(()));
 
         let runner = jobs::Runner {
@@ -1201,9 +1546,12 @@ impl Daemon {
         let mut launched = launched;
         tokio::spawn(async move {
             runner.run(&mut page).await;
-            // The browser belongs to the job, so it goes when the job does.
+            // The browser belongs to the job, so it goes when the job does. The
+            // acknowledgement is deliberately after kill + reap: `job stop`
+            // promises that no page timer or request can fire after it returns.
             let _ = launched.child.kill();
             let _ = launched.child.wait();
+            let _ = terminalized_tx.send(true);
         });
 
         self.jobs.lock().await.handles.insert(
@@ -1213,6 +1561,7 @@ impl Daemon {
                 control: control_tx,
                 stop: stop_tx,
                 action_gate,
+                terminalized: terminalized_rx,
             },
         );
 
@@ -1252,16 +1601,19 @@ impl Daemon {
 
     /// Moves a finished job out of the live table so its handle is released.
     async fn reap_job(&self, id: &str) {
-        let record = {
+        let (record, terminalized) = {
             let store = self.jobs.lock().await;
-            store
-                .handles
-                .get(id)
-                .map(|handle| Arc::clone(&handle.record))
+            let Some(handle) = store.handles.get(id) else {
+                return;
+            };
+            (Arc::clone(&handle.record), handle.terminalized.clone())
         };
-        let Some(record) = record else {
+        // Runner commits terminal state before its owner kills/reaps Chromium.
+        // Retain the handle (and therefore the shutdown acknowledgement) across
+        // that interval so daemon shutdown cannot lose track of a live browser.
+        if !*terminalized.borrow() {
             return;
-        };
+        }
         let finished = record.lock().await.clone();
         if !finished.state.is_terminal() {
             return;
@@ -1286,47 +1638,49 @@ impl Daemon {
                 (
                     Arc::clone(&handle.record),
                     handle.stop.clone(),
-                    Arc::clone(&handle.action_gate),
+                    handle.terminalized.clone(),
                 )
             })
         };
-        let Some((record, stop, action_gate)) = handle else {
+        let Some((record, stop, mut terminalized)) = handle else {
             return no_job(id);
         };
 
-        // Both paths, because a job is either parked (reading control) or
-        // mid-step (watching the stop signal), and we do not know which.
+        // Runner owns cancellation terminalization: it captures the final safe
+        // diagnostic checkpoint, persists terminal state, releases its action
+        // gate, then acknowledges through `terminalized`.
         let _ = stop.send(true);
-        let _action = action_gate.lock().await;
-        let mut current = record.lock().await;
-        if current.state.is_terminal() {
-            let state = current.state;
-            drop(current);
-            self.reap_job(id).await;
-            if state == jobs::JobState::Stopped {
-                return Response::ok_text(
-                    json!({ "stopped": id, "already_stopped": true }),
-                    format!("stopped {id}"),
-                );
+        while !*terminalized.borrow() {
+            if terminalized.changed().await.is_err() {
+                break;
             }
-            return Response::error(format!("{id} is already {}", state.label()));
         }
-        current.state = jobs::JobState::Stopped;
-        let persisted = jobs::persist_or_mark_failed(&mut current).await;
-        let persistence_error = (!persisted)
-            .then(|| current.error.clone())
-            .flatten()
-            .unwrap_or_else(|| "job manifest persistence failed".to_string());
-        drop(current);
+
+        let (state, error) = {
+            let current = record.lock().await;
+            (current.state, current.error.clone())
+        };
         self.reap_job(id).await;
 
-        if !persisted {
-            return Response::error_hint(
-                format!("could not durably stop {id}: {persistence_error}"),
-                "the in-memory job is failed and its browser is being closed; inspect the artifact directory before restarting the daemon",
-            );
+        match state {
+            jobs::JobState::Stopped => {
+                Response::ok_text(json!({ "stopped": id }), format!("stopped {id}"))
+            }
+            jobs::JobState::Failed => Response::error_hint(
+                format!(
+                    "could not durably stop {id}: {}",
+                    error.unwrap_or_else(|| "runner terminalization failed".into())
+                ),
+                "inspect the job status and its artifact directory before attempting recovery",
+            ),
+            other => Response::error_hint(
+                format!(
+                    "{id} runner ended before committing a terminal stop state (still {})",
+                    other.label()
+                ),
+                "inspect the durable job record; do not assume the browser action or terminal checkpoint completed",
+            ),
         }
-        Response::ok_text(json!({ "stopped": id }), format!("stopped {id}"))
     }
 
     /// Delivers a control message, refusing it if the job is not waiting for
@@ -1383,6 +1737,131 @@ impl Daemon {
             }
             Err(_) => Response::error(format!("{id} stopped listening before the answer arrived")),
         }
+    }
+
+    async fn invalid_request_response(&self, req: &Request, error: String) -> Response {
+        let context = match req {
+            Request::Click {
+                session,
+                wait,
+                timeout_ms,
+                ..
+            } => Some((session.as_str(), "click", *wait, *wait, *timeout_ms, 300)),
+            Request::Press {
+                session,
+                wait,
+                timeout_ms,
+                ..
+            } => Some((session.as_str(), "press", *wait, *wait, *timeout_ms, 300)),
+            Request::Tap {
+                session,
+                wait,
+                timeout_ms,
+                ..
+            } => Some((session.as_str(), "tap", *wait, *wait, *timeout_ms, 300)),
+            Request::Wait {
+                session,
+                conditions,
+                timeout_ms,
+                quiet_ms,
+            } => {
+                let policy = if conditions.stable {
+                    WaitPolicy::Stable
+                } else {
+                    WaitPolicy::Load
+                };
+                Some((
+                    session.as_str(),
+                    "wait",
+                    policy,
+                    policy,
+                    *timeout_ms,
+                    *quiet_ms,
+                ))
+            }
+            Request::Back {
+                session,
+                wait,
+                timeout_ms,
+            } => {
+                let policy = wait.unwrap_or(WaitPolicy::Load);
+                Some((session.as_str(), "back", policy, policy, *timeout_ms, 300))
+            }
+            Request::Forward {
+                session,
+                wait,
+                timeout_ms,
+            } => {
+                let policy = wait.unwrap_or(WaitPolicy::Load);
+                Some((
+                    session.as_str(),
+                    "forward",
+                    policy,
+                    policy,
+                    *timeout_ms,
+                    300,
+                ))
+            }
+            Request::Reload {
+                session,
+                wait,
+                timeout_ms,
+                ..
+            } => {
+                let policy = wait.unwrap_or(WaitPolicy::Load);
+                Some((session.as_str(), "reload", policy, policy, *timeout_ms, 300))
+            }
+            Request::Checkpoint {
+                session,
+                wait,
+                timeout_ms,
+                quiet_ms,
+                ..
+            } => {
+                let policy = wait.unwrap_or(WaitPolicy::Stable);
+                Some((
+                    session.as_str(),
+                    "checkpoint",
+                    policy,
+                    policy,
+                    *timeout_ms,
+                    *quiet_ms,
+                ))
+            }
+            _ => None,
+        };
+        let message = format!("invalid request: {error}");
+        if let Some((session, operation, requested, effective, timeout_ms, quiet_ms)) = context {
+            if let Ok(guard) = self.lock_session(session).await {
+                let receipt = guard
+                    .page
+                    .rejected_request_receipt(
+                        operation,
+                        requested,
+                        effective,
+                        Duration::from_millis(timeout_ms),
+                        Duration::from_millis(quiet_ms),
+                        message.clone(),
+                    )
+                    .await;
+                return Response::error_data(
+                    message,
+                    "fix the request parameters; the daemon rejected it before browser dispatch",
+                    json!({
+                        "code": "invalid_request",
+                        "dispatched": false,
+                        "receipt": receipt,
+                    }),
+                );
+            }
+        }
+        // Without a live Page there is no truthful URL/generation seed from
+        // which to fabricate REC-001. Keep admission structured but omit receipt.
+        Response::error_data(
+            message,
+            "fix the request parameters; the daemon rejected it before browser dispatch",
+            json!({"code": "invalid_request", "dispatched": false}),
+        )
     }
 
     async fn lock_session(&self, name: &str) -> Result<SessionGuard, Response> {
@@ -1463,7 +1942,7 @@ impl Daemon {
             store
                 .handles
                 .values()
-                .map(|handle| (handle.stop.clone(), Arc::clone(&handle.record)))
+                .map(|handle| (handle.stop.clone(), handle.terminalized.clone()))
                 .collect()
         };
         if jobs.is_empty() {
@@ -1472,32 +1951,30 @@ impl Daemon {
         for (stop, _) in &jobs {
             let _ = stop.send(true);
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let mut all_terminal = true;
-            for (_, record) in &jobs {
-                if !record.lock().await.state.is_terminal() {
-                    all_terminal = false;
-                    break;
-                }
-            }
-            if all_terminal {
-                // The runner kills and waits for its owned Chromium immediately
-                // after setting terminal state; yield once so that cleanup tail
-                // can run before the runtime exits.
-                tokio::task::yield_now().await;
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::error!(
-                    count = jobs.len(),
-                    "timed out waiting for job browsers to stop during daemon shutdown"
-                );
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        // A terminal manifest is not a process-cleanup acknowledgement. Runner
+        // persists that state before the owner task kills/reaps Chromium; wait
+        // for the same post-reap watch value used by explicit `job stop`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let acknowledgements = jobs.into_iter().map(|(_, ack)| ack).collect();
+        if !wait_for_job_termination_acks(acknowledgements, deadline).await {
+            tracing::error!("timed out waiting for job browsers to stop during daemon shutdown");
         }
     }
+}
+
+async fn wait_for_job_termination_acks(
+    mut acknowledgements: Vec<tokio::sync::watch::Receiver<bool>>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    for acknowledgement in &mut acknowledgements {
+        while !*acknowledgement.borrow() {
+            match tokio::time::timeout_at(deadline, acknowledgement.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return false,
+            }
+        }
+    }
+    true
 }
 
 async fn finish_session_close(name: &str, slot: &SessionSlot) {
@@ -1540,18 +2017,57 @@ fn point_target(t: Target) -> PointTarget {
     }
 }
 
-fn parse_button(s: &str) -> MouseButton {
-    match s.to_ascii_lowercase().as_str() {
-        "right" => MouseButton::Right,
-        "middle" => MouseButton::Middle,
-        "back" => MouseButton::Back,
-        "forward" => MouseButton::Forward,
-        _ => MouseButton::Left,
+fn parse_button(value: &str) -> Result<MouseButton, &'static str> {
+    match ClickButton::parse(value) {
+        Some(ClickButton::Left) => Ok(MouseButton::Left),
+        Some(ClickButton::Right) => Ok(MouseButton::Right),
+        Some(ClickButton::Middle) => Ok(MouseButton::Middle),
+        Some(ClickButton::Back) => Ok(MouseButton::Back),
+        Some(ClickButton::Forward) => Ok(MouseButton::Forward),
+        None => Err("click button must be left, right, middle, back, or forward"),
     }
 }
 
 /// Turns an internal error into something an agent can act on.
 fn page_error(e: PageError) -> Response {
+    if let PageError::WaitFailure { message, receipt } = &e {
+        let hint = if receipt.operation == "wait" {
+            "this was observation-only: no trusted action was dispatched; inspect the observed conditions and page state, then adjust the wait"
+        } else {
+            match receipt.dispatch_state {
+                DispatchState::Prevented if message.contains("snapshot") => {
+                    "trusted input was not dispatched; take a fresh `brow snapshot` and use the new refs"
+                }
+                DispatchState::Prevented => {
+                    "trusted input was not dispatched; fix the target or request before retrying"
+                }
+                DispatchState::Sent => {
+                    "the action was dispatched and may already have happened; inspect the receipt and page state before deciding whether any retry is safe"
+                }
+                DispatchState::Uncertain => {
+                    "input delivery is unknown; inspect page/application state before deciding whether any retry is safe"
+                }
+            }
+        };
+        return Response::error_data(message.clone(), hint, json!({ "receipt": receipt }));
+    }
+    if let PageError::NoHistoryEntry {
+        current_index,
+        entry_count,
+        receipt,
+    } = &e
+    {
+        return Response::error_data(
+            e.to_string(),
+            "the history command was not dispatched; open or navigate to another page first",
+            json!({
+                "receipt": receipt,
+                "current_index": current_index,
+                "entry_count": entry_count,
+                "code": "no_history_entry"
+            }),
+        );
+    }
     let hint = match &e {
         PageError::NoSnapshot => Some("run `brow snapshot` to mint refs".to_string()),
         PageError::Ref(crate::page::RefError::Stale { .. }) => {
@@ -1578,18 +2094,20 @@ fn page_error(e: PageError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future as _;
 
     #[test]
-    fn button_parsing_defaults_to_left() {
-        assert_eq!(parse_button("right"), MouseButton::Right);
-        assert_eq!(parse_button("MIDDLE"), MouseButton::Middle);
-        assert_eq!(parse_button("nonsense"), MouseButton::Left);
+    fn button_parsing_is_closed_and_fallible() {
+        assert_eq!(parse_button("").unwrap(), MouseButton::Left);
+        assert_eq!(parse_button("right").unwrap(), MouseButton::Right);
+        assert_eq!(parse_button("MIDDLE").unwrap(), MouseButton::Middle);
+        assert!(parse_button("nonsense").is_err());
     }
 
     #[test]
     fn missing_session_errors_name_the_fix() {
         let r = no_session("qa");
-        let ipc::Response::Error { message, hint } = r else {
+        let ipc::Response::Error { message, hint, .. } = r else {
             panic!("expected an error")
         };
         assert!(message.contains("qa"));
@@ -1607,6 +2125,51 @@ mod tests {
             panic!("expected an error")
         };
         assert!(hint.unwrap().contains("snapshot"));
+    }
+
+    #[tokio::test]
+    async fn oversized_daemon_response_is_replaced_by_a_small_structured_error() {
+        let (server, client) = UnixStream::pair().expect("create IPC pair");
+        let (_server_read, mut server_write) = server.into_split();
+        let (client_read, _client_write) = client.into_split();
+        let oversized = Response::ok(json!({
+            "payload": "x".repeat(MAX_IPC_FRAME_BYTES)
+        }));
+
+        write_response(&mut server_write, &oversized)
+            .await
+            .expect("write bounded fallback");
+
+        let mut reader = IpcFrameReader::new(BufReader::new(client_read));
+        let frame = reader
+            .read_frame()
+            .await
+            .expect("read fallback frame")
+            .expect("fallback frame");
+        assert!(frame.len() < MAX_IPC_FRAME_BYTES);
+        let response: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["data"]["code"], "ipc_response_too_large");
+        assert_eq!(
+            response["data"]["max_frame_bytes"],
+            MAX_IPC_FRAME_BYTES as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_waits_for_post_browser_reap_acknowledgement() {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut waiting = Box::pin(wait_for_job_termination_acks(vec![receiver], deadline));
+
+        assert!(std::future::poll_fn(|cx| match waiting.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+            std::task::Poll::Pending => std::task::Poll::Ready(None),
+        })
+        .await
+        .is_none());
+        sender.send(true).expect("publish browser-reaped ack");
+        assert!(waiting.await);
     }
 
     use crate::ipc;

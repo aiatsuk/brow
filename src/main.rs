@@ -1,9 +1,9 @@
 use clap::Parser;
 use serde_json::json;
 
-use brow::cli::{parse_point, parse_rect, Cli, Command, DaemonAction, JobAction};
+use brow::cli::{parse_point, parse_rect, Cli, Command, DaemonAction, JobAction, PointerAction};
 use brow::client::{self, Client};
-use brow::ipc::{Request, Response, ShotTarget, Target};
+use brow::ipc::{Request, Response, ShotTarget, Target, WaitConditions};
 use brow::{daemon, paths};
 
 #[tokio::main]
@@ -58,7 +58,7 @@ async fn run(cli: &Cli) -> anyhow::Result<std::process::ExitCode> {
 
 fn build_request(cli: &Cli) -> anyhow::Result<Request> {
     let session = cli.session.clone();
-    Ok(match &cli.command {
+    let request = match &cli.command {
         Command::Open { url, headed } => Request::Open {
             url: normalize_url(url),
             session,
@@ -74,6 +74,8 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
             double,
             count,
             force,
+            wait,
+            timeout_ms,
         } => {
             let target = as_target(target);
             Request::Click {
@@ -83,6 +85,8 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
                 count: if *double { 2 } else { *count },
                 modifiers: 0,
                 force: *force,
+                wait: *wait,
+                timeout_ms: *timeout_ms,
             }
         }
         Command::Hover { node_ref } => Request::Hover {
@@ -99,9 +103,15 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
             text: text.clone(),
             by_key: *by_key,
         },
-        Command::Press { chord } => Request::Press {
+        Command::Press {
+            chord,
+            wait,
+            timeout_ms,
+        } => Request::Press {
             session,
             chord: chord.clone(),
+            wait: *wait,
+            timeout_ms: *timeout_ms,
         },
         Command::Scroll { direction, amount } => {
             let (dx, dy) = match direction.as_str() {
@@ -162,9 +172,15 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
             failed: *failed,
             limit: *limit,
         },
-        Command::Tap { target } => Request::Tap {
+        Command::Tap {
+            target,
+            wait,
+            timeout_ms,
+        } => Request::Tap {
             session,
             target: as_target(target),
+            wait: *wait,
+            timeout_ms: *timeout_ms,
         },
         Command::LongPress {
             target,
@@ -208,16 +224,77 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
             duration_ms: *duration_ms,
             steps: *steps,
         },
+        Command::Wait {
+            url,
+            generation_after,
+            load,
+            stable,
+            quiet_ms,
+            timeout_ms,
+        } => Request::Wait {
+            session,
+            conditions: WaitConditions {
+                url: url.clone(),
+                generation_after: *generation_after,
+                load: *load,
+                stable: *stable,
+            },
+            timeout_ms: *timeout_ms,
+            quiet_ms: *quiet_ms,
+        },
+        Command::Back { wait, timeout_ms } => Request::Back {
+            session,
+            wait: wait.map(Into::into),
+            timeout_ms: *timeout_ms,
+        },
+        Command::Forward { wait, timeout_ms } => Request::Forward {
+            session,
+            wait: wait.map(Into::into),
+            timeout_ms: *timeout_ms,
+        },
+        Command::Reload {
+            ignore_cache,
+            wait,
+            timeout_ms,
+        } => Request::Reload {
+            session,
+            ignore_cache: *ignore_cache,
+            wait: wait.map(Into::into),
+            timeout_ms: *timeout_ms,
+        },
+        Command::Pointer {
+            action: PointerAction::Park,
+        } => Request::PointerPark { session },
+        Command::Checkpoint {
+            name,
+            full_page,
+            wait,
+            quiet_ms,
+            timeout_ms,
+            park_pointer,
+            output_root,
+        } => Request::Checkpoint {
+            session,
+            name: name.clone(),
+            full_page: *full_page,
+            wait: wait.map(Into::into),
+            timeout_ms: *timeout_ms,
+            quiet_ms: *quiet_ms,
+            park_pointer: *park_pointer,
+            output_root: output_root.clone(),
+        },
         Command::Close => Request::Close { session },
         Command::Job { action } => match action {
             JobAction::Start {
                 intent,
                 steps,
                 headed,
+                checkpoint_each_step,
             } => Request::JobStart {
                 intent: intent.clone(),
                 steps: steps.clone(),
                 headless: !headed,
+                checkpoint_each_step: *checkpoint_each_step,
             },
             JobAction::List => Request::JobList,
             JobAction::Status { id } => Request::JobStatus {
@@ -238,7 +315,9 @@ fn build_request(cli: &Cli) -> anyhow::Result<Request> {
         Command::Sessions => Request::Sessions,
         Command::Status => Request::Status,
         Command::Daemon { .. } => unreachable!("handled before this point"),
-    })
+    };
+    request.validate()?;
+    Ok(request)
 }
 
 /// A pointer target is a ref unless it parses as `x,y`.
@@ -283,9 +362,14 @@ fn render(response: Response, as_json: bool) -> std::process::ExitCode {
             }
             std::process::ExitCode::SUCCESS
         }
-        Response::Error { message, hint } => {
+        Response::Error {
+            message,
+            hint,
+            data,
+        } => {
             if as_json {
-                let payload = json!({ "status": "error", "message": message, "hint": hint });
+                let payload =
+                    json!({ "status": "error", "message": message, "hint": hint, "data": data });
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&payload).unwrap_or_default()
@@ -371,7 +455,7 @@ async fn daemon_command(
             Ok(std::process::ExitCode::SUCCESS)
         }
         DaemonAction::Start => {
-            if client::is_running().await {
+            if Client::connect_if_running().await?.is_some() {
                 println!("browd is already running");
                 return Ok(std::process::ExitCode::SUCCESS);
             }
@@ -380,32 +464,35 @@ async fn daemon_command(
             Ok(render(resp, as_json))
         }
         DaemonAction::Status => {
-            if !client::is_running().await {
-                if as_json {
-                    println!("{}", json!({ "running": false }));
-                } else {
-                    println!("browd is not running");
+            let mut c = match Client::connect_if_running().await? {
+                Some(client) => client,
+                None => {
+                    if as_json {
+                        println!("{}", json!({ "running": false }));
+                    } else {
+                        println!("browd is not running");
+                    }
+                    // Not an error: "is it up?" answered truthfully is a success.
+                    return Ok(std::process::ExitCode::SUCCESS);
                 }
-                // Not an error: "is it up?" answered truthfully is a success.
-                return Ok(std::process::ExitCode::SUCCESS);
-            }
-            let mut c = Client::connect().await?;
+            };
             let resp = c.request(Request::Status).await?;
             Ok(render(resp, as_json))
         }
         DaemonAction::Stop => {
-            if !client::is_running().await {
-                println!("browd is not running");
-                return Ok(std::process::ExitCode::SUCCESS);
-            }
-            let mut c = Client::connect().await?;
+            let mut c = match Client::connect_if_running().await? {
+                Some(client) => client,
+                None => {
+                    println!("browd is not running");
+                    return Ok(std::process::ExitCode::SUCCESS);
+                }
+            };
             let resp = c.request(Request::Shutdown).await?;
             wait_for_socket_release().await;
             Ok(render(resp, as_json))
         }
         DaemonAction::Restart => {
-            if client::is_running().await {
-                let mut c = Client::connect().await?;
+            if let Some(mut c) = Client::connect_if_running().await? {
                 let _ = c.request(Request::Shutdown).await;
                 wait_for_socket_release().await;
             }
@@ -450,6 +537,25 @@ mod tests {
             "data:text/html,<p>hi",
         ] {
             assert_eq!(normalize_url(url), url);
+        }
+    }
+
+    #[test]
+    fn empty_wait_is_rejected_before_any_client_connection() {
+        let cli = Cli::try_parse_from(["brow", "wait"]).unwrap();
+        let error = build_request(&cli).expect_err("empty typed wait must fail locally");
+        assert!(error.to_string().contains("requires at least one"));
+    }
+
+    #[test]
+    fn expected_navigation_commands_reject_auto_policy_locally() {
+        for args in [
+            vec!["brow", "back", "--wait", "auto"],
+            vec!["brow", "reload", "--wait", "auto"],
+            vec!["brow", "checkpoint", "--name", "x", "--wait", "auto"],
+        ] {
+            let error = Cli::try_parse_from(args).expect_err("auto must be rejected by clap");
+            assert!(error.to_string().contains("invalid value 'auto'"));
         }
     }
 }
