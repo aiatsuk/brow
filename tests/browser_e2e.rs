@@ -301,9 +301,9 @@ async fn screenshots_cover_viewport_document_and_node() {
     let (launched, mut page, scratch) = open_fixture("shots", &fixture.url("/")).await;
     let snap = page.snapshot().await.expect("snapshot");
 
-    // Viewport: the layout viewport (page pixels). Classic desktop scrollbars
-    // live in the window chrome and must not appear as extra width here, or a
-    // full-page capture of cssContentSize would be 15px narrower on Linux.
+    // Viewport: the visual viewport in page pixels. Must share a width with
+    // full-page `cssContentSize` even when Chrome's layout viewport is one
+    // classic-scrollbar narrower than `window.innerWidth`.
     let shot = page
         .screenshot(ScreenshotTarget::Viewport, ImageFormat::Png, None)
         .await

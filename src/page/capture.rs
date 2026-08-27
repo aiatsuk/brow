@@ -194,12 +194,14 @@ fn clamp_clip(clip: Clip, scale: f64, device_ratio: f64) -> (Clip, Option<String
 }
 
 /// Document-space offset of the visual viewport, plus the full content size
-/// and the layout viewport (page pixels, excluding classic OS scrollbars).
+/// and both viewport rectangles from `Page.getLayoutMetrics`.
 struct Metrics {
     page_x: f64,
     page_y: f64,
     content_width: f64,
     content_height: f64,
+    visual_width: f64,
+    visual_height: f64,
     layout_width: f64,
     layout_height: f64,
 }
@@ -229,6 +231,33 @@ async fn device_pixel_ratio(client: &CdpClient, session_id: &str) -> f64 {
         .unwrap_or(2.0)
 }
 
+fn json_number(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|n| n as f64))
+        .or_else(|| value.as_u64().map(|n| n as f64))
+}
+
+/// `window.innerWidth` / `innerHeight` — the CSS viewport the page actually uses.
+async fn inner_size(client: &CdpClient, session_id: &str) -> Option<(f64, f64)> {
+    let res = client
+        .call_on(
+            session_id,
+            "Runtime.evaluate",
+            json!({
+                "expression": "[window.innerWidth, window.innerHeight]",
+                "returnByValue": true,
+                "throwOnSideEffect": true,
+            }),
+        )
+        .await
+        .ok()?;
+    let values = res.get("result")?.get("value")?.as_array()?;
+    let width = json_number(values.first()?)?;
+    let height = json_number(values.get(1)?)?;
+    (width > 0.0 && height > 0.0).then_some((width, height))
+}
+
 async fn metrics(client: &CdpClient, session_id: &str) -> Result<Metrics, CdpError> {
     let m = client
         .call_on(session_id, "Page.getLayoutMetrics", json!({}))
@@ -244,7 +273,7 @@ async fn metrics(client: &CdpClient, session_id: &str) -> Result<Metrics, CdpErr
     let content = m.get("cssContentSize").or_else(|| m.get("contentSize"));
     let num = |v: Option<&Value>, k: &str| -> f64 {
         v.and_then(|v| v.get(k))
-            .and_then(Value::as_f64)
+            .and_then(json_number)
             .unwrap_or(0.0)
     };
     Ok(Metrics {
@@ -252,6 +281,8 @@ async fn metrics(client: &CdpClient, session_id: &str) -> Result<Metrics, CdpErr
         page_y: num(visual, "pageY"),
         content_width: num(content, "width"),
         content_height: num(content, "height"),
+        visual_width: num(visual, "clientWidth"),
+        visual_height: num(visual, "clientHeight"),
         layout_width: num(layout, "clientWidth"),
         layout_height: num(layout, "clientHeight"),
     })
@@ -259,20 +290,32 @@ async fn metrics(client: &CdpClient, session_id: &str) -> Result<Metrics, CdpErr
 
 /// Visible page rectangle in document coordinates.
 ///
-/// Classic desktop scrollbars sit in the window chrome and shrink
-/// `cssLayoutViewport` / `cssContentSize` without shrinking an unclipped
-/// surface capture. Using the layout viewport keeps viewport and full-page
-/// widths on the same page-pixel grid.
+/// Prefer `cssVisualViewport`: on Chrome 148 / Linux it matches
+/// `window.innerWidth` (1280). `cssLayoutViewport.clientWidth` can be one
+/// classic-scrollbar narrower (1265) even when JS `clientWidth`/`scrollWidth`
+/// stay at 1280, so using the layout viewport would crop real page pixels and
+/// disagree with a `cssContentSize` full-page capture.
 fn viewport_clip(metrics: &Metrics) -> Option<Clip> {
-    if metrics.layout_width <= 0.0 || metrics.layout_height <= 0.0 {
-        return None;
-    }
+    let width = [metrics.visual_width, metrics.layout_width]
+        .into_iter()
+        .find(|width| *width > 0.0)?;
+    let height = [metrics.visual_height, metrics.layout_height]
+        .into_iter()
+        .find(|height| *height > 0.0)?;
     Some(Clip {
         x: metrics.page_x,
         y: metrics.page_y,
-        width: metrics.layout_width,
-        height: metrics.layout_height,
+        width,
+        height,
     })
+}
+
+/// Full-page width on the same CSS grid as the viewport capture.
+fn full_page_width(metrics: &Metrics) -> f64 {
+    metrics
+        .content_width
+        .max(metrics.visual_width)
+        .max(metrics.layout_width)
 }
 
 fn capture_error(method: &str, message: impl Into<String>) -> CdpError {
@@ -428,9 +471,14 @@ fn tiled_full_page_tiles(full: Clip, device_ratio: f64) -> Vec<TilePlan> {
     let output_height = (full.height * factor).round().max(1.0) as u64;
     let max_axis_output = (MAX_OUTPUT_PIXELS - 2.0) as u64;
     let tile_output_width = output_width.min(max_axis_output).max(1);
-    let tile_output_height = (MAX_CAPTURE_FRAME_PIXELS / tile_output_width)
-        .min(max_axis_output)
-        .max(1);
+    // Covering integer CSS can add about one device pixel per axis; keep that
+    // expansion inside the per-frame decode budget (784×10205 = 8_000_720).
+    let axis_slack = factor.ceil().max(1.0) as u64;
+    let tile_output_height = (MAX_CAPTURE_FRAME_PIXELS
+        / tile_output_width.saturating_add(axis_slack))
+    .saturating_sub(axis_slack)
+    .min(max_axis_output)
+    .max(1);
 
     let mut tiles = Vec::new();
     let mut dst_y = 0_u64;
@@ -555,13 +603,22 @@ pub async fn capture(
 
     let full_page = matches!(&region, Region::FullPage);
     let clip: Option<Clip> = match region {
-        Region::Viewport => viewport_clip(&metrics(client, session_id).await?),
+        Region::Viewport => {
+            let mut m = metrics(client, session_id).await?;
+            if let Some((width, height)) = inner_size(client, session_id).await {
+                // Trust the live CSS viewport when CDP's layout viewport is one
+                // classic-scrollbar narrower than `window.innerWidth`.
+                m.visual_width = m.visual_width.max(width);
+                m.visual_height = m.visual_height.max(height);
+            }
+            viewport_clip(&m)
+        }
         Region::FullPage => {
             let m = metrics(client, session_id).await?;
             Some(Clip {
                 x: 0.0,
                 y: 0.0,
-                width: m.content_width,
+                width: full_page_width(&m),
                 height: m.content_height,
             })
         }
@@ -914,27 +971,32 @@ mod tests {
     }
 
     #[test]
-    fn viewport_clip_uses_layout_viewport_not_window_chrome() {
+    fn viewport_clip_prefers_visual_viewport_over_narrower_layout() {
         let metrics = Metrics {
             page_x: 0.0,
             page_y: 12.0,
-            content_width: 1265.0,
-            content_height: 3000.0,
+            content_width: 1280.0,
+            content_height: 3039.0,
+            visual_width: 1280.0,
+            visual_height: 713.0,
             layout_width: 1265.0,
-            layout_height: 800.0,
+            layout_height: 713.0,
         };
         assert_eq!(
             viewport_clip(&metrics),
             Some(Clip {
                 x: 0.0,
                 y: 12.0,
-                width: 1265.0,
-                height: 800.0
+                width: 1280.0,
+                height: 713.0
             })
         );
+        assert_eq!(full_page_width(&metrics), 1280.0);
         let missing = Metrics {
+            visual_width: 0.0,
+            visual_height: 0.0,
             layout_width: 0.0,
-            layout_height: 800.0,
+            layout_height: 0.0,
             ..metrics
         };
         assert_eq!(viewport_clip(&missing), None);
@@ -954,7 +1016,6 @@ mod tests {
         let tiles = tiled_full_page_tiles(full, 1.25);
         assert!(tiles.len() >= 2, "the area bound must split this page");
         let last = tiles.last().expect("last tile");
-        assert_eq!(last.copy_height, 46);
         assert_eq!(
             last.y.fract(),
             0.0,
@@ -969,7 +1030,12 @@ mod tests {
             last.height * 1.25 >= last.copy_height as f64,
             "integer CSS clip must cover the required device rows: {last:?}"
         );
-        assert_eq!(last.y, 8163.0);
-        assert_eq!(last.height, 37.0);
+        for tile in &tiles {
+            let requested = (tile.width * 1.25).ceil() as u64 * (tile.height * 1.25).ceil() as u64;
+            assert!(
+                requested <= MAX_CAPTURE_FRAME_PIXELS,
+                "covering clip {tile:?} would decode {requested} pixels"
+            );
+        }
     }
 }
