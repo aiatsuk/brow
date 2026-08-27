@@ -193,12 +193,15 @@ fn clamp_clip(clip: Clip, scale: f64, device_ratio: f64) -> (Clip, Option<String
     (clamped, Some(note))
 }
 
-/// Document-space offset of the visual viewport, plus the full content size.
+/// Document-space offset of the visual viewport, plus the full content size
+/// and the layout viewport (page pixels, excluding classic OS scrollbars).
 struct Metrics {
     page_x: f64,
     page_y: f64,
     content_width: f64,
     content_height: f64,
+    layout_width: f64,
+    layout_height: f64,
 }
 
 /// `window.devicePixelRatio`, which `Page.getLayoutMetrics` does not report.
@@ -235,6 +238,9 @@ async fn metrics(client: &CdpClient, session_id: &str) -> Result<Metrics, CdpErr
     let visual = m
         .get("cssVisualViewport")
         .or_else(|| m.get("visualViewport"));
+    let layout = m
+        .get("cssLayoutViewport")
+        .or_else(|| m.get("layoutViewport"));
     let content = m.get("cssContentSize").or_else(|| m.get("contentSize"));
     let num = |v: Option<&Value>, k: &str| -> f64 {
         v.and_then(|v| v.get(k))
@@ -246,6 +252,26 @@ async fn metrics(client: &CdpClient, session_id: &str) -> Result<Metrics, CdpErr
         page_y: num(visual, "pageY"),
         content_width: num(content, "width"),
         content_height: num(content, "height"),
+        layout_width: num(layout, "clientWidth"),
+        layout_height: num(layout, "clientHeight"),
+    })
+}
+
+/// Visible page rectangle in document coordinates.
+///
+/// Classic desktop scrollbars sit in the window chrome and shrink
+/// `cssLayoutViewport` / `cssContentSize` without shrinking an unclipped
+/// surface capture. Using the layout viewport keeps viewport and full-page
+/// widths on the same page-pixel grid.
+fn viewport_clip(metrics: &Metrics) -> Option<Clip> {
+    if metrics.layout_width <= 0.0 || metrics.layout_height <= 0.0 {
+        return None;
+    }
+    Some(Clip {
+        x: metrics.page_x,
+        y: metrics.page_y,
+        width: metrics.layout_width,
+        height: metrics.layout_height,
     })
 }
 
@@ -377,6 +403,67 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, CdpError>
     Ok(encoded)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct TilePlan {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    dst_x: usize,
+    dst_y: usize,
+    copy_width: usize,
+    copy_height: usize,
+}
+
+/// Device-pixel tile grid with CSS clips that still cover those pixels after
+/// Chromium integerizes `Page.captureScreenshot` rectangles.
+///
+/// Walking the page in CSS and converting with `round` asked Chrome 148 for a
+/// last clip of 36.8 CSS px at DPR 1.25 (required 46 device px). Chromium
+/// integerizes that height to 36 CSS px and returns 45. Asking for the integer
+/// CSS rect that covers the remaining device rows avoids the shortfall.
+fn tiled_full_page_tiles(full: Clip, device_ratio: f64) -> Vec<TilePlan> {
+    let factor = device_ratio.max(0.01);
+    let output_width = (full.width * factor).round().max(1.0) as u64;
+    let output_height = (full.height * factor).round().max(1.0) as u64;
+    let max_axis_output = (MAX_OUTPUT_PIXELS - 2.0) as u64;
+    let tile_output_width = output_width.min(max_axis_output).max(1);
+    let tile_output_height = (MAX_CAPTURE_FRAME_PIXELS / tile_output_width)
+        .min(max_axis_output)
+        .max(1);
+
+    let mut tiles = Vec::new();
+    let mut dst_y = 0_u64;
+    while dst_y < output_height {
+        let copy_height = tile_output_height.min(output_height - dst_y);
+        let mut dst_x = 0_u64;
+        while dst_x < output_width {
+            let copy_width = tile_output_width.min(output_width - dst_x);
+            let x0 = (dst_x as f64 / factor).floor().max(0.0);
+            let y0 = (dst_y as f64 / factor).floor().max(0.0);
+            let x1 = ((dst_x + copy_width) as f64 / factor)
+                .ceil()
+                .min(full.width);
+            let y1 = ((dst_y + copy_height) as f64 / factor)
+                .ceil()
+                .min(full.height);
+            tiles.push(TilePlan {
+                x: full.x + x0,
+                y: full.y + y0,
+                width: (x1 - x0).max(1.0 / factor),
+                height: (y1 - y0).max(1.0 / factor),
+                dst_x: dst_x as usize,
+                dst_y: dst_y as usize,
+                copy_width: copy_width as usize,
+                copy_height: copy_height as usize,
+            });
+            dst_x += copy_width;
+        }
+        dst_y += copy_height;
+    }
+    tiles
+}
+
 /// Captures a full page as a grid of clips that each remain below Chromium's
 /// silent 16,384-output-pixel corruption threshold, then stitches them in memory.
 async fn capture_tiled_full_page(
@@ -412,63 +499,36 @@ async fn capture_tiled_full_page(
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| capture_error("tiled capture", "RGBA allocation size overflow"))?;
     let mut rgba = vec![0_u8; rgba_len];
-
-    // Leave output-pixel headroom for floating-point/device-scale rounding. The
-    // width is chosen first, then height is derived from the per-frame area
-    // budget; this avoids hundreds of tiny square tiles on a very narrow page.
-    let factor = device_ratio.max(0.01);
-    let max_axis_output = (MAX_OUTPUT_PIXELS - 2.0) as u64;
-    let full_output_width = (full.width * factor).ceil().max(1.0) as u64;
-    let tile_output_width = full_output_width.min(max_axis_output).max(1);
-    let tile_output_height = (MAX_CAPTURE_FRAME_PIXELS / tile_output_width)
-        .min(max_axis_output)
-        .max(1);
-    let tile_css_width = (tile_output_width as f64 / factor).max(1.0 / factor);
-    let tile_css_height = (tile_output_height as f64 / factor).max(1.0 / factor);
     let mut tile_count = 0;
-    let mut y = 0.0;
-    while y < full.height {
-        let css_height = tile_css_height.min(full.height - y);
-        let dst_y = (y * device_ratio).round() as usize;
-        let next_y = ((y + css_height) * device_ratio).round() as usize;
-        let copy_height = next_y.saturating_sub(dst_y);
-        let mut x = 0.0;
-        while x < full.width {
-            let css_width = tile_css_width.min(full.width - x);
-            let dst_x = (x * device_ratio).round() as usize;
-            let next_x = ((x + css_width) * device_ratio).round() as usize;
-            let copy_width = next_x.saturating_sub(dst_x);
-            let bytes = capture_clip_png(
-                client,
-                session_id,
-                Clip {
-                    x: full.x + x,
-                    y: full.y + y,
-                    width: css_width,
-                    height: css_height,
-                },
-            )
-            .await?;
-            let tile = decode_png(&bytes, MAX_CAPTURE_FRAME_PIXELS)?;
-            if tile.width < copy_width || tile.height < copy_height {
-                return Err(capture_error(
-                    "tiled capture",
-                    format!(
-                        "Chromium returned tile {}x{}, smaller than required {}x{} at ({x},{y})",
-                        tile.width, tile.height, copy_width, copy_height
-                    ),
-                ));
-            }
-            for row in 0..copy_height {
-                let src = row * tile.width * 4;
-                let dst = ((dst_y + row) * width as usize + dst_x) * 4;
-                let len = copy_width * 4;
-                rgba[dst..dst + len].copy_from_slice(&tile.pixels[src..src + len]);
-            }
-            tile_count += 1;
-            x += css_width;
+    for plan in tiled_full_page_tiles(full, device_ratio) {
+        let bytes = capture_clip_png(
+            client,
+            session_id,
+            Clip {
+                x: plan.x,
+                y: plan.y,
+                width: plan.width,
+                height: plan.height,
+            },
+        )
+        .await?;
+        let tile = decode_png(&bytes, MAX_CAPTURE_FRAME_PIXELS)?;
+        if tile.width < plan.copy_width || tile.height < plan.copy_height {
+            return Err(capture_error(
+                "tiled capture",
+                format!(
+                    "Chromium returned tile {}x{}, smaller than required {}x{} at ({},{})",
+                    tile.width, tile.height, plan.copy_width, plan.copy_height, plan.x, plan.y
+                ),
+            ));
         }
-        y += css_height;
+        for row in 0..plan.copy_height {
+            let src = row * tile.width * 4;
+            let dst = ((plan.dst_y + row) * width as usize + plan.dst_x) * 4;
+            let len = plan.copy_width * 4;
+            rgba[dst..dst + len].copy_from_slice(&tile.pixels[src..src + len]);
+        }
+        tile_count += 1;
     }
 
     Ok(Capture {
@@ -495,7 +555,7 @@ pub async fn capture(
 
     let full_page = matches!(&region, Region::FullPage);
     let clip: Option<Clip> = match region {
-        Region::Viewport => None,
+        Region::Viewport => viewport_clip(&metrics(client, session_id).await?),
         Region::FullPage => {
             let m = metrics(client, session_id).await?;
             Some(Clip {
@@ -851,5 +911,65 @@ mod tests {
         assert_eq!(ImageFormat::parse("jpg"), Some(ImageFormat::Jpeg));
         assert_eq!(ImageFormat::parse("jpeg"), Some(ImageFormat::Jpeg));
         assert_eq!(ImageFormat::parse("gif"), None);
+    }
+
+    #[test]
+    fn viewport_clip_uses_layout_viewport_not_window_chrome() {
+        let metrics = Metrics {
+            page_x: 0.0,
+            page_y: 12.0,
+            content_width: 1265.0,
+            content_height: 3000.0,
+            layout_width: 1265.0,
+            layout_height: 800.0,
+        };
+        assert_eq!(
+            viewport_clip(&metrics),
+            Some(Clip {
+                x: 0.0,
+                y: 12.0,
+                width: 1265.0,
+                height: 800.0
+            })
+        );
+        let missing = Metrics {
+            layout_width: 0.0,
+            layout_height: 800.0,
+            ..metrics
+        };
+        assert_eq!(viewport_clip(&missing), None);
+    }
+
+    #[test]
+    fn fractional_dpr_last_tile_requests_integer_css_that_covers_device_rows() {
+        // Chrome 148 / Linux: a 627.2×8200 CSS page at DPR 1.25 used to ask for
+        // the last clip at y=8163.2 height=36.8 (required 46 device px). Chromium
+        // integerized that height to 36 CSS px and returned 45.
+        let full = Clip {
+            x: 0.0,
+            y: 0.0,
+            width: 627.2,
+            height: 8200.0,
+        };
+        let tiles = tiled_full_page_tiles(full, 1.25);
+        assert!(tiles.len() >= 2, "the area bound must split this page");
+        let last = tiles.last().expect("last tile");
+        assert_eq!(last.copy_height, 46);
+        assert_eq!(
+            last.y.fract(),
+            0.0,
+            "clip origin must be integer CSS: {last:?}"
+        );
+        assert_eq!(
+            last.height.fract(),
+            0.0,
+            "clip height must be integer CSS: {last:?}"
+        );
+        assert!(
+            last.height * 1.25 >= last.copy_height as f64,
+            "integer CSS clip must cover the required device rows: {last:?}"
+        );
+        assert_eq!(last.y, 8163.0);
+        assert_eq!(last.height, 37.0);
     }
 }
