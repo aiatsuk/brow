@@ -3,7 +3,7 @@
 //! Everything lives under one root so that uninstalling is `rm -rf` of a single
 //! directory, and so a user can see exactly what the tool has stored.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MAX_SESSION_COMPONENT_BYTES: usize = 240;
 
@@ -51,6 +51,60 @@ pub fn profile(session: &str) -> PathBuf {
 /// Where screenshots and other outputs land when no path is given.
 pub fn artifacts(session: &str) -> PathBuf {
     root().join("artifacts").join(sanitize(session))
+}
+
+/// Creates a directory tree and durably publishes every newly-created
+/// directory entry before returning.
+///
+/// `create_dir_all` alone is not a host-crash durability boundary: a new child
+/// can disappear unless its parent directory is synced. Walking the missing
+/// chain deepest-first commits each child before the parent that names it.
+pub(crate) fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut missing = Vec::new();
+    let mut cursor = absolute.as_path();
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        cursor = parent;
+    }
+    std::fs::create_dir_all(&absolute)?;
+    #[cfg(unix)]
+    for directory in &missing {
+        if let Some(parent) = directory.parent() {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// Encodes one explicit artifact name without allowing traversal or aliases.
+pub(crate) fn artifact_component(name: &str) -> std::io::Result<String> {
+    if name.is_empty() || name.len() > 80 || name.chars().any(char::is_control) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact name must be 1..=80 bytes and contain no control characters",
+        ));
+    }
+    let encoded = sanitize(name);
+    if encoded.len() > MAX_SESSION_COMPONENT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "encoded artifact name is too long",
+        ));
+    }
+    Ok(encoded)
 }
 
 /// Refuses an ambiguous upgrade from the historical lossy session mapping.
@@ -116,10 +170,14 @@ pub fn job(id: &str) -> PathBuf {
 /// is a real access control, not hygiene.
 pub fn ensure_layout() -> std::io::Result<()> {
     let root = root();
-    std::fs::create_dir_all(root.join("run"))?;
-    std::fs::create_dir_all(logs())?;
-    std::fs::create_dir_all(root.join("profiles"))?;
-    std::fs::create_dir_all(root.join("artifacts"))?;
+    // These directories are part of the daemon's persisted contract. Plain
+    // `create_dir_all` can report success while the parent directory entry is
+    // still only in the kernel cache, so a host crash could make a subsequently
+    // fsynced manifest unreachable after restart.
+    create_dir_all_durable(&root.join("run"))?;
+    create_dir_all_durable(&logs())?;
+    create_dir_all_durable(&root.join("profiles"))?;
+    create_dir_all_durable(&root.join("artifacts"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -127,6 +185,10 @@ pub fn ensure_layout() -> std::io::Result<()> {
             let mut perms = std::fs::metadata(&dir)?.permissions();
             perms.set_mode(0o700);
             std::fs::set_permissions(&dir, perms)?;
+            // Persist the access-control metadata too. On a fresh layout the
+            // directory may initially have been created under a permissive
+            // umask; a crash must not resurrect that pre-chmod mode.
+            sync_directory(&dir)?;
         }
     }
     Ok(())
@@ -228,6 +290,14 @@ mod tests {
         )
         .expect_err("uppercase bytes expand to percent escapes");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn durable_directory_creation_builds_nested_parents() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("jobs/job_1/checkpoints");
+        create_dir_all_durable(&nested).expect("create and sync nested directory chain");
+        assert!(nested.is_dir());
     }
 
     #[test]

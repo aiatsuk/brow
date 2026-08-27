@@ -6,11 +6,19 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use brow::browser::{launch, Headless, LaunchOptions, Launched};
-use brow::page::{ImageFormat, MouseButton, Node, Page, PointTarget, ScreenshotTarget, Snapshot};
+#[cfg(debug_assertions)]
+use brow::ipc::WaitConditions;
+use brow::ipc::WaitPolicy;
+#[cfg(debug_assertions)]
+use brow::page::{DispatchState, PageError};
+use brow::page::{
+    ImageFormat, MouseButton, NavigationKind, NavigationScope, Node, Page, PointTarget,
+    ScreenshotTarget, Snapshot, WaitOutcome,
+};
 use serde_json::json;
 
 type Handler = dyn Fn(&str, &str) -> String + Send + Sync + 'static;
@@ -189,6 +197,63 @@ fn main_fixture(child_base: String) -> HttpFixture {
     HttpFixture::start("localhost", handler)
 }
 
+#[derive(Default)]
+struct OverlapGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl OverlapGate {
+    fn mark_action_started_and_wait(&self) {
+        let mut state = self.state.lock().expect("overlap gate");
+        state.0 = true;
+        self.changed.notify_all();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.1)
+            .expect("overlap gate condvar");
+        assert!(state.1, "unrelated OOPIF navigation was never released");
+    }
+
+    fn wait_for_action(&self) {
+        let state = self.state.lock().expect("overlap gate");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.0)
+            .expect("overlap gate condvar");
+        assert!(state.0, "root action did not reach the overlap barrier");
+    }
+
+    fn release_action(&self) {
+        let mut state = self.state.lock().expect("overlap gate");
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+fn overlap_main_fixture(child_base: String) -> (HttpFixture, Arc<OverlapGate>) {
+    let gate = Arc::new(OverlapGate::default());
+    let handler_gate = Arc::clone(&gate);
+    let handler: Arc<Handler> = Arc::new(move |_method, path| {
+        if path.starts_with("/root-action-started") {
+            handler_gate.mark_action_started_and_wait();
+            return "ok".into();
+        }
+        format!(
+            "<!doctype html><html><head><title>OOPIF overlap parent</title></head>\
+             <body style='margin:0'>\
+               <button id='root-action' aria-label='Root no navigation'>root action</button>\
+               <iframe id='foreign' src='{child_base}/child' \
+                 style='position:absolute;left:120px;top:140px;width:420px;height:260px;border:0'></iframe>\
+               <script>rootAction=document.querySelector('#root-action');\
+                 rootAction.onclick=()=>{{const marker=new XMLHttpRequest();\
+                 marker.open('POST','/root-action-started',false);marker.send(null);}};</script>\
+             </body></html>"
+        )
+    });
+    (HttpFixture::start("localhost", handler), gate)
+}
+
 async fn open_page(url: &str) -> (Launched, Page, common::Scratch) {
     let scratch = common::Scratch::new("oopif");
     let mut options = LaunchOptions::new(scratch.0.join("profile"));
@@ -247,11 +312,262 @@ async fn wait_for_generation(page: &Page, before: u64) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn unrelated_oopif_navigation_cannot_settle_a_root_action() {
+    if !common::chrome_available() {
+        return common::skip("unrelated_oopif_navigation_cannot_settle_a_root_action");
+    }
+    // OOPIF scenarios fan out into several renderer/helper processes each.
+    // Reserving the pool keeps three parallel OOPIF tests from exhausting
+    // Chrome during the protocol handshake after the larger E2E suite.
+    let _slots = common::exclusive_browser_slots();
+    let (child, _child_state) = child_fixture(String::new());
+    let (parent, gate) = overlap_main_fixture(child.base.clone());
+    let (launched, mut page, _scratch) = open_page(&parent.url("/")).await;
+
+    let snapshot = snapshot_until(&mut page, |snapshot| {
+        ["Root no navigation", "Cross origin action"]
+            .into_iter()
+            .all(|name| {
+                snapshot
+                    .interactive()
+                    .any(|node| node.name.as_deref() == Some(name))
+            })
+    })
+    .await;
+    let root_action = named(&snapshot, "Root no navigation");
+    let child_action = named(&snapshot, "Cross origin action");
+    assert_eq!(root_action.session_id, page.session_id);
+    assert_ne!(child_action.session_id, page.session_id);
+
+    let client = Arc::clone(&launched.client);
+    let child_session = child_action.session_id.clone();
+    let navigation_gate = Arc::clone(&gate);
+    let unrelated_navigation = tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || navigation_gate.wait_for_action())
+            .await
+            .expect("overlap waiter");
+        client
+            .call_on(
+                &child_session,
+                "Runtime.evaluate",
+                json!({
+                    "expression": "location.hash='unrelated-navigation'",
+                    "returnByValue": true
+                }),
+            )
+            .await
+            .expect("dispatch unrelated OOPIF navigation");
+        gate.release_action();
+    });
+
+    let (_, receipt) = page
+        .click_with_wait(
+            &root_action.node_ref,
+            MouseButton::Left,
+            1,
+            0,
+            false,
+            WaitPolicy::Auto,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("root action remains navigation-free");
+    unrelated_navigation
+        .await
+        .expect("unrelated navigation task");
+    assert_eq!(receipt.outcome, WaitOutcome::NoNavigation, "{receipt:?}");
+    assert_eq!(receipt.navigation, NavigationKind::None, "{receipt:?}");
+    assert_eq!(
+        receipt.navigation_scope,
+        NavigationScope::None,
+        "{receipt:?}"
+    );
+
+    shutdown(launched);
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread")]
+async fn stable_fails_closed_while_an_oopif_initializer_is_held() {
+    if !common::chrome_available() {
+        return common::skip("stable_fails_closed_while_an_oopif_initializer_is_held");
+    }
+    let _slots = common::exclusive_browser_slots();
+    let child_handler: Arc<Handler> = Arc::new(|_method, _path| {
+        "<!doctype html><html><body><button aria-label='Held child ready'>ready</button></body></html>"
+            .into()
+    });
+    let child = HttpFixture::start("127.0.0.1", child_handler);
+    let held_child_url = child.url("/held");
+    let parent_handler: Arc<Handler> = Arc::new(move |_method, path| {
+        if path.starts_with("/with-child") {
+            return format!(
+                "<!doctype html><html><head><title>action initializer gate</title></head>\
+                 <body><h1>navigated root</h1><iframe src='{held_child_url}'></iframe></body></html>"
+            );
+        }
+        "<!doctype html><html><head><title>initializer gate</title></head>\
+         <body><h1>root ready</h1>\
+           <button id='navigate' aria-label='Navigate to held target tree'>navigate</button>\
+           <script>navigate.onclick=()=>location.href='/with-child'</script>\
+         </body></html>"
+            .into()
+    });
+    let parent = HttpFixture::start("localhost", parent_handler);
+    let (launched, mut page, _scratch) = open_page(&parent.url("/")).await;
+
+    let hold = brow::page::test_support::hold_next_target_initializer(page.session_id.clone());
+    page.evaluate(
+        &format!(
+            "const frame=document.createElement('iframe');frame.src={:?};document.body.appendChild(frame)",
+            child.url("/held")
+        ),
+        false,
+    )
+    .await
+    .expect("create held OOPIF");
+    tokio::time::timeout(Duration::from_secs(2), hold.wait_until_entered())
+        .await
+        .expect("OOPIF initializer reached deterministic barrier");
+
+    let error = page
+        .wait_for_conditions(
+            &WaitConditions {
+                stable: true,
+                ..WaitConditions::default()
+            },
+            Duration::from_millis(350),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("held related target must prevent a stable claim");
+    let PageError::WaitFailure { receipt, .. } = error else {
+        panic!("expected typed wait failure, got {error:?}");
+    };
+    assert_eq!(receipt.outcome, WaitOutcome::TimedOut, "{receipt:?}");
+    assert!(!receipt.root_loading, "{receipt:?}");
+    assert!(!receipt.target_settled, "{receipt:?}");
+    assert!(
+        receipt
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("related target")),
+        "{receipt:?}"
+    );
+
+    hold.release();
+    let snapshot = snapshot_until(&mut page, |snapshot| {
+        snapshot.coverage_gaps.is_empty()
+            && snapshot
+                .interactive()
+                .any(|node| node.name.as_deref() == Some("Held child ready"))
+    })
+    .await;
+    assert!(snapshot.coverage_gaps.is_empty());
+    let settled = page
+        .wait_for_conditions(
+            &WaitConditions {
+                stable: true,
+                ..WaitConditions::default()
+            },
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "stable succeeds after related target initialization: {error:?}; network={:#?}",
+                page.events.network(false, 20)
+            )
+        });
+    assert!(!settled.root_loading, "{settled:?}");
+    assert!(settled.target_settled, "{settled:?}");
+
+    // A navigation action must apply the same target-tree gate as an explicit
+    // stable wait. Hold the new OOPIF's initializer across a real root
+    // navigation and prove Load cannot report success while that related target
+    // is known but unusable.
+    let navigation_snapshot = snapshot_until(&mut page, |snapshot| {
+        snapshot
+            .interactive()
+            .any(|node| node.name.as_deref() == Some("Navigate to held target tree"))
+    })
+    .await;
+    let navigate = named(&navigation_snapshot, "Navigate to held target tree");
+    assert_eq!(navigate.session_id, page.session_id);
+
+    let action_hold =
+        brow::page::test_support::hold_next_target_initializer(page.session_id.clone());
+    let action_result = {
+        let action = page.click_with_wait(
+            &navigate.node_ref,
+            MouseButton::Left,
+            1,
+            0,
+            false,
+            WaitPolicy::Load,
+            Duration::from_millis(700),
+        );
+        tokio::pin!(action);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                _ = action_hold.wait_until_entered() => {}
+                result = &mut action => {
+                    panic!("navigation action completed before its OOPIF initializer was held: {result:?}")
+                }
+            }
+        })
+        .await
+        .expect("action-created OOPIF reached deterministic barrier");
+        tokio::time::timeout(Duration::from_secs(2), &mut action)
+            .await
+            .expect("held target action respected its own deadline")
+    };
+    let error = action_result.expect_err("unsettled action target tree must fail closed");
+    let PageError::WaitFailure { receipt, .. } = error else {
+        panic!("expected action wait failure, got {error:?}");
+    };
+    assert_eq!(receipt.dispatch_state, DispatchState::Sent, "{receipt:?}");
+    assert_eq!(receipt.dispatched, Some(true), "{receipt:?}");
+    assert_eq!(
+        receipt.navigation,
+        NavigationKind::CrossDocument,
+        "{receipt:?}"
+    );
+    assert_eq!(
+        receipt.navigation_scope,
+        NavigationScope::Root,
+        "{receipt:?}"
+    );
+    assert!(
+        matches!(
+            receipt.outcome,
+            WaitOutcome::TimedOut | WaitOutcome::Incomplete
+        ),
+        "{receipt:?}"
+    );
+    assert!(!receipt.target_settled, "{receipt:?}");
+    assert!(!receipt.blockers.is_empty(), "{receipt:?}");
+
+    action_hold.release();
+    let action_snapshot = snapshot_until(&mut page, |snapshot| {
+        snapshot.coverage_gaps.is_empty()
+            && snapshot
+                .interactive()
+                .any(|node| node.name.as_deref() == Some("Held child ready"))
+    })
+    .await;
+    assert!(action_snapshot.coverage_gaps.is_empty());
+
+    shutdown(launched);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn oopif_snapshot_actions_lifecycle_and_coverage_are_real() {
     if !common::chrome_available() {
         return common::skip("oopif_snapshot_actions_lifecycle_and_coverage_are_real");
     }
-    let _slot = common::browser_slot();
+    let _slots = common::exclusive_browser_slots();
     let (nested, nested_clicks) = nested_fixture();
     let (child, child_state) = child_fixture(nested.base.clone());
     let parent = main_fixture(child.base.clone());
@@ -491,10 +807,21 @@ async fn oopif_snapshot_actions_lifecycle_and_coverage_are_real() {
     .await;
     let navigate = named(&nav_snapshot, "Navigate child");
     let generation_before = page.generation();
-    page.click(&navigate.node_ref, MouseButton::Left, 1, 0, false)
+    let (_, receipt) = page
+        .click_with_wait(
+            &navigate.node_ref,
+            MouseButton::Left,
+            1,
+            0,
+            false,
+            WaitPolicy::Auto,
+            Duration::from_secs(3),
+        )
         .await
         .expect("navigate inside OOPIF");
-    wait_for_generation(&page, generation_before).await;
+    assert_eq!(receipt.outcome, WaitOutcome::Committed);
+    assert_eq!(receipt.navigation_scope, NavigationScope::Subframe);
+    assert!(receipt.final_generation > generation_before, "{receipt:?}");
     let stale = page
         .click(&navigate.node_ref, MouseButton::Left, 1, 0, false)
         .await

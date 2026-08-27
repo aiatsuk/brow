@@ -89,7 +89,7 @@ fn a_job_runs_a_plan_to_completion_in_the_background() {
         "job",
         "start",
         "--intent",
-        "check that the signup button works",
+        "check signup at https://trace-user:trace-pass@app.test/?token=trace-query",
         "--step",
         &format!("open {}", fixture.url("/")),
         "--step",
@@ -101,6 +101,27 @@ fn a_job_runs_a_plan_to_completion_in_the_background() {
     ]);
     let id = started["id"].as_str().expect("a job id").to_string();
     assert_eq!(started["state"], "queued");
+    let admitted_artifacts =
+        std::path::PathBuf::from(started["artifacts"].as_str().expect("artifact path"));
+    let admitted: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(admitted_artifacts.join("job.json"))
+            .expect("accepted job must have a durable manifest before start returns"),
+    )
+    .expect("accepted job manifest is valid JSON");
+    assert_eq!(admitted["id"], id);
+    assert!(
+        admitted["state"] == "queued"
+            || admitted["state"] == "running"
+            || admitted["state"] == "succeeded",
+        "runner may advance the durable admission, but it may not disappear: {admitted:#}"
+    );
+    let admitted_bytes = std::fs::read_to_string(admitted_artifacts.join("job.json")).unwrap();
+    for secret in ["trace-user", "trace-pass", "trace-query"] {
+        assert!(
+            !admitted_bytes.contains(secret),
+            "durable admission leaked {secret}: {admitted_bytes}"
+        );
+    }
 
     // `job start` must return immediately rather than block for the run.
     let status = h.wait_for(&id, &["succeeded", "failed"], 60);
@@ -133,6 +154,274 @@ fn a_job_runs_a_plan_to_completion_in_the_background() {
         .any(|j| j["id"] == id.as_str() && j["state"] == "succeeded"));
 
     h.ok(&["daemon", "stop"]);
+    let daemon_log =
+        std::fs::read_to_string(h.home.join("logs/browd.log")).expect("durable daemon log");
+    for secret in ["trace-user", "trace-pass", "trace-query"] {
+        assert!(
+            !daemon_log.contains(secret),
+            "browd.log leaked {secret}: {daemon_log}"
+        );
+    }
+}
+
+#[test]
+fn typed_flow_steps_and_checkpoint_each_step_round_trip_and_execute() {
+    if !common::chrome_available() {
+        return common::skip("typed_flow_steps_and_checkpoint_each_step_round_trip_and_execute");
+    }
+    let _slot = common::browser_slot();
+    let h = Harness::new("typed-flow");
+    let fixture = common::serve();
+
+    let started = h.json(&[
+        "job",
+        "start",
+        "--intent",
+        "prove typed waits and durable evidence",
+        "--checkpoint-each-step",
+        "--step",
+        &format!("open {}", fixture.url("/second")),
+        "--step",
+        "wait stable quiet-ms=100",
+        "--step",
+        "pointer park",
+    ]);
+    let id = started["id"].as_str().unwrap().to_string();
+    let status = h.wait_for(&id, &["succeeded", "failed"], 60);
+    assert_eq!(status["state"], "succeeded", "{status:#}");
+    let checkpoints = status["checkpoints"]
+        .as_array()
+        .expect("checkpoint path list");
+    assert_eq!(checkpoints.len(), 3, "{status:#}");
+    for (index, path) in checkpoints.iter().enumerate() {
+        let path = std::path::PathBuf::from(path.as_str().unwrap());
+        assert!(path.join("manifest.json").is_file(), "checkpoint {index}");
+        assert!(path.join("screenshot.png").is_file(), "checkpoint {index}");
+    }
+
+    let artifacts = std::path::PathBuf::from(status["artifacts"].as_str().unwrap());
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(artifacts.join("job.json")).expect("persisted job manifest"),
+    )
+    .expect("valid persisted job JSON");
+    assert_eq!(persisted["checkpoint_each_step"], true);
+    assert_eq!(persisted["checkpoints"].as_array().unwrap().len(), 3);
+    let log = persisted["log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|line| line["text"].as_str())
+        .collect::<Vec<_>>();
+    let pointer = log
+        .iter()
+        .filter_map(|line| line.strip_prefix("receipt "))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|receipt| receipt["operation"] == "pointer_park")
+        .expect("pointer park must log its structured receipt");
+    assert_eq!(pointer["operation"], "pointer_park");
+    assert_eq!(pointer["dispatch_state"], "sent");
+    let checkpoint_results = log
+        .iter()
+        .filter_map(|line| line.strip_prefix("checkpoint_result "))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(checkpoint_results.len(), 3, "{log:#?}");
+    assert!(checkpoint_results.iter().all(|result| {
+        result["manifest"]["wait"]["operation"] == "wait"
+            && result["path"].is_string()
+            && result["durability"]["status"].is_string()
+    }));
+}
+
+#[test]
+fn explicit_checkpoint_replaces_the_automatic_checkpoint_for_that_step() {
+    if !common::chrome_available() {
+        return common::skip("explicit_checkpoint_replaces_the_automatic_checkpoint_for_that_step");
+    }
+    let _slot = common::browser_slot();
+    let h = Harness::new("explicit-checkpoint");
+    let fixture = common::serve();
+
+    let started = h.json(&[
+        "job",
+        "start",
+        "--intent",
+        "one evidence bundle per successful logical step",
+        "--checkpoint-each-step",
+        "--step",
+        &format!("open {}", fixture.url("/second")),
+        "--step",
+        "checkpoint manual",
+    ]);
+    let id = started["id"].as_str().unwrap().to_string();
+    let status = h.wait_for(&id, &["succeeded", "failed"], 60);
+    assert_eq!(status["state"], "succeeded", "{status:#}");
+    let checkpoints = status["checkpoints"].as_array().unwrap();
+    assert_eq!(
+        checkpoints.len(),
+        2,
+        "explicit capture was duplicated: {status:#}"
+    );
+    let names = checkpoints
+        .iter()
+        .map(|path| {
+            std::path::Path::new(path.as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["after-step-001", "manual"]);
+
+    let artifacts = std::path::PathBuf::from(status["artifacts"].as_str().unwrap());
+    let discovered = std::fs::read_dir(artifacts.join("checkpoints"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .count();
+    assert_eq!(discovered, 2, "an unlisted final checkpoint exists");
+}
+
+#[test]
+fn stop_cancels_a_typed_stable_wait_before_following_checkpoint() {
+    if !common::chrome_available() {
+        return common::skip("stop_cancels_a_typed_stable_wait_before_following_checkpoint");
+    }
+    let _slot = common::browser_slot();
+    let h = Harness::new("stop-stable");
+    let fixture = common::serve();
+    let started = h.json(&[
+        "job",
+        "start",
+        "--intent",
+        "stop a deterministic wait safely",
+        "--checkpoint-each-step",
+        "--step",
+        &format!("open {}", fixture.url("/navigation")),
+        "--step",
+        "click Submit once",
+        "--step",
+        "wait stable quiet-ms=300",
+        "--step",
+        "checkpoint should-not-exist",
+    ]);
+    let id = started["id"].as_str().unwrap().to_string();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut current = serde_json::Value::Null;
+    while std::time::Instant::now() < deadline {
+        current = h.json(&["job", "status", &id]);
+        let log = current["log"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|line| line["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if log.contains("[3/4] wait for browser stability") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    assert_eq!(current["state"], "running", "{current:#}");
+    // The step log is committed before the fixture thread is guaranteed to
+    // observe Chromium's asynchronous fetch. Establish the external side-effect
+    // oracle before raising stop so a slow localhost scheduler cannot look like
+    // either a missing dispatch or a replay.
+    let side_effect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while fixture.side_effect_count() == 0 && std::time::Instant::now() < side_effect_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        fixture.side_effect_count(),
+        1,
+        "the dispatched click did not produce exactly one observable side effect before stop"
+    );
+    h.ok(&["job", "stop", &id]);
+    let stopped = h.wait_for(&id, &["stopped", "failed", "succeeded"], 10);
+    assert_eq!(stopped["state"], "stopped", "{stopped:#}");
+    let checkpoints = stopped["checkpoints"].as_array().unwrap();
+    assert_eq!(checkpoints.len(), 3, "{stopped:#}");
+    let names = checkpoints
+        .iter()
+        .map(|path| {
+            std::path::Path::new(path.as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["after-step-001", "after-step-002", "terminal-stopped"]
+    );
+    let artifacts = std::path::PathBuf::from(stopped["artifacts"].as_str().unwrap());
+    assert!(!artifacts.join("checkpoints/after-step-003").exists());
+    assert!(!artifacts.join("checkpoints/should-not-exist").exists());
+    let inventory_at_response = std::fs::read_dir(artifacts.join("checkpoints"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let inventory_later = std::fs::read_dir(artifacts.join("checkpoints"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inventory_at_response, inventory_later,
+        "checkpoint appeared after stop returned"
+    );
+    assert_eq!(fixture.side_effect_count(), 1, "click was replayed");
+}
+
+#[test]
+fn stop_does_not_capture_terminal_evidence_while_waiting_for_human_input() {
+    if !common::chrome_available() {
+        return common::skip(
+            "stop_does_not_capture_terminal_evidence_while_waiting_for_human_input",
+        );
+    }
+    let _slot = common::browser_slot();
+    let h = Harness::new("stop-parked");
+    let fixture = common::serve();
+    let started = h.json(&[
+        "job",
+        "start",
+        "--intent",
+        "stop without capturing unapproved page state",
+        "--checkpoint-each-step",
+        "--step",
+        &format!("open {}", fixture.url("/ambiguous")),
+        "--step",
+        "click Continue",
+    ]);
+    let id = started["id"].as_str().unwrap().to_string();
+    let parked = h.wait_for(&id, &["needs_decision", "failed", "succeeded"], 60);
+    assert_eq!(parked["state"], "needs_decision", "{parked:#}");
+
+    h.ok(&["job", "stop", &id]);
+    let stopped = h.wait_for(&id, &["stopped", "failed", "succeeded"], 10);
+    assert_eq!(stopped["state"], "stopped", "{stopped:#}");
+    let checkpoints = stopped["checkpoints"].as_array().unwrap();
+    assert_eq!(checkpoints.len(), 1, "{stopped:#}");
+    assert!(checkpoints[0].as_str().unwrap().ends_with("after-step-001"));
+    let log = stopped["log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|line| line["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        log.contains(
+            "terminal checkpoint skipped: cancellation occurred while waiting for human input"
+        ),
+        "{log}"
+    );
 }
 
 #[test]
@@ -623,4 +912,53 @@ fn stopping_a_job_ends_it_and_takes_its_browser() {
     assert_eq!(left, 0, "a stopped job leaked its browser");
 
     h.ok(&["daemon", "stop"]);
+}
+
+#[test]
+fn stopping_the_daemon_waits_until_job_browsers_are_reaped() {
+    if !common::chrome_available() {
+        return common::skip("stopping_the_daemon_waits_until_job_browsers_are_reaped");
+    }
+    let _slot = common::browser_slot();
+    let h = Harness::new("daemon-stop-job");
+    let fixture = common::serve();
+
+    let started = h.json(&[
+        "job",
+        "start",
+        "--intent",
+        "daemon shutdown owns browser cleanup",
+        "--step",
+        &format!("open {}", fixture.url("/")),
+        "--step",
+        "wait 60000",
+    ]);
+    let id = started["id"].as_str().unwrap().to_string();
+    h.wait_for(&id, &["running"], 30);
+    let pattern = h.home.join("jobs").display().to_string();
+    let browsers = |pattern: &str| {
+        Command::new("pgrep")
+            .arg("-f")
+            .arg(pattern)
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).lines().count())
+            .unwrap_or(0)
+    };
+    assert!(browsers(&pattern) > 0, "the job did not start a browser");
+
+    h.ok(&["daemon", "stop"]);
+
+    assert_eq!(
+        browsers(&pattern),
+        0,
+        "daemon stop returned before the job browser was reaped"
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            std::path::PathBuf::from(started["artifacts"].as_str().unwrap()).join("job.json"),
+        )
+        .expect("terminal job manifest"),
+    )
+    .expect("terminal job manifest is valid");
+    assert_eq!(manifest["state"], "stopped", "{manifest:#}");
 }

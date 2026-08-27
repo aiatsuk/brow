@@ -113,6 +113,95 @@ pub fn url(raw: &str) -> String {
     out
 }
 
+/// Redacts a URL glob before it is persisted as wait evidence.
+///
+/// Globs are not necessarily parse-shaped URLs: `*access_token=secret*` is a
+/// valid matcher even though it has no literal query delimiter. Apply the
+/// ordinary URL rules first, then conservatively mask recognized credential
+/// assignments anywhere they occur on a token boundary.
+pub fn url_glob(raw: &str) -> String {
+    SECRET_PARAMS.iter().fold(url(raw), |value, name| {
+        redact_named_assignment(&value, name)
+    })
+}
+
+/// Redacts recognizable credentials inside durable prose such as job logs.
+/// Unlike [`url`], this does not interpret the whole string as one URL, so
+/// punctuation and unrelated text remain byte-for-byte intact.
+pub fn storage_text(raw: &str) -> String {
+    let without_userinfo = redact_url_userinfo_in_text(&text(raw));
+    SECRET_PARAMS.iter().fold(without_userinfo, |value, name| {
+        redact_named_assignment(&value, name)
+    })
+}
+
+/// Masks URL authority credentials embedded anywhere in a prose field.
+///
+/// Calling [`url`] on a whole log sentence would treat everything after its
+/// first `?` as one query and cannot correctly process a second URL. Scan only
+/// URL-like authority spans here, leaving punctuation and surrounding prose
+/// untouched.
+fn redact_url_userinfo_in_text(raw: &str) -> String {
+    let mut out = raw.to_string();
+    let mut cursor = 0;
+    while let Some(relative_scheme) = out[cursor..].find("://") {
+        let authority_start = cursor + relative_scheme + 3;
+        let authority_end = out[authority_start..]
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        '/' | '?' | '#' | '\'' | '"' | '<' | '>' | '(' | ')' | '[' | ']' | ','
+                    )
+            })
+            .map(|offset| authority_start + offset)
+            .unwrap_or(out.len());
+        let authority = &out[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            let userinfo_end = authority_start + at;
+            out.replace_range(authority_start..userinfo_end, MASK);
+            cursor = authority_start + MASK.len() + 1;
+        } else {
+            cursor = authority_end.max(authority_start);
+        }
+        if cursor >= out.len() {
+            break;
+        }
+    }
+    out
+}
+
+fn redact_named_assignment(raw: &str, name: &str) -> String {
+    let needle = format!("{name}=");
+    let mut out = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    while let Some(relative) = find_ci(&raw[cursor..], &needle) {
+        let start = cursor + relative;
+        let bounded = start == 0
+            || !raw.as_bytes()[start - 1].is_ascii_alphanumeric()
+                && !matches!(raw.as_bytes()[start - 1], b'_' | b'-');
+        if !bounded {
+            let advance = start + 1;
+            out.push_str(&raw[cursor..advance]);
+            cursor = advance;
+            continue;
+        }
+
+        let value_start = start + needle.len();
+        let value_end = raw[value_start..]
+            .find(|character: char| {
+                matches!(character, '&' | '#' | '\'' | '"') || character.is_whitespace()
+            })
+            .map(|offset| value_start + offset)
+            .unwrap_or(raw.len());
+        out.push_str(&raw[cursor..value_start]);
+        out.push_str(MASK);
+        cursor = value_end;
+    }
+    out.push_str(&raw[cursor..]);
+    out
+}
+
 /// Masks the RFC 3986 `userinfo@` authority component. Passwords in URL
 /// userinfo are credentials even when no query parameter carries a recognizable
 /// name. The username is masked too because it can itself be sensitive.
@@ -310,6 +399,41 @@ mod tests {
             format!("not a url?token={MASK}")
         );
         assert_eq!(url(""), "");
+    }
+
+    #[test]
+    fn url_globs_redact_secret_assignments_without_query_delimiters() {
+        assert_eq!(
+            url_glob("*access_token=typed-wait-secret*#settled"),
+            format!("*access_token={MASK}#settled")
+        );
+        assert_eq!(
+            url_glob("*?page=2&REFRESH_TOKEN=secret-value*#done"),
+            format!("*?page=2&REFRESH_TOKEN={MASK}#done")
+        );
+        assert_eq!(
+            url_glob("*my_access_token=ordinary*"),
+            "*my_access_token=ordinary*",
+            "a credential name embedded in another parameter is not the same key"
+        );
+    }
+
+    #[test]
+    fn durable_prose_masks_url_assignments_without_rewriting_the_sentence() {
+        assert_eq!(
+            storage_text("open https://x.test/?access_token=secret&page=2 next"),
+            format!("open https://x.test/?access_token={MASK}&page=2 next")
+        );
+        assert_eq!(
+            storage_text("retry Bearer sk_live_abcdef later"),
+            format!("retry Bearer {MASK} later")
+        );
+        assert_eq!(
+            storage_text(
+                "failed https://alice:swordfish@one.test/a then https://bob:second@two.test/b"
+            ),
+            format!("failed https://{MASK}@one.test/a then https://{MASK}@two.test/b")
+        );
     }
 
     #[test]

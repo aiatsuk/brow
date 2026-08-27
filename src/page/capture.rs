@@ -7,13 +7,12 @@
 //! exactly one place here, using the visual viewport's page offset.
 
 use std::ffi::OsString;
-use std::io::Cursor;
+use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 
 use crate::cdp::{CdpClient, CdpError};
@@ -111,40 +110,48 @@ pub struct Capture {
 
 impl Capture {
     pub async fn write_to(&self, path: &Path) -> std::io::Result<PathBuf> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+        let parent = publication_parent(path);
+        crate::paths::create_dir_all_durable(parent)?;
         let sequence = CAPTURE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let mut temp_name = OsString::from(path.file_name().unwrap_or_default());
         temp_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
         let temp = path.with_file_name(temp_name);
-        let result = async {
-            let mut file = tokio::fs::OpenOptions::new()
+        // Deliberately contains no await point. Job cancellation uses `select!`;
+        // splitting write/fsync/rename across cancellable Tokio filesystem
+        // futures can publish an orphan PNG after `job stop` has already replied.
+        // Once this future is polled, publication completes (or fails) before
+        // cancellation can be observed.
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&temp)
-                .await?;
-            file.write_all(&self.bytes).await?;
-            file.flush().await?;
-            file.sync_all().await?;
+                .open(&temp)?;
+            file.write_all(&self.bytes)?;
+            file.flush()?;
+            file.sync_all()?;
             drop(file);
-            tokio::fs::rename(&temp, path).await?;
+            std::fs::rename(&temp, path)?;
             #[cfg(unix)]
-            if let Some(parent) = path.parent() {
+            {
                 // The manifest may be fsynced immediately after this returns. Sync
                 // the directory too, so it can never durably point at evidence
                 // whose rename existed only in the kernel cache.
-                tokio::fs::File::open(parent).await?.sync_all().await?;
+                crate::paths::sync_directory(parent)?;
             }
             Ok::<(), std::io::Error>(())
-        }
-        .await;
+        })();
         if result.is_err() {
-            let _ = tokio::fs::remove_file(&temp).await;
+            let _ = std::fs::remove_file(&temp);
         }
         result?;
         Ok(path.to_path_buf())
     }
+}
+
+fn publication_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 /// A clip clamped to what Chromium can actually render, plus a note when it had
@@ -186,12 +193,17 @@ fn clamp_clip(clip: Clip, scale: f64, device_ratio: f64) -> (Clip, Option<String
     (clamped, Some(note))
 }
 
-/// Document-space offset of the visual viewport, plus the full content size.
+/// Document-space offset of the visual viewport, plus the full content size
+/// and both viewport rectangles from `Page.getLayoutMetrics`.
 struct Metrics {
     page_x: f64,
     page_y: f64,
     content_width: f64,
     content_height: f64,
+    visual_width: f64,
+    visual_height: f64,
+    layout_width: f64,
+    layout_height: f64,
 }
 
 /// `window.devicePixelRatio`, which `Page.getLayoutMetrics` does not report.
@@ -219,6 +231,33 @@ async fn device_pixel_ratio(client: &CdpClient, session_id: &str) -> f64 {
         .unwrap_or(2.0)
 }
 
+fn json_number(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|n| n as f64))
+        .or_else(|| value.as_u64().map(|n| n as f64))
+}
+
+/// `window.innerWidth` / `innerHeight` — the CSS viewport the page actually uses.
+async fn inner_size(client: &CdpClient, session_id: &str) -> Option<(f64, f64)> {
+    let res = client
+        .call_on(
+            session_id,
+            "Runtime.evaluate",
+            json!({
+                "expression": "[window.innerWidth, window.innerHeight]",
+                "returnByValue": true,
+                "throwOnSideEffect": true,
+            }),
+        )
+        .await
+        .ok()?;
+    let values = res.get("result")?.get("value")?.as_array()?;
+    let width = json_number(values.first()?)?;
+    let height = json_number(values.get(1)?)?;
+    (width > 0.0 && height > 0.0).then_some((width, height))
+}
+
 async fn metrics(client: &CdpClient, session_id: &str) -> Result<Metrics, CdpError> {
     let m = client
         .call_on(session_id, "Page.getLayoutMetrics", json!({}))
@@ -228,10 +267,13 @@ async fn metrics(client: &CdpClient, session_id: &str) -> Result<Metrics, CdpErr
     let visual = m
         .get("cssVisualViewport")
         .or_else(|| m.get("visualViewport"));
+    let layout = m
+        .get("cssLayoutViewport")
+        .or_else(|| m.get("layoutViewport"));
     let content = m.get("cssContentSize").or_else(|| m.get("contentSize"));
     let num = |v: Option<&Value>, k: &str| -> f64 {
         v.and_then(|v| v.get(k))
-            .and_then(Value::as_f64)
+            .and_then(json_number)
             .unwrap_or(0.0)
     };
     Ok(Metrics {
@@ -239,7 +281,41 @@ async fn metrics(client: &CdpClient, session_id: &str) -> Result<Metrics, CdpErr
         page_y: num(visual, "pageY"),
         content_width: num(content, "width"),
         content_height: num(content, "height"),
+        visual_width: num(visual, "clientWidth"),
+        visual_height: num(visual, "clientHeight"),
+        layout_width: num(layout, "clientWidth"),
+        layout_height: num(layout, "clientHeight"),
     })
+}
+
+/// Visible page rectangle in document coordinates.
+///
+/// Prefer `cssVisualViewport`: on Chrome 148 / Linux it matches
+/// `window.innerWidth` (1280). `cssLayoutViewport.clientWidth` can be one
+/// classic-scrollbar narrower (1265) even when JS `clientWidth`/`scrollWidth`
+/// stay at 1280, so using the layout viewport would crop real page pixels and
+/// disagree with a `cssContentSize` full-page capture.
+fn viewport_clip(metrics: &Metrics) -> Option<Clip> {
+    let width = [metrics.visual_width, metrics.layout_width]
+        .into_iter()
+        .find(|width| *width > 0.0)?;
+    let height = [metrics.visual_height, metrics.layout_height]
+        .into_iter()
+        .find(|height| *height > 0.0)?;
+    Some(Clip {
+        x: metrics.page_x,
+        y: metrics.page_y,
+        width,
+        height,
+    })
+}
+
+/// Full-page width on the same CSS grid as the viewport capture.
+fn full_page_width(metrics: &Metrics) -> f64 {
+    metrics
+        .content_width
+        .max(metrics.visual_width)
+        .max(metrics.layout_width)
 }
 
 fn capture_error(method: &str, message: impl Into<String>) -> CdpError {
@@ -370,6 +446,72 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, CdpError>
     Ok(encoded)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct TilePlan {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    dst_x: usize,
+    dst_y: usize,
+    copy_width: usize,
+    copy_height: usize,
+}
+
+/// Device-pixel tile grid with CSS clips that still cover those pixels after
+/// Chromium integerizes `Page.captureScreenshot` rectangles.
+///
+/// Walking the page in CSS and converting with `round` asked Chrome 148 for a
+/// last clip of 36.8 CSS px at DPR 1.25 (required 46 device px). Chromium
+/// integerizes that height to 36 CSS px and returns 45. Asking for the integer
+/// CSS rect that covers the remaining device rows avoids the shortfall.
+fn tiled_full_page_tiles(full: Clip, device_ratio: f64) -> Vec<TilePlan> {
+    let factor = device_ratio.max(0.01);
+    let output_width = (full.width * factor).round().max(1.0) as u64;
+    let output_height = (full.height * factor).round().max(1.0) as u64;
+    let max_axis_output = (MAX_OUTPUT_PIXELS - 2.0) as u64;
+    let tile_output_width = output_width.min(max_axis_output).max(1);
+    // Covering integer CSS can add about one device pixel per axis; keep that
+    // expansion inside the per-frame decode budget (784×10205 = 8_000_720).
+    let axis_slack = factor.ceil().max(1.0) as u64;
+    let tile_output_height = (MAX_CAPTURE_FRAME_PIXELS
+        / tile_output_width.saturating_add(axis_slack))
+    .saturating_sub(axis_slack)
+    .min(max_axis_output)
+    .max(1);
+
+    let mut tiles = Vec::new();
+    let mut dst_y = 0_u64;
+    while dst_y < output_height {
+        let copy_height = tile_output_height.min(output_height - dst_y);
+        let mut dst_x = 0_u64;
+        while dst_x < output_width {
+            let copy_width = tile_output_width.min(output_width - dst_x);
+            let x0 = (dst_x as f64 / factor).floor().max(0.0);
+            let y0 = (dst_y as f64 / factor).floor().max(0.0);
+            let x1 = ((dst_x + copy_width) as f64 / factor)
+                .ceil()
+                .min(full.width);
+            let y1 = ((dst_y + copy_height) as f64 / factor)
+                .ceil()
+                .min(full.height);
+            tiles.push(TilePlan {
+                x: full.x + x0,
+                y: full.y + y0,
+                width: (x1 - x0).max(1.0 / factor),
+                height: (y1 - y0).max(1.0 / factor),
+                dst_x: dst_x as usize,
+                dst_y: dst_y as usize,
+                copy_width: copy_width as usize,
+                copy_height: copy_height as usize,
+            });
+            dst_x += copy_width;
+        }
+        dst_y += copy_height;
+    }
+    tiles
+}
+
 /// Captures a full page as a grid of clips that each remain below Chromium's
 /// silent 16,384-output-pixel corruption threshold, then stitches them in memory.
 async fn capture_tiled_full_page(
@@ -405,63 +547,36 @@ async fn capture_tiled_full_page(
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| capture_error("tiled capture", "RGBA allocation size overflow"))?;
     let mut rgba = vec![0_u8; rgba_len];
-
-    // Leave output-pixel headroom for floating-point/device-scale rounding. The
-    // width is chosen first, then height is derived from the per-frame area
-    // budget; this avoids hundreds of tiny square tiles on a very narrow page.
-    let factor = device_ratio.max(0.01);
-    let max_axis_output = (MAX_OUTPUT_PIXELS - 2.0) as u64;
-    let full_output_width = (full.width * factor).ceil().max(1.0) as u64;
-    let tile_output_width = full_output_width.min(max_axis_output).max(1);
-    let tile_output_height = (MAX_CAPTURE_FRAME_PIXELS / tile_output_width)
-        .min(max_axis_output)
-        .max(1);
-    let tile_css_width = (tile_output_width as f64 / factor).max(1.0 / factor);
-    let tile_css_height = (tile_output_height as f64 / factor).max(1.0 / factor);
     let mut tile_count = 0;
-    let mut y = 0.0;
-    while y < full.height {
-        let css_height = tile_css_height.min(full.height - y);
-        let dst_y = (y * device_ratio).round() as usize;
-        let next_y = ((y + css_height) * device_ratio).round() as usize;
-        let copy_height = next_y.saturating_sub(dst_y);
-        let mut x = 0.0;
-        while x < full.width {
-            let css_width = tile_css_width.min(full.width - x);
-            let dst_x = (x * device_ratio).round() as usize;
-            let next_x = ((x + css_width) * device_ratio).round() as usize;
-            let copy_width = next_x.saturating_sub(dst_x);
-            let bytes = capture_clip_png(
-                client,
-                session_id,
-                Clip {
-                    x: full.x + x,
-                    y: full.y + y,
-                    width: css_width,
-                    height: css_height,
-                },
-            )
-            .await?;
-            let tile = decode_png(&bytes, MAX_CAPTURE_FRAME_PIXELS)?;
-            if tile.width < copy_width || tile.height < copy_height {
-                return Err(capture_error(
-                    "tiled capture",
-                    format!(
-                        "Chromium returned tile {}x{}, smaller than required {}x{} at ({x},{y})",
-                        tile.width, tile.height, copy_width, copy_height
-                    ),
-                ));
-            }
-            for row in 0..copy_height {
-                let src = row * tile.width * 4;
-                let dst = ((dst_y + row) * width as usize + dst_x) * 4;
-                let len = copy_width * 4;
-                rgba[dst..dst + len].copy_from_slice(&tile.pixels[src..src + len]);
-            }
-            tile_count += 1;
-            x += css_width;
+    for plan in tiled_full_page_tiles(full, device_ratio) {
+        let bytes = capture_clip_png(
+            client,
+            session_id,
+            Clip {
+                x: plan.x,
+                y: plan.y,
+                width: plan.width,
+                height: plan.height,
+            },
+        )
+        .await?;
+        let tile = decode_png(&bytes, MAX_CAPTURE_FRAME_PIXELS)?;
+        if tile.width < plan.copy_width || tile.height < plan.copy_height {
+            return Err(capture_error(
+                "tiled capture",
+                format!(
+                    "Chromium returned tile {}x{}, smaller than required {}x{} at ({},{})",
+                    tile.width, tile.height, plan.copy_width, plan.copy_height, plan.x, plan.y
+                ),
+            ));
         }
-        y += css_height;
+        for row in 0..plan.copy_height {
+            let src = row * tile.width * 4;
+            let dst = ((plan.dst_y + row) * width as usize + plan.dst_x) * 4;
+            let len = plan.copy_width * 4;
+            rgba[dst..dst + len].copy_from_slice(&tile.pixels[src..src + len]);
+        }
+        tile_count += 1;
     }
 
     Ok(Capture {
@@ -488,13 +603,22 @@ pub async fn capture(
 
     let full_page = matches!(&region, Region::FullPage);
     let clip: Option<Clip> = match region {
-        Region::Viewport => None,
+        Region::Viewport => {
+            let mut m = metrics(client, session_id).await?;
+            if let Some((width, height)) = inner_size(client, session_id).await {
+                // Trust the live CSS viewport when CDP's layout viewport is one
+                // classic-scrollbar narrower than `window.innerWidth`.
+                m.visual_width = m.visual_width.max(width);
+                m.visual_height = m.visual_height.max(height);
+            }
+            viewport_clip(&m)
+        }
         Region::FullPage => {
             let m = metrics(client, session_id).await?;
             Some(Clip {
                 x: 0.0,
                 y: 0.0,
-                width: m.content_width,
+                width: full_page_width(&m),
                 height: m.content_height,
             })
         }
@@ -678,6 +802,44 @@ pub async fn node_at(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn screenshot_publication_has_no_cancellable_await_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("evidence.png");
+        let capture = Capture {
+            bytes: b"atomic screenshot bytes".to_vec(),
+            format: ImageFormat::Png,
+            clip: None,
+            truncated: None,
+            tiled: false,
+            tile_count: 1,
+        };
+
+        let written = tokio::time::timeout(std::time::Duration::ZERO, capture.write_to(&path))
+            .await
+            .expect("the complete fsync/rename transaction must finish in one poll")
+            .expect("publish screenshot");
+        assert_eq!(written, path);
+        assert_eq!(std::fs::read(&written).unwrap(), capture.bytes);
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "no temporary publication name remains"
+        );
+    }
+
+    #[test]
+    fn relative_screenshot_output_syncs_the_current_directory() {
+        assert_eq!(
+            publication_parent(Path::new("evidence.png")),
+            Path::new(".")
+        );
+        assert_eq!(
+            publication_parent(Path::new("artifacts/evidence.png")),
+            Path::new("artifacts")
+        );
+    }
+
     #[test]
     fn oversized_tile_dimensions_are_rejected_before_pixel_allocation() {
         let width = 4_000;
@@ -806,5 +968,74 @@ mod tests {
         assert_eq!(ImageFormat::parse("jpg"), Some(ImageFormat::Jpeg));
         assert_eq!(ImageFormat::parse("jpeg"), Some(ImageFormat::Jpeg));
         assert_eq!(ImageFormat::parse("gif"), None);
+    }
+
+    #[test]
+    fn viewport_clip_prefers_visual_viewport_over_narrower_layout() {
+        let metrics = Metrics {
+            page_x: 0.0,
+            page_y: 12.0,
+            content_width: 1280.0,
+            content_height: 3039.0,
+            visual_width: 1280.0,
+            visual_height: 713.0,
+            layout_width: 1265.0,
+            layout_height: 713.0,
+        };
+        assert_eq!(
+            viewport_clip(&metrics),
+            Some(Clip {
+                x: 0.0,
+                y: 12.0,
+                width: 1280.0,
+                height: 713.0
+            })
+        );
+        assert_eq!(full_page_width(&metrics), 1280.0);
+        let missing = Metrics {
+            visual_width: 0.0,
+            visual_height: 0.0,
+            layout_width: 0.0,
+            layout_height: 0.0,
+            ..metrics
+        };
+        assert_eq!(viewport_clip(&missing), None);
+    }
+
+    #[test]
+    fn fractional_dpr_last_tile_requests_integer_css_that_covers_device_rows() {
+        // Chrome 148 / Linux: a 627.2×8200 CSS page at DPR 1.25 used to ask for
+        // the last clip at y=8163.2 height=36.8 (required 46 device px). Chromium
+        // integerized that height to 36 CSS px and returned 45.
+        let full = Clip {
+            x: 0.0,
+            y: 0.0,
+            width: 627.2,
+            height: 8200.0,
+        };
+        let tiles = tiled_full_page_tiles(full, 1.25);
+        assert!(tiles.len() >= 2, "the area bound must split this page");
+        let last = tiles.last().expect("last tile");
+        assert_eq!(
+            last.y.fract(),
+            0.0,
+            "clip origin must be integer CSS: {last:?}"
+        );
+        assert_eq!(
+            last.height.fract(),
+            0.0,
+            "clip height must be integer CSS: {last:?}"
+        );
+        assert!(
+            last.height * 1.25 >= last.copy_height as f64,
+            "integer CSS clip must cover the required device rows: {last:?}"
+        );
+        for tile in &tiles {
+            let requested = (tile.width * 1.25).ceil() as u64 * (tile.height * 1.25).ceil() as u64;
+            assert!(
+                requested <= MAX_CAPTURE_FRAME_PIXELS,
+                "covering clip {tile:?} would decode {requested} pixels"
+            );
+        }
     }
 }

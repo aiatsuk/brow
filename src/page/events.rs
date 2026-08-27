@@ -12,11 +12,13 @@
 //! is consistent, monotonic, and honest about being a few milliseconds late.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 
 use crate::cdp::{CdpClient, CdpEvent, EVENT_STREAM_GAP_METHOD};
 use crate::redact;
@@ -114,6 +116,10 @@ impl NetworkEntry {
 struct Inner {
     console: VecDeque<ConsoleEntry>,
     network: VecDeque<NetworkEntry>,
+    /// Authoritative in-flight truth. The diagnostic ring above is allowed to
+    /// evict old rows; doing so must never make an unfinished request disappear
+    /// from the stability predicate.
+    active_requests: HashMap<(String, String), ActiveRequest>,
     next_seq: u64,
     console_dropped: u64,
     network_dropped: u64,
@@ -121,12 +127,39 @@ struct Inner {
     /// because the retained-byte budget rejected a browser event or this recorder
     /// lagged the shared broadcast. Non-zero means results are incomplete.
     event_stream_gaps: u64,
+    /// Monotonic causal boundary for the stability quiet window. It advances on
+    /// every relevant request start/end, even when both events land between two
+    /// stability polls.
+    activity_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityKind {
+    Finite,
+    LongLived,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveRequest {
+    kind: ActivityKind,
+    frame_id: Option<String>,
 }
 
 /// Bounded, thread-safe capture for one session.
 pub struct EventLog {
     inner: Mutex<Inner>,
     started: Instant,
+    processed_event_sequence: AtomicU64,
+    processed_notify: Notify,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ActivitySummary {
+    pub active_finite: usize,
+    pub excluded_long_lived: usize,
+    /// Changes whenever relevant network activity starts, finishes, or is
+    /// invalidated by a root-document replacement.
+    pub revision: u64,
 }
 
 pub(crate) struct RecorderTask {
@@ -150,6 +183,8 @@ impl EventLog {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             started: Instant::now(),
+            processed_event_sequence: AtomicU64::new(0),
+            processed_notify: Notify::new(),
         })
     }
 
@@ -204,19 +239,179 @@ impl EventLog {
         self.inner.lock().expect("event log").event_stream_gaps
     }
 
-    /// Forgets everything captured so far.
+    /// Current network activity used by the generic stability predicate.
+    pub fn activity(&self) -> ActivitySummary {
+        let inner = self.inner.lock().expect("event log");
+        let active_finite = inner
+            .active_requests
+            .values()
+            .filter(|request| request.kind == ActivityKind::Finite)
+            .count();
+        let excluded_long_lived = inner
+            .active_requests
+            .values()
+            .filter(|request| request.kind == ActivityKind::LongLived)
+            .count();
+        ActivitySummary {
+            active_finite,
+            excluded_long_lived,
+            revision: inner.activity_revision,
+        }
+    }
+
+    pub(crate) fn initialize_processed_prefix(&self, event_sequence: u64) {
+        self.mark_event_processed(event_sequence);
+    }
+
+    fn mark_event_processed(&self, event_sequence: u64) {
+        let previous = self
+            .processed_event_sequence
+            .fetch_max(event_sequence, Ordering::AcqRel);
+        if event_sequence > previous {
+            self.processed_notify.notify_waiters();
+        }
+    }
+
+    pub(crate) fn processed_through(&self, event_sequence: u64) -> bool {
+        self.processed_event_sequence.load(Ordering::Acquire) >= event_sequence
+    }
+
+    /// Waits until the recorder has folded (or explicitly classified) every
+    /// event through `event_sequence` into EventLog state.
+    pub(crate) async fn wait_processed_until(
+        &self,
+        event_sequence: u64,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        loop {
+            let notified = self.processed_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.processed_through(event_sequence) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.processed_through(event_sequence);
+            }
+        }
+    }
+
+    /// Deterministic identity projection for regression tests. Production
+    /// callers receive aggregate/redacted activity only; raw request ids stay
+    /// inside the recorder.
+    #[cfg(test)]
+    fn active_request_ids(&self) -> Vec<(String, String)> {
+        let mut ids: Vec<_> = self
+            .inner
+            .lock()
+            .expect("event log")
+            .active_requests
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Forgets captured diagnostic rows. Upstream event loss is authoritative
+    /// evidence incompleteness and cannot be repaired by clearing the UI rings.
     pub fn clear(&self) {
         let mut inner = self.inner.lock().expect("event log");
         inner.console.clear();
         inner.network.clear();
         inner.console_dropped = 0;
         inner.network_dropped = 0;
-        inner.event_stream_gaps = 0;
     }
 
     fn note_event_stream_gap(&self, count: u64) {
         let mut inner = self.inner.lock().expect("event log");
         inner.event_stream_gaps = inner.event_stream_gaps.saturating_add(count.max(1));
+    }
+
+    fn note_root_navigation(&self) {
+        let mut inner = self.inner.lock().expect("event log");
+        // Chromium can omit terminal events for requests owned by the replaced
+        // renderer. Root navigation is the authoritative lifetime boundary.
+        inner.active_requests.clear();
+        inner.activity_revision = inner.activity_revision.saturating_add(1);
+    }
+
+    fn begin_activity(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        resource_type: &str,
+        frame_id: Option<&str>,
+    ) {
+        let kind = match resource_type {
+            "WebSocket" | "EventSource" | "WebTransport" => ActivityKind::LongLived,
+            "Document" | "Stylesheet" | "Script" | "Image" | "Font" | "XHR" | "Fetch" => {
+                ActivityKind::Finite
+            }
+            _ => return,
+        };
+        let mut inner = self.inner.lock().expect("event log");
+        inner.active_requests.insert(
+            (session_id.to_string(), request_id.to_string()),
+            ActiveRequest {
+                kind,
+                frame_id: frame_id.map(str::to_string),
+            },
+        );
+        inner.activity_revision = inner.activity_revision.saturating_add(1);
+    }
+
+    /// Chromium may start an iframe Document request on the parent renderer and
+    /// finish it only after the frame migrates to an OOPIF session. A child load
+    /// event is the terminal proof for those parent-owned rows. Requests already
+    /// owned by the child session (for example an async Fetch) remain active.
+    fn finish_transferred_frame_activity(&self, frame_id: &str, owner_session: &str) {
+        let mut inner = self.inner.lock().expect("event log");
+        let transferred: HashSet<_> = inner
+            .active_requests
+            .iter()
+            .filter(|((session_id, _), request)| {
+                session_id != owner_session && request.frame_id.as_deref() == Some(frame_id)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if transferred.is_empty() {
+            return;
+        }
+        inner
+            .active_requests
+            .retain(|key, _| !transferred.contains(key));
+        for entry in &mut inner.network {
+            if transferred.contains(&(entry.session_id.clone(), entry.request_id.clone())) {
+                entry.finished = true;
+            }
+        }
+        inner.activity_revision = inner.activity_revision.saturating_add(1);
+    }
+
+    fn finish_activity(&self, session_id: &str, request_id: &str) {
+        let mut inner = self.inner.lock().expect("event log");
+        if inner
+            .active_requests
+            .remove(&(session_id.to_string(), request_id.to_string()))
+            .is_some()
+        {
+            inner.activity_revision = inner.activity_revision.saturating_add(1);
+        }
+    }
+
+    fn finish_session_activity(&self, session_id: &str) {
+        let mut inner = self.inner.lock().expect("event log");
+        let before = inner.active_requests.len();
+        inner
+            .active_requests
+            .retain(|(active_session, _), _| active_session != session_id);
+        if inner.active_requests.len() != before {
+            inner.activity_revision = inner.activity_revision.saturating_add(1);
+        }
     }
 
     fn push_console(&self, mut entry: ConsoleEntry) {
@@ -261,6 +456,17 @@ impl EventLog {
     }
 }
 
+struct RecorderEventProcessed {
+    log: Arc<EventLog>,
+    event_sequence: u64,
+}
+
+impl Drop for RecorderEventProcessed {
+    fn drop(&mut self) {
+        self.log.mark_event_processed(self.event_sequence);
+    }
+}
+
 /// Enables the domains that produce the events, then records them until the
 /// session ends.
 pub(crate) async fn spawn_recorder(
@@ -272,9 +478,11 @@ pub(crate) async fn spawn_recorder(
     // Subscribe before enabling domains. Chromium may synchronously flush buffered
     // Log entries while `Log.enable` is in flight; subscribing afterwards loses
     // them permanently.
-    let mut events = client.subscribe();
+    let (mut events, processed_before_subscription) = client.subscribe_with_watermark();
+    log.initialize_processed_prefix(processed_before_subscription);
     let sink = Arc::clone(&log);
     let root_session_id = session_id.to_string();
+    let root_for_navigation = root_session_id.clone();
     let task = tokio::spawn(async move {
         // Membership is consumed from this receiver's own ordered event stream.
         // Consulting the router task's latest state races at attach/detach
@@ -290,6 +498,17 @@ pub(crate) async fn spawn_recorder(
                 }
                 Err(_) => break,
             };
+            let _processed = RecorderEventProcessed {
+                log: Arc::clone(&sink),
+                event_sequence: ev.sequence(),
+            };
+            #[cfg(debug_assertions)]
+            super::test_support::hold_recorder_event_if_requested(
+                &root_for_navigation,
+                ev.session_id.as_deref(),
+                &ev.method,
+            )
+            .await;
             if ev.method == EVENT_STREAM_GAP_METHOD {
                 // Browser-level gaps affect every page recorder. Session-level
                 // gaps affect the recursively owned root/OOPIF session graph.
@@ -308,8 +527,53 @@ pub(crate) async fn spawn_recorder(
                 }
                 continue;
             }
+            if ev.method == "Target.detachedFromTarget" {
+                if let Some(session_id) = ev.params.get("sessionId").and_then(Value::as_str) {
+                    for detached in membership.subtree_sessions(session_id) {
+                        sink.finish_session_activity(&detached);
+                    }
+                }
+            } else if ev.method == "Target.attachedToTarget" {
+                let target_id = ev
+                    .params
+                    .get("targetInfo")
+                    .and_then(|target| target.get("targetId"))
+                    .and_then(Value::as_str);
+                let new_session = ev.params.get("sessionId").and_then(Value::as_str);
+                if let (Some(target_id), Some(new_session)) = (target_id, new_session) {
+                    if let Some(previous) = membership
+                        .target_session
+                        .get(target_id)
+                        .filter(|previous| previous.as_str() != new_session)
+                    {
+                        for detached in membership.subtree_sessions(previous) {
+                            sink.finish_session_activity(&detached);
+                        }
+                    }
+                }
+            }
             if !membership.accepts(&ev) {
                 continue;
+            }
+            if matches!(
+                ev.method.as_str(),
+                "Page.loadEventFired" | "Page.frameStoppedLoading"
+            ) {
+                if let Some(session_id) = ev.session_id.as_deref() {
+                    if let Some(target_id) = membership.target_for_session(session_id) {
+                        sink.finish_transferred_frame_activity(target_id, session_id);
+                    }
+                }
+            }
+            if ev.method == "Page.frameNavigated"
+                && ev.session_id.as_deref() == Some(root_for_navigation.as_str())
+                && ev
+                    .params
+                    .get("frame")
+                    .and_then(|frame| frame.get("parentId"))
+                    .is_none()
+            {
+                sink.note_root_navigation();
             }
             record(&sink, &ev);
         }
@@ -361,7 +625,11 @@ impl RecorderMembership {
         self.owned.contains(session_id)
     }
 
-    fn remove_subtree(&mut self, session_id: &str) {
+    fn target_for_session(&self, session_id: &str) -> Option<&str> {
+        self.session_target.get(session_id).map(String::as_str)
+    }
+
+    fn subtree_sessions(&self, session_id: &str) -> HashSet<String> {
         let mut remove = HashSet::from([session_id.to_string()]);
         loop {
             let before = remove.len();
@@ -374,7 +642,11 @@ impl RecorderMembership {
                 break;
             }
         }
-        for session in remove {
+        remove
+    }
+
+    fn remove_subtree(&mut self, session_id: &str) {
+        for session in self.subtree_sessions(session_id) {
             self.owned.remove(&session);
             self.parent.remove(&session);
             if let Some(target) = self.session_target.remove(&session) {
@@ -448,7 +720,7 @@ fn record(log: &EventLog, ev: &CdpEvent) {
                 .and_then(Value::as_str)
                 .unwrap_or("log")
                 .to_string();
-            let text = redact::text(&render_args(ev.params.get("args")));
+            let text = redact::storage_text(&render_args(ev.params.get("args")));
             let (url, line) = first_frame(ev.params.get("stackTrace"));
             log.push_console(ConsoleEntry {
                 seq: 0,
@@ -479,7 +751,7 @@ fn record(log: &EventLog, ev: &CdpEvent) {
                 seq: 0,
                 t,
                 level: "exception".into(),
-                text: redact::text(&text),
+                text: redact::storage_text(&text),
                 url,
                 line,
             });
@@ -507,7 +779,7 @@ fn record(log: &EventLog, ev: &CdpEvent) {
                 seq: 0,
                 t,
                 level,
-                text: redact::text(&text),
+                text: redact::storage_text(&text),
                 url,
                 line,
             });
@@ -545,6 +817,18 @@ fn record(log: &EventLog, ev: &CdpEvent) {
                 }
             }
 
+            let resource_type = ev
+                .params
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("Other")
+                .to_string();
+            log.begin_activity(
+                session_id,
+                &request_id,
+                &resource_type,
+                ev.params.get("frameId").and_then(Value::as_str),
+            );
             log.push_network(NetworkEntry {
                 seq: 0,
                 t,
@@ -561,12 +845,7 @@ fn record(log: &EventLog, ev: &CdpEvent) {
                         .and_then(Value::as_str)
                         .unwrap_or_default(),
                 ),
-                resource_type: ev
-                    .params
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Other")
-                    .to_string(),
+                resource_type,
                 status: None,
                 mime: None,
                 error: None,
@@ -595,25 +874,29 @@ fn record(log: &EventLog, ev: &CdpEvent) {
             });
         }
         "Network.loadingFinished" => {
+            let request_id = string_at(&ev.params, "requestId");
+            log.finish_activity(session_id, &request_id);
             let bytes = ev.params.get("encodedDataLength").and_then(Value::as_f64);
-            log.update_network(session_id, &string_at(&ev.params, "requestId"), |e| {
+            log.update_network(session_id, &request_id, |e| {
                 e.encoded_bytes = bytes;
                 e.finished = true;
             });
         }
         "Network.loadingFailed" => {
-            let error = ev
-                .params
-                .get("errorText")
-                .and_then(Value::as_str)
-                .unwrap_or("failed")
-                .to_string();
+            let request_id = string_at(&ev.params, "requestId");
+            log.finish_activity(session_id, &request_id);
+            let error = redact::storage_text(
+                ev.params
+                    .get("errorText")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed"),
+            );
             let canceled = ev
                 .params
                 .get("canceled")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            log.update_network(session_id, &string_at(&ev.params, "requestId"), |e| {
+            log.update_network(session_id, &request_id, |e| {
                 // A cancelled request is usually the page changing its mind, not a
                 // problem; label it so it does not read as an error.
                 e.error = Some(if canceled {
@@ -622,6 +905,101 @@ fn record(log: &EventLog, ev: &CdpEvent) {
                     error
                 });
                 e.finished = true;
+            });
+        }
+        // WebSocket and WebTransport lifetimes are reported on dedicated CDP
+        // events rather than the ordinary requestWillBeSent/loadingFinished
+        // pair. Keep synthetic rows so stability can explicitly report that it
+        // excluded these long-lived transports instead of silently ignoring
+        // them.
+        "Network.webSocketCreated" => {
+            let request_id = string_at(&ev.params, "requestId");
+            log.begin_activity(session_id, &request_id, "WebSocket", None);
+            log.push_network(NetworkEntry {
+                seq: 0,
+                t,
+                request_id,
+                session_id: session_id.to_string(),
+                method: "WS".into(),
+                url: redact::url(
+                    ev.params
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ),
+                resource_type: "WebSocket".into(),
+                status: None,
+                mime: None,
+                error: None,
+                from_cache: false,
+                encoded_bytes: None,
+                finished: false,
+            });
+        }
+        "Network.webSocketHandshakeResponseReceived" => {
+            let status = ev
+                .params
+                .get("response")
+                .and_then(|response| response.get("status"))
+                .and_then(Value::as_i64);
+            log.update_network(session_id, &string_at(&ev.params, "requestId"), |entry| {
+                entry.status = status;
+            });
+        }
+        "Network.webSocketFrameError" => {
+            let error = redact::storage_text(
+                ev.params
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .unwrap_or("websocket frame error"),
+            );
+            log.update_network(session_id, &string_at(&ev.params, "requestId"), |entry| {
+                entry.error = Some(error);
+            });
+        }
+        "Network.webSocketClosed" => {
+            let request_id = string_at(&ev.params, "requestId");
+            log.finish_activity(session_id, &request_id);
+            log.update_network(session_id, &request_id, |entry| {
+                entry.finished = true;
+            });
+        }
+        "Network.webTransportCreated" => {
+            let request_id = string_at(&ev.params, "transportId");
+            log.begin_activity(session_id, &request_id, "WebTransport", None);
+            log.push_network(NetworkEntry {
+                seq: 0,
+                t,
+                request_id,
+                session_id: session_id.to_string(),
+                method: "CONNECT".into(),
+                url: redact::url(
+                    ev.params
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ),
+                resource_type: "WebTransport".into(),
+                status: None,
+                mime: None,
+                error: None,
+                from_cache: false,
+                encoded_bytes: None,
+                finished: false,
+            });
+        }
+        "Network.webTransportConnectionEstablished" => {
+            log.update_network(session_id, &string_at(&ev.params, "transportId"), |entry| {
+                // CDP does not expose the HTTP status here. A successful QUIC
+                // establishment is still useful lifecycle evidence.
+                entry.status = Some(200);
+            });
+        }
+        "Network.webTransportClosed" => {
+            let request_id = string_at(&ev.params, "transportId");
+            log.finish_activity(session_id, &request_id);
+            log.update_network(session_id, &request_id, |entry| {
+                entry.finished = true;
             });
         }
         _ => {}
@@ -807,7 +1185,8 @@ mod tests {
             &event(
                 "Runtime.consoleAPICalled",
                 json!({"type": "log", "args": [
-                    {"type": "string", "value": "retrying with Bearer sk_live_9f8a7b6c5d"}
+                    {"type": "string", "value": "retrying with Bearer sk_live_9f8a7b6c5d"},
+                    {"type": "string", "value": "https://console-user:console-pass@app.test/?token=console-query"}
                 ]}),
             ),
         );
@@ -843,6 +1222,9 @@ mod tests {
             !stored.contains("abc123"),
             "query credential reached storage"
         );
+        for secret in ["console-user", "console-pass", "console-query"] {
+            assert!(!stored.contains(secret), "console URL leaked {secret}");
+        }
         assert!(!stored.contains("exception-secret"), "exception URL leaked");
         assert!(
             stored.contains("page=1"),
@@ -884,6 +1266,203 @@ mod tests {
         assert!(rows[0].finished);
         assert!(rows[0].render().contains("2.0 KB"));
         assert!(!rows[0].is_failure());
+    }
+
+    #[test]
+    fn unfinished_requests_from_a_superseded_document_do_not_pin_stability() {
+        let log = EventLog::new();
+        record(
+            &log,
+            &event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "old", "type": "Fetch",
+                       "request": {"method": "GET", "url": "https://x.test/hung"}}),
+            ),
+        );
+        assert_eq!(log.activity().active_finite, 1);
+        log.note_root_navigation();
+        assert_eq!(log.activity().active_finite, 0);
+        record(
+            &log,
+            &event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "current", "type": "XHR",
+                       "request": {"method": "GET", "url": "https://x.test/current"}}),
+            ),
+        );
+        assert_eq!(log.activity().active_finite, 1);
+    }
+
+    #[test]
+    fn oopif_load_finishes_only_the_document_transferred_from_its_parent() {
+        let log = EventLog::new();
+        record(
+            &log,
+            &session_event(
+                "root",
+                "Network.requestWillBeSent",
+                json!({
+                    "requestId": "parent-document",
+                    "frameId": "child-target",
+                    "type": "Document",
+                    "request": {"method": "GET", "url": "https://child.test/"}
+                }),
+            ),
+        );
+        record(
+            &log,
+            &session_event(
+                "child-session",
+                "Network.requestWillBeSent",
+                json!({
+                    "requestId": "child-fetch",
+                    "frameId": "child-target",
+                    "type": "Fetch",
+                    "request": {"method": "GET", "url": "https://child.test/api/hang"}
+                }),
+            ),
+        );
+        assert_eq!(log.activity().active_finite, 2);
+
+        log.finish_transferred_frame_activity("child-target", "child-session");
+
+        assert_eq!(log.activity().active_finite, 1);
+        assert_eq!(
+            log.active_request_ids(),
+            vec![("child-session".to_string(), "child-fetch".to_string())]
+        );
+        let rows = log.network(false, 10);
+        assert!(rows
+            .iter()
+            .find(|entry| entry.request_id == "parent-document")
+            .is_some_and(|entry| entry.finished));
+        assert!(rows
+            .iter()
+            .find(|entry| entry.request_id == "child-fetch")
+            .is_some_and(|entry| !entry.finished));
+    }
+
+    #[test]
+    fn completed_request_between_polls_advances_the_quiet_revision() {
+        let log = EventLog::new();
+        let before = log.activity();
+
+        // Both events occur before the next call to `activity`, exactly like a
+        // fast cached fetch landing between two stability polls.
+        record(
+            &log,
+            &event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "fast", "type": "Fetch",
+                       "request": {"method": "GET", "url": "https://x.test/fast"}}),
+            ),
+        );
+        record(
+            &log,
+            &event(
+                "Network.loadingFinished",
+                json!({"requestId": "fast", "encodedDataLength": 1.0}),
+            ),
+        );
+
+        let after = log.activity();
+        assert_eq!(after.active_finite, 0);
+        assert_eq!(after.revision, before.revision + 2);
+    }
+
+    #[test]
+    fn diagnostic_ring_eviction_cannot_evict_active_request_truth() {
+        let log = EventLog::new();
+        record(
+            &log,
+            &event(
+                "Network.requestWillBeSent",
+                json!({"requestId": "held", "type": "Fetch",
+                       "request": {"method": "GET", "url": "https://x.test/held"}}),
+            ),
+        );
+
+        for i in 0..NETWORK_CAPACITY {
+            let request_id = format!("finished-{i}");
+            record(
+                &log,
+                &event(
+                    "Network.requestWillBeSent",
+                    json!({"requestId": request_id, "type": "Fetch",
+                           "request": {"method": "GET", "url": "https://x.test/done"}}),
+                ),
+            );
+            record(
+                &log,
+                &event(
+                    "Network.loadingFinished",
+                    json!({"requestId": request_id, "encodedDataLength": 1.0}),
+                ),
+            );
+        }
+
+        assert_eq!(log.network(false, usize::MAX).len(), NETWORK_CAPACITY);
+        assert!(
+            log.network(false, usize::MAX)
+                .iter()
+                .all(|entry| entry.request_id != "held"),
+            "the fixture must actually evict the held request's diagnostic row"
+        );
+        assert_eq!(log.activity().active_finite, 1);
+        assert_eq!(
+            log.active_request_ids(),
+            vec![("s".to_string(), "held".to_string())]
+        );
+
+        // A terminal event must still clear truth even though its row is gone.
+        record(
+            &log,
+            &event(
+                "Network.loadingFinished",
+                json!({"requestId": "held", "encodedDataLength": 1.0}),
+            ),
+        );
+        assert_eq!(log.activity().active_finite, 0);
+    }
+
+    #[test]
+    fn long_lived_transports_are_recorded_excluded_and_closed() {
+        let log = EventLog::new();
+        record(
+            &log,
+            &event(
+                "Network.webSocketCreated",
+                json!({
+                    "requestId": "ws-1",
+                    "url": "wss://stream.test/live?access_token=secret"
+                }),
+            ),
+        );
+        record(
+            &log,
+            &event(
+                "Network.webTransportCreated",
+                json!({"transportId": "wt-1", "url": "https://stream.test/transport"}),
+            ),
+        );
+
+        let activity = log.activity();
+        assert_eq!(activity.active_finite, 0);
+        assert_eq!(activity.excluded_long_lived, 2);
+        let rows = log.network(false, 10);
+        assert_eq!(rows.len(), 2);
+        assert!(!format!("{rows:?}").contains("secret"));
+
+        record(
+            &log,
+            &event("Network.webSocketClosed", json!({"requestId": "ws-1"})),
+        );
+        record(
+            &log,
+            &event("Network.webTransportClosed", json!({"transportId": "wt-1"})),
+        );
+        assert_eq!(log.activity().excluded_long_lived, 0);
+        assert!(log.network(false, 10).iter().all(|entry| entry.finished));
     }
 
     #[test]
@@ -1071,7 +1650,11 @@ mod tests {
         assert_eq!(log.event_stream_gaps(), 3);
         assert_eq!(log.dropped(), (0, 0));
         log.clear();
-        assert_eq!(log.event_stream_gaps(), 0);
+        assert_eq!(
+            log.event_stream_gaps(),
+            3,
+            "clearing diagnostic rows must not manufacture complete event evidence"
+        );
     }
 
     #[test]

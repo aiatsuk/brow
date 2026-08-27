@@ -24,6 +24,16 @@ struct FixtureState {
     decision_mutation_observed: std::sync::atomic::AtomicBool,
     decision_target_clicked: std::sync::atomic::AtomicBool,
     delayed_danger_released: std::sync::atomic::AtomicBool,
+    side_effect_count: std::sync::atomic::AtomicUsize,
+    navigation_request_count: std::sync::atomic::AtomicUsize,
+    held_navigation: std::sync::Mutex<HeldNavigation>,
+    held_navigation_changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct HeldNavigation {
+    arrived: bool,
+    released: bool,
 }
 
 impl Fixture {
@@ -104,6 +114,41 @@ impl Fixture {
             .delayed_danger_released
             .store(true, std::sync::atomic::Ordering::Release);
     }
+
+    #[allow(dead_code)]
+    pub fn side_effect_count(&self) -> usize {
+        self.state
+            .side_effect_count
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[allow(dead_code)]
+    pub fn navigation_request_count(&self) -> usize {
+        self.state
+            .navigation_request_count
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[allow(dead_code)]
+    pub fn wait_for_held_navigation(&self, timeout: std::time::Duration) {
+        let state = self.state.held_navigation.lock().expect("held navigation");
+        let (state, _) = self
+            .state
+            .held_navigation_changed
+            .wait_timeout_while(state, timeout, |state| !state.arrived)
+            .expect("held navigation condvar");
+        assert!(
+            state.arrived,
+            "held navigation did not arrive within {timeout:?}"
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn release_held_navigation(&self) {
+        let mut state = self.state.held_navigation.lock().expect("held navigation");
+        state.released = true;
+        self.state.held_navigation_changed.notify_all();
+    }
 }
 
 /// Starts the fixture server on an ephemeral port.
@@ -122,15 +167,32 @@ pub fn serve() -> Fixture {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // On macOS an accepted socket can inherit O_NONBLOCK from
+                    // the listener. The per-request handler uses blocking
+                    // BufRead; without this reset an early read races the first
+                    // request byte, returns EAGAIN, and closes the connection.
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        eprintln!("fixture could not make accepted stream blocking: {error}");
+                        continue;
+                    }
                     let request_state = std::sync::Arc::clone(&server_state);
                     std::thread::spawn(move || {
-                        let _ = handle(stream, &request_state);
+                        if let Err(error) = handle(stream, &request_state) {
+                            eprintln!("fixture request handler failed: {error}");
+                        }
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                Err(_) => break,
+                // A nonblocking listener may transiently report EINTR or an
+                // aborted connection. Never turn that into a silent fixture
+                // shutdown: retry while the owner is alive and surface the
+                // error so a persistent OS failure remains diagnosable.
+                Err(error) => {
+                    eprintln!("fixture accept failed; retrying: {error}");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
             }
         }
     });
@@ -166,9 +228,62 @@ fn handle(mut stream: TcpStream, state: &FixtureState) -> std::io::Result<()> {
     }
 
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
-    let (status, content_type, extra_headers, body) = match path.split('?').next().unwrap_or("/") {
+    let route = path.split('?').next().unwrap_or("/");
+    if route == "/navigation" {
+        state
+            .navigation_request_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    if route == "/nav-stream-held" {
+        // The same-process child completes while the root response remains
+        // open. A navigation waiter that accepts any frameStoppedLoading will
+        // therefore return early; correct code must wait for the root frame.
+        let prefix = "<!doctype html><html><head><meta charset=\"utf-8\"><title>streaming navigation</title></head><body><h1>Streaming navigation</h1><iframe id=\"fast-child\" src=\"/second\"></iframe>";
+        let suffix = "</body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+            prefix.len() + suffix.len(),
+            prefix
+        );
+        stream.write_all(response.as_bytes())?;
+        stream.flush()?;
+        let mut held = state.held_navigation.lock().expect("held navigation");
+        held.arrived = true;
+        state.held_navigation_changed.notify_all();
+        let (held, _) = state
+            .held_navigation_changed
+            .wait_timeout_while(held, std::time::Duration::from_secs(10), |held| {
+                !held.released
+            })
+            .expect("held navigation condvar");
+        assert!(held.released, "streaming navigation was never released");
+        drop(held);
+        stream.write_all(suffix.as_bytes())?;
+        return stream.flush();
+    }
+    let (status, content_type, extra_headers, body) = match route {
         "/second" => ("200 OK", "text/html; charset=utf-8", "", SECOND_PAGE),
         "/slow" => ("200 OK", "text/html; charset=utf-8", "", SLOW_PAGE),
+        "/navigation" => ("200 OK", "text/html; charset=utf-8", "", NAVIGATION_PAGE),
+        "/nav-slow" => {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            ("200 OK", "text/html; charset=utf-8", "", NAV_SLOW_PAGE)
+        }
+        "/nav-held" => {
+            let state_guard = state.held_navigation.lock().expect("held navigation");
+            let mut state_guard = state_guard;
+            state_guard.arrived = true;
+            state.held_navigation_changed.notify_all();
+            let (state_guard, _) = state
+                .held_navigation_changed
+                .wait_timeout_while(state_guard, std::time::Duration::from_secs(10), |state| {
+                    !state.released
+                })
+                .expect("held navigation condvar");
+            assert!(state_guard.released, "held navigation was never released");
+            ("200 OK", "text/html; charset=utf-8", "", NAV_HELD_PAGE)
+        }
         "/events" => ("200 OK", "text/html; charset=utf-8", "", EVENTS_PAGE),
         "/frames" => ("200 OK", "text/html; charset=utf-8", "", FRAMES_PAGE),
         "/ambiguous" => ("200 OK", "text/html; charset=utf-8", "", AMBIGUOUS_PAGE),
@@ -272,6 +387,20 @@ fn handle(mut stream: TcpStream, state: &FixtureState) -> std::io::Result<()> {
             REDIRECT_FINAL_PAGE,
         ),
         "/api/ok" => ("200 OK", "application/json", "", r#"{"ok":true}"#),
+        "/api/delayed" => {
+            std::thread::sleep(std::time::Duration::from_millis(180));
+            ("200 OK", "application/json", "", r#"{"ready":true}"#)
+        }
+        "/api/hang" => {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            ("200 OK", "application/json", "", r#"{"late":true}"#)
+        }
+        "/side-effect" => {
+            state
+                .side_effect_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            ("200 OK", "application/json", "", r#"{"accepted":true}"#)
+        }
         "/missing-endpoint" => (
             "404 Not Found",
             "application/json",
@@ -360,6 +489,67 @@ pub const MAIN_PAGE: &str = r##"<!doctype html>
 pub const SECOND_PAGE: &str = r##"<!doctype html>
 <html><head><meta charset="utf-8"><title>second page</title></head>
 <body><h1>Second</h1><button id="only">Only button</button></body></html>"##;
+
+pub const NAVIGATION_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>navigation fixture</title></head>
+<body>
+  <button id="cross">Delayed cross-document</button>
+  <button id="slow-cross">Slow cross-document</button>
+  <button id="held-cross">Held cross-document</button>
+  <button id="spa">Delayed SPA</button>
+  <button id="data">Load data</button>
+  <button id="side-effect">Submit once</button>
+  <button id="beforeunload">Protect navigation</button>
+  <button id="hover">Hover target</button>
+  <div id="state">idle</div>
+  <div id="hover-card" hidden>hover card</div>
+  <script>
+    document.getElementById('cross').addEventListener('click', function () {
+      setTimeout(function () { location.href = '/second'; }, 50);
+    });
+    document.getElementById('slow-cross').addEventListener('click', function () {
+      setTimeout(function () { location.href = '/nav-slow'; }, 20);
+    });
+    document.getElementById('held-cross').addEventListener('click', function () {
+      location.href = '/nav-held';
+    });
+    document.getElementById('spa').addEventListener('click', function () {
+      setTimeout(function () {
+        history.pushState({}, '', '#settled');
+        document.getElementById('state').textContent = 'spa-ready';
+      }, 50);
+    });
+    document.getElementById('data').addEventListener('click', function () {
+      document.getElementById('state').textContent = 'skeleton';
+      fetch('/api/delayed').then(function (response) { return response.json(); }).then(function () {
+        document.getElementById('state').textContent = 'data-ready';
+      });
+    });
+    document.getElementById('side-effect').addEventListener('click', function () {
+      fetch('/side-effect', {method: 'POST'}).then(function (response) { return response.text(); });
+      fetch('/api/hang').then(function (response) { return response.text(); });
+    });
+    document.getElementById('beforeunload').addEventListener('click', function () {
+      window.onbeforeunload = function () { return 'fixture has unsaved work'; };
+      document.getElementById('state').textContent = 'navigation-protected';
+    });
+    var hover = document.getElementById('hover');
+    hover.addEventListener('mouseenter', function () {
+      document.getElementById('hover-card').hidden = false;
+    });
+    hover.addEventListener('mouseleave', function () {
+      document.getElementById('hover-card').hidden = true;
+    });
+  </script>
+</body></html>"##;
+
+pub const NAV_SLOW_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>slow navigation complete</title></head>
+<body><h1>Slow navigation complete</h1></body></html>"##;
+
+pub const NAV_HELD_PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>held navigation complete</title></head>
+<body><h1>Held navigation complete</h1></body></html>"##;
 
 pub const REDIRECT_FINAL_PAGE: &str = r##"<!doctype html>
 <html><head><meta charset="utf-8"><title>redirect complete</title></head>
@@ -630,6 +820,9 @@ const BROWSER_SLOTS: usize = 4;
 #[allow(dead_code)]
 pub struct BrowserSlot(std::fs::File);
 
+#[allow(dead_code)]
+pub struct ExclusiveBrowserSlots(Vec<std::fs::File>);
+
 /// Blocks until a slot is free.
 #[allow(dead_code)]
 pub fn browser_slot() -> BrowserSlot {
@@ -638,6 +831,19 @@ pub fn browser_slot() -> BrowserSlot {
     let dir = std::path::Path::new("/tmp/brow-test-slots");
     let _ = std::fs::create_dir_all(dir);
     loop {
+        // The shared pool gate makes selecting one slot atomic with respect to
+        // an exclusive reservation. It is held only while scanning, never for
+        // the lifetime of the browser, so ordinary tests still use all slots.
+        let gate = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join("pool.gate"))
+            .expect("open browser test pool gate");
+        // SAFETY: `gate` is open for the complete shared-lock lifetime.
+        let rc = unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_SH) };
+        assert_eq!(rc, 0, "lock shared browser test pool gate");
         for i in 0..BROWSER_SLOTS {
             let Ok(file) = std::fs::OpenOptions::new()
                 .create(true)
@@ -654,8 +860,50 @@ pub fn browser_slot() -> BrowserSlot {
                 return BrowserSlot(file);
             }
         }
+        drop(gate);
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// Reserves the entire cross-binary Chromium pool for a latency-sensitive test.
+/// An exclusive pool gate prevents new ordinary reservations while existing
+/// browsers drain. Slot locks are then taken in deterministic order, so there is
+/// no circular wait and the exclusive test cannot starve under a busy suite.
+#[allow(dead_code)]
+pub fn exclusive_browser_slots() -> ExclusiveBrowserSlots {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = std::path::Path::new("/tmp/brow-test-slots");
+    let _ = std::fs::create_dir_all(dir);
+    let gate = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join("pool.gate"))
+        .expect("open exclusive browser test pool gate");
+    // SAFETY: `gate` is open until every slot below has been reserved.
+    let rc = unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "lock exclusive browser test pool gate");
+    let mut files = Vec::with_capacity(BROWSER_SLOTS);
+    for i in 0..BROWSER_SLOTS {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join(format!("{i}.lock")))
+            .expect("open exclusive browser test slot");
+        // SAFETY: `file` is open and retained by `ExclusiveBrowserSlots` for the
+        // complete latency test.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(rc, 0, "lock exclusive browser test slot {i}");
+        files.push(file);
+    }
+    // With all slots retained in `files`, later ordinary scans may proceed but
+    // cannot acquire one until `ExclusiveBrowserSlots` is dropped.
+    drop(gate);
+    ExclusiveBrowserSlots(files)
 }
 
 /// True when a browser is available; the browser-level tests skip without one.

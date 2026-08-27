@@ -27,6 +27,10 @@ brow open example.com
 brow snapshot
 ```
 
+`open` returns only after a causal root-document commit and load, and reports
+the URL actually reached after redirects. Treat a timeout or event-gap error as
+unknown state; do not assume the requested URL loaded.
+
 `snapshot` returns the interactive elements with refs:
 
 ```text
@@ -51,6 +55,20 @@ brow click @node-2-12
 brow press Enter
 ```
 
+Navigation-capable input defaults to `--wait auto`: brow subscribes before the
+trusted event, watches 250 ms for a navigation signal, and settles an observed
+commit before returning. Read the receipt. If an error says `dispatched: true`,
+the action may already have happened — inspect the current page or application
+read-back and never blindly replay it.
+
+Ctrl-C or a dropped client cancels an in-flight typed `wait` and releases that
+session. It does not roll back or force-cancel an already accepted mutating
+operation; recover by inspecting the receipt when available and then the page.
+
+`window.open()` is a committed popup navigation, not a load of the originating
+root page. An explicit `--wait load` can therefore fail or time out; inspect the
+receipt instead of treating the popup as root completion.
+
 Then **snapshot again**. Refs belong to one document generation. Any navigation,
 including an in-page route change, invalidates them all. Reusing a stale ref is an
 error, not a wrong click — that is deliberate, and the error tells you what to do.
@@ -66,6 +84,10 @@ error, not a wrong click — that is deliberate, and the error tells you what to
 | Fill a field | `brow fill @node-2-14 'text'` |
 | Type into focus | `brow type 'text'` (`--by-key` if the app listens to keydown) |
 | Keys | `brow press Enter` · `brow press Ctrl+A` · `brow press Escape` |
+| Typed wait | `brow wait --url '*issues/*' --generation-after 20 --load` · `brow wait --stable` |
+| History | `brow back` · `brow forward` · `brow reload --ignore-cache` |
+| Pointer cleanup | `brow pointer park` (explicit trusted input; may fire `mouseleave`) |
+| Evidence bundle | `brow checkpoint --name after-submit` (`--full-page`, `--park-pointer`) |
 | Scroll | `brow scroll down 800` |
 | Screenshot | `brow screenshot` · `--full-page` · `--node @node-2-12` · `-o path.png` |
 | Read page state | `brow eval "document.querySelector('#status').textContent"` |
@@ -169,7 +191,13 @@ brow job start --intent "check signup still works after the deploy" \
 ```
 
 Steps: `open <url>` · `click <text>` · `fill <field>=<value>` · `press <chord>` ·
-`wait <ms>` · `screenshot` · `check-errors`.
+`wait <ms>` · `wait url <glob>` · `wait generation-after <n>` · `wait load` ·
+`wait stable [quiet-ms]` · `back` · `forward` · `reload [ignore-cache]` ·
+`pointer park` · `checkpoint [name]` · `screenshot` · `check-errors`.
+
+Add `--checkpoint-each-step` to `job start` only when durable DOM/image evidence
+is explicitly wanted. Checkpoints can contain arbitrary private page content;
+they are never a harmless default.
 
 Then `brow job logs <id> --follow`. It stops following when the job finishes
 **or when the job needs you** — which is the part to pay attention to.
@@ -225,6 +253,8 @@ report the exact gap if it remains.
 ## Habits that keep this reliable
 
 - Snapshot after every action that could change the page. It is cheap.
+- Use the action receipt plus typed `wait`; do not replace browser signals with
+  guessed sleeps. `stable` is generic browser readiness, not business success.
 - Prefer refs over coordinates; coordinates break on any layout change.
 - Read results with `eval` or `snapshot`, not by screenshotting and guessing.
 - If something fails twice the same way, stop and report what you saw — including
