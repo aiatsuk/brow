@@ -1,6 +1,7 @@
 ---
 name: browser
-description: Drive a real browser — open pages, read their structure, click, type, screenshot, and inspect what a page is actually doing. Use whenever the task involves a web page: checking that a UI change works, walking a signup or checkout flow, reproducing a bug on a site, reading a page that needs JavaScript to render, or verifying a deploy. Requires the `brow` CLI.
+description: "Drive a real browser — open pages, read their structure, click, type, screenshot, and inspect what a page is actually doing. Use whenever the task involves a web page: checking that a UI change works, walking a signup or checkout flow, reproducing a bug on a site, reading a page that needs JavaScript to render, or verifying a deploy. Requires the `brow` CLI."
+model: inherit
 ---
 
 # Browser
